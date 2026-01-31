@@ -1,0 +1,432 @@
+templates:
+  - id: 0
+    name: "Inlined_cot_decomp_breath"
+    text: |
+      Now you have a dataset from {region} with description: {description}
+      The historical {value_col} data is: {HISTORY}
+      The start date of the historical data is {start_date}. The end date of the historical data is {end_date}. The data is sampled every {freq} minutes.
+      News records (treat as exogenous signals): {NEWS}
+      Please perform a detailed analysis of the historical trend step-by-step:
+        - Patterns observed (increase, decrease, periodicity, spikes, etc.).
+        - Potential impact of the weekday, holidays, or provided news events on future.
+        - Explain how this reasoning informs your prediction.
+        - Decompose the prediction task: Short-term forecast: focus on trend changes and dynamic fluctuations. Long-term forecast: focus on statistical properties and periodic/seasonal patterns.
+      Based on the historical data and news texts (if given), predict the data from {pred_start} to {pred_end} with a frequency of {freq} minutes.
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: true
+    has_pred_frequency: true
+    has_explicit_forecast_window: true
+    has_news_instruction: true
+    news_insert_after_history: true
+    news_insert_before_pred_request: true
+    has_cot: true
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 1
+    name: "Compact_strong_anchors_no_cot"
+    text: |
+      Dataset: region={region}. Description: {description}
+      Series: {value_col}. History window: {start_date} -> {end_date}. Sampling: {freq} minutes.
+      History (z-scored summary): {HISTORY}
+      News (may affect forecast): {NEWS}
+      Task: Forecast {value_col} for {pred_start} -> {pred_end} at {freq}-minute intervals. Output only the {H} predicted values (z-space).
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: true
+    has_pred_frequency: true
+    has_explicit_forecast_window: true
+    has_news_instruction: true
+    news_insert_after_history: true
+    news_insert_before_pred_request: true
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 2
+    name: "Sectioned_headings_no_cot"
+    text: |
+      [Context]
+      Region: {region}
+      Description: {description}
+      Target column: {value_col}
+
+      [History]
+      Window: {start_date} -> {end_date}
+      Frequency: {freq} minutes
+      {HISTORY}
+
+      [News]
+      Use the following news as potential drivers (may be relevant or irrelevant):
+      {NEWS}
+
+      [Forecast]
+      Predict {value_col} from {pred_start} to {pred_end} with frequency {freq} minutes.
+      Provide the {H} predictions in z-space.
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: true
+    has_pred_frequency: true
+    has_explicit_forecast_window: true
+    has_news_instruction: true
+    news_insert_after_history: true
+    news_insert_before_pred_request: true
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 4
+    template_token_length: ""
+
+  - id: 3
+    name: "History_only_no_news_instruction"
+    text: |
+      Dataset: {region}. {description}
+      Historical {value_col}: {HISTORY}
+      History window {start_date} -> {end_date}, sampled every {freq} minutes.
+      Forecast {value_col} for {pred_start} -> {pred_end} with {freq}-minute frequency. Output {H} values in z-space.
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: true
+    has_pred_frequency: true
+    has_explicit_forecast_window: true
+    has_news_instruction: false
+    news_insert_after_history: false
+    news_insert_before_pred_request: false
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 4
+    name: "News_before_history_no_cot"
+    text: |
+      Dataset: region={region}. Description: {description}
+
+      News records (treat as exogenous signals):
+      {NEWS}
+
+      History summary for {value_col} (z-scored): {HISTORY}
+      History window: {start_date} -> {end_date}. Sampling: {freq} minutes.
+
+      Forecast request: predict {value_col} from {pred_start} to {pred_end} with {freq}-minute intervals. Output {H} z-values.
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: true
+    has_pred_frequency: true
+    has_explicit_forecast_window: true
+    has_news_instruction: true
+    news_insert_after_history: false
+    news_insert_before_pred_request: true
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 4
+    template_token_length: ""
+
+  - id: 5
+    name: "Short_cot_trend_and_shocks"
+    text: |
+      Region={region}. {description}. Column={value_col}. Freq={freq} minutes.
+      History window: {start_date} -> {end_date}.
+      History summary (z): {HISTORY}
+      News records (treat as exogenous signals): {NEWS}
+
+      Think briefly (do not write the reasoning): identify (a) baseline trend/seasonality from history, (b) any likely shocks from news (direction + strength).
+      Then output the {H} forecasts (z-space) for {pred_start} -> {pred_end}.
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: true
+    has_pred_frequency: false
+    has_explicit_forecast_window: true
+    has_news_instruction: true
+    news_insert_after_history: true
+    news_insert_before_pred_request: true
+    has_cot: true
+    cot_tokens: ""
+    num_sections: 2
+    template_token_length: ""
+
+  - id: 6
+    name: "News_as_structured_records_trend_focused"
+    text: |
+      Dataset context: {region}. {description}. Target={value_col}. Freq={freq} minutes.
+      History: {start_date} -> {end_date}. {HISTORY}
+
+      News records (treat as exogenous signals):
+      {NEWS}
+
+      Internal step (do not output): convert each news item into {direction, strength, confidence, time_offset} and aggregate a net trend bias.
+      Output: predict {H} z-values for {pred_start} -> {pred_end}.
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: true
+    has_pred_frequency: false
+    has_explicit_forecast_window: true
+    has_news_instruction: true
+    news_insert_after_history: true
+    news_insert_before_pred_request: true
+    has_cot: true
+    cot_tokens: ""
+    num_sections: 3
+    template_token_length: ""
+
+  - id: 7
+    name: "No_news_instruction_news_last_full_anchors"
+    text: |
+      Dataset: region={region}. Description: {description}
+      Series: {value_col}. History window: {start_date} -> {end_date}. Sampling: {freq} minutes.
+      History (z-scored summary): {HISTORY}
+      Forecast: predict {value_col} from {pred_start} to {pred_end} with {freq}-minute intervals. Output {H} z-values.
+      {NEWS}
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: true
+    has_pred_frequency: true
+    has_explicit_forecast_window: true
+    has_news_instruction: false
+    news_insert_after_history: true
+    news_insert_before_pred_request: false
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 8
+    name: "No_news_instruction_news_first_full_anchors"
+    text: |
+      {NEWS}
+      Dataset: region={region}. Description: {description}
+      Series: {value_col}. History window: {start_date} -> {end_date}. Sampling: {freq} minutes.
+      History (z-scored summary): {HISTORY}
+      Forecast: predict {value_col} from {pred_start} to {pred_end} with {freq}-minute intervals. Output {H} z-values.
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: true
+    has_pred_frequency: true
+    has_explicit_forecast_window: true
+    has_news_instruction: false
+    news_insert_after_history: false
+    news_insert_before_pred_request: true
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 9
+    name: "No_history_pred_time_anchor_keep_freq_news_last"
+    text: |
+      Dataset: region={region}. Description: {description}
+      Series: {value_col}. Sampling: {freq} minutes.
+      History (z-scored summary): {HISTORY}
+      Forecast: predict the next {H} steps. Output {H} z-values.
+      News: {NEWS}
+
+    has_region_anchor: true
+    has_history_start_end: false
+    has_pred_start_end: false
+    has_history_frequency: true
+    has_pred_frequency: false
+    has_explicit_forecast_window: false
+    has_news_instruction: false
+    news_insert_after_history: true
+    news_insert_before_pred_request: false
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 10
+    name: "No_history_pred_time_anchor_keep_freq_news_first"
+    text: |
+      News: {NEWS}
+      Dataset: region={region}. Description: {description}
+      Series: {value_col}. Sampling: {freq} minutes.
+      History (z-scored summary): {HISTORY}
+      Forecast: predict the next {H} steps. Output {H} z-values.
+
+    has_region_anchor: true
+    has_history_start_end: false
+    has_pred_start_end: false
+    has_history_frequency: true
+    has_pred_frequency: false
+    has_explicit_forecast_window: false
+    has_news_instruction: false
+    news_insert_after_history: false
+    news_insert_before_pred_request: true
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 11
+    name: "No_frequency_keep_time_anchors_news_last"
+    text: |
+      Dataset: region={region}. Description: {description}
+      Series: {value_col}. History window: {start_date} -> {end_date}.
+      History (z-scored summary): {HISTORY}
+      Forecast window: {pred_start} -> {pred_end}. Output {H} z-values.
+      News: {NEWS}
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: false
+    has_pred_frequency: false
+    has_explicit_forecast_window: true
+    has_news_instruction: false
+    news_insert_after_history: true
+    news_insert_before_pred_request: false
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 12
+    name: "No_frequency_keep_time_anchors_news_first"
+    text: |
+      News: {NEWS}
+      Dataset: region={region}. Description: {description}
+      Series: {value_col}. History window: {start_date} -> {end_date}.
+      History (z-scored summary): {HISTORY}
+      Forecast window: {pred_start} -> {pred_end}. Output {H} z-values.
+
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: false
+    has_pred_frequency: false
+    has_explicit_forecast_window: true
+    has_news_instruction: false
+    news_insert_after_history: false
+    news_insert_before_pred_request: true
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 13
+    name: "No_time_anchors_no_frequency_news_last"
+    text: |
+      Dataset: region={region}. Description: {description}
+      Series: {value_col}.
+      History (z-scored summary): {HISTORY}
+      Forecast: predict the next {H} steps. Output {H} z-values.
+      News: {NEWS}
+
+    has_region_anchor: true
+    has_history_start_end: false
+    has_pred_start_end: false
+    has_history_frequency: false
+    has_pred_frequency: false
+    has_explicit_forecast_window: false
+    has_news_instruction: false
+    news_insert_after_history: true
+    news_insert_before_pred_request: false
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 14
+    name: "No_time_anchors_no_frequency_news_first"
+    text: |
+      News: {NEWS}
+      Dataset: region={region}. Description: {description}
+      Series: {value_col}.
+      History (z-scored summary): {HISTORY}
+      Forecast: predict the next {H} steps. Output {H} z-values.
+
+    has_region_anchor: true
+    has_history_start_end: false
+    has_pred_start_end: false
+    has_history_frequency: false
+    has_pred_frequency: false
+    has_explicit_forecast_window: false
+    has_news_instruction: false
+    news_insert_after_history: false
+    news_insert_before_pred_request: true
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""
+
+  - id: 15
+    name: "Sectioned_no_news_instruction_news_last_no_freq"
+    text: |
+      [Context]
+      Region: {region}
+      Description: {description}
+      Target: {value_col}
+
+      [History]
+      {HISTORY}
+
+      [Forecast]
+      Predict the next {H} steps. Output {H} z-values.
+
+      [News]
+      {NEWS}
+
+    has_region_anchor: true
+    has_history_start_end: false
+    has_pred_start_end: false
+    has_history_frequency: false
+    has_pred_frequency: false
+    has_explicit_forecast_window: false
+    has_news_instruction: false
+    news_insert_after_history: true
+    news_insert_before_pred_request: false
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 4
+    template_token_length: ""
+
+  - id: 16
+    name: "Sectioned_no_news_instruction_news_first_no_freq"
+    text: |
+      [News]
+      {NEWS}
+
+      [Context]
+      Region: {region}
+      Description: {description}
+      Target: {value_col}
+
+      [History]
+      {HISTORY}
+
+      [Forecast]
+      Predict the next {H} steps. Output {H} z-values.
+
+    has_region_anchor: true
+    has_history_start_end: false
+    has_pred_start_end: false
+    has_history_frequency: false
+    has_pred_frequency: false
+    has_explicit_forecast_window: false
+    has_news_instruction: false
+    news_insert_after_history: false
+    news_insert_before_pred_request: true
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 4
+    template_token_length: ""

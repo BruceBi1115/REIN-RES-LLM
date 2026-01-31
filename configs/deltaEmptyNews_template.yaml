@@ -1,0 +1,36 @@
+# templates:
+  # - id: 1
+  #   name: "Pure"
+  #   text: |
+  #     The historical {value_col} is: {HISTORY}
+
+  #   has_example: false
+  #   has_breath: false
+  #   has_decomp: false
+  #   has_self_consistency: false
+  #   n_paths: 0
+  #   breath_freq: 0
+  
+templates:
+  - id: 1
+    name: "No_frequency_keep_time_anchors_news_first"
+    text: |
+      Dataset: region={region}. 
+      Description: {description}
+      Series: {value_col}. 
+      History window: {start_date} -> {end_date}.
+      History (z-scored summary): {HISTORY}
+      Forecast window: {pred_start} -> {pred_end}. 
+    has_region_anchor: true
+    has_history_start_end: true
+    has_pred_start_end: true
+    has_history_frequency: false
+    has_pred_frequency: false
+    has_explicit_forecast_window: true
+    has_news_instruction: false
+    news_insert_after_history: false
+    news_insert_before_pred_request: true
+    has_cot: false
+    cot_tokens: ""
+    num_sections: 1
+    template_token_length: ""

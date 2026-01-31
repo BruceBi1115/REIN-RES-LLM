@@ -1,0 +1,3 @@
+# Ignore checkpoints directory
+checkpoints/
+dataset/

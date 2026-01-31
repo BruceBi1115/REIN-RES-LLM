@@ -1,0 +1,149 @@
+demand
+peak demand
+demand peaked
+demand hit
+demand rose
+high demand
+load
+peak load
+record demand
+MW
+heat
+hot
+temperature
+°C
+heatwave
+humid
+humidity
+evening peak
+afternoon peak
+peak period
+price spike
+spike
+volatility
+volatile
+dispatch price
+spot price
+RRP
+$/MWh
+negative price
+prices below zero
+Market Price Floor
+Market Price Cap
+price cap
+administered price cap
+cumulative price threshold
+outage
+forced outage
+unplanned outage
+planned maintenance
+unit offline
+unit out
+tripped
+trip
+failure
+breakdown
+explosion
+fire
+damaged
+derating
+reduced output
+capacity reduced
+return to service
+return date
+expected back
+until (date/time)
+availability
+available capacity
+generator
+power station
+unit
+interconnector
+link
+flow
+imports
+exports
+limited to
+constrained
+constraint
+binding constraint
+congestion
+bottleneck
+transient stability
+system strength
+security constraint
+maxed out
+at limit
+flow limit
+ramp limit
+separation
+islanded
+islanding
+wind output
+wind fades
+wind lull
+solar output
+rooftop PV
+ramp up
+ramp down
+sudden drop
+surge
+forecast
+below forecast
+above forecast
+forecast error
+curtailment
+curtailed
+spill
+withdraw supply
+withdrew bids
+withdrew offers
+FCAS
+ancillary services
+raise
+lower
+regulation
+contingency
+6-second
+60-second
+5-minute
+frequency
+frequency event
+procured within region
+local FCAS requirement
+interconnector tripped
+AEMO
+Market Notice
+LOR1
+LOR2
+LOR3
+lack of reserve
+RERT
+directions
+directed
+load shedding
+demand response
+emergency
+gas price
+gas supply
+pipeline outage
+LNG
+coal supply
+fuel constraint
+marginal cost
+bidding behaviour
+rebid
+offer
+bid bands
+at HH:MM
+at 3:45pm
+by 12:30
+today
+tomorrow
+this evening
+overnight
+until DATE
+return DATE
+over the next X days
+over the next X weeks
+over the next X months

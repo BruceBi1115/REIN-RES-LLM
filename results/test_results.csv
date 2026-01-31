@@ -1,0 +1,12 @@
+Task,mse,mae
+[Full]NSW_2019_2020_delta_news_dataset/FNT_2019_2020_combined.json_0.0_0.1_0.4_0.5_2.0_0.1_basefrac_0.4_epochs_50_lookback_1_topK_10,57082.772020537275,32.1853736460894
+[Full]NSW_2019_2020_delta_news_dataset/Sum_V7_FNT_2019_2020_combined.json_0.0_0.1_0.4_0.05_1.0_0.05_basefrac_0.4_epochs_50_lookback_1_topK_10,55082.14211878283,31.84104156274905
+[Full]NSW_2019_2020_delta_news_dataset/Sum_V7_FNT_2019_2020_combined.json_0.0_0.1_0.4_0.05_1.0_0.1_basefrac_0.4_epochs_50_lookback_1_topK_10,55006.785488479436,31.58562999813036
+[Full]NSW_2019_2020_delta_news_dataset/Sum_V7_FNT_2019_2020_combined.json_0.0_0.1_0.4_0.05_1.0_0.5_basefrac_0.4_epochs_50_lookback_1_topK_10,54628.73174533186,31.61736247402498
+[Full]NSW_2019_2020_delta_news_dataset/Sum_V7_FNT_2019_2020_combined.json_0.0_0.1_0.4_0.05_1.0_1.0_basefrac_0.4_epochs_50_lookback_1_topK_10,54651.87308482904,31.806466490646887
+
+
+[Full]NSW_2019_2020_delta_news_dataset/Sum_V7_FNT_2019_2020_combined.json_0.0_0.1_0.4_0.05_1.0_0.05_basefrac_0.4_epochs_50_lookback_1_topK_10,55022.89612056688,30.949768965271698
+[Full]NSW_2019_2020_delta_news_dataset/Sum_V7_FNT_2019_2020_combined.json_0.0_0.1_0.4_0.05_1.0_0.1_basefrac_0.4_epochs_50_lookback_1_topK_10,56796.367442085,32.61361231091379
+[Full]NSW_2019_2020_delta_news_dataset/Sum_V7_FNT_2019_2020_combined.json_0.0_0.1_0.4_0.05_1.0_0.5_basefrac_0.4_epochs_50_lookback_1_topK_10,55133.49497628924,31.595981709710482
+[Full]NSW_2019_2020_delta_news_dataset/Sum_V7_FNT_2019_2020_combined.json_0.0_0.1_0.4_0.05_1.0_1.0_basefrac_0.4_epochs_50_lookback_1_topK_10,54947.16205442582,31.10069406662864
