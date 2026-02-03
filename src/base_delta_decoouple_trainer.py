@@ -418,7 +418,7 @@ def evaluate_metrics_single(
             rel_targets=rel_labels,
             rel_lambda=args.rel_lambda,
         )
-        loss = out["loss"]
+        loss = out["loss_fore"]
         pred_z = out["pred"]
 
         bs = input_ids.size(0)
@@ -1068,7 +1068,7 @@ def train_base_stage(args, bundle):
                 ts_patch_mask=ts_patch_mask,
                 targets=targets_z,
             )
-            loss = out["loss"] / args.grad_accum
+            loss = out["loss_fore"] / args.grad_accum
             loss.backward()
 
             loss_window.append(float(loss.detach().cpu()))
@@ -1469,15 +1469,15 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 rel_lambda=args.rel_lambda,
             )
             delta_pred_real = out_delta["pred"].to(torch.float32)  # (B,H)
-            # loss_res = out_delta["loss"]                            # scalar (L1 in your model)
-            w = rel_labels_d.to(device=device, dtype=torch.float32)  # (B,)
+            loss_res = out_delta["loss_fore"]                            # scalar (L1 in your model)
+            # w = rel_labels_d.to(device=device, dtype=torch.float32)  # (B,)
           
-            w = w.clamp(0.0, 1.0)
-            # per-sample residual loss (L1 in z-space)
-            per_sample_res = torch.abs(delta_pred_real - delta_targets).mean(dim=1)  # (B,)
-            loss_res = (w * per_sample_res).sum() / (w.sum().clamp_min(1e-6))
+            # w = w.clamp(0.0, 1.0)
+            # # per-sample residual loss (L1 in z-space)
+            # per_sample_res = torch.abs(delta_pred_real - delta_targets).mean(dim=1)  # (B,)
+            # loss_res = (w * per_sample_res).sum() / (w.sum().clamp_min(1e-6))
 
-            pbar.set_postfix(rel_labels_d=rel_labels_d)
+            # pbar.set_postfix(rel_labels_d=rel_labels_d)
             # pbar.set_postfix(w=w)
             # loss_res = (w * per_sample_res).mean() 
 
@@ -1518,10 +1518,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             err_null = torch.abs(pred_null_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
 
             # 4.2 hinge margin: err_null >= err_real + margin  =>  relu(margin + err_real - err_null)
-            # loss_margin = torch.relu(delta_adv_margin + err_real - err_null).mean()
+            loss_margin = torch.relu(delta_adv_margin + err_real - err_null).mean()
 
             hinge = torch.relu(delta_adv_margin + err_real - err_null)  # (B,)
-            loss_margin = (w * hinge).sum() / (w.sum().clamp_min(1e-6))
+            # loss_margin = (w * hinge).sum() / (w.sum().clamp_min(1e-6))
             # loss_margin = (w * hinge).mean() 
 
             # total loss

@@ -46,11 +46,11 @@ REWARD_METRIC="mae"
 #test different news lookback length in days
 LOOKBACK_WINDOWS=(
   "1"
-  "1"
-  "1"
-  "5"
-  "5"
-  "5"
+  # "1"
+  # "1"
+  # "5"
+  # "5"
+  # "5"
   # "10"
   # "14"
 )
@@ -65,11 +65,11 @@ TASK_NAMES=(
   "[Full]NSW_2019_2020"
 )
 
-STAGE="delta"
+STAGE="all"
 
 NEWS_CHOICES=(
-  # ""
-  "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
+  ""
+  # "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
   # "dataset/V0_Watt_NoSum_news_2015_2020.json"
   # "dataset/FNT_traffic_news.json"
   # "dataset/Sum_V6_news_2015_2016.json"
@@ -115,11 +115,11 @@ TEMPLATE_POOLS=(
   ""                     # Default: no --template_pool
 )
 null=(
-  "0.05"
+  # "0.05"
   # "0.5"
   # "0.1"
   # # "0.05"
-  # "0.005"
+  "0.005"
 
 )
 
