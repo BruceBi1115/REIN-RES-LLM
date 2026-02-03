@@ -213,6 +213,7 @@ def build_batch_inputs(
 
     hist_strs = []
     news_str_list = []
+    rel_labels_list = []
 
     start_dates = []
     end_dates = []
@@ -236,11 +237,12 @@ def build_batch_inputs(
         elif policy_name == "sum_v0":
             args.news_text_col = "sum_v0"
         # news
+        avg_rate = 0.0
         if force_no_news or (news_df is None) or (len(news_df) == 0):
             selected = pd.DataFrame(columns=[args.news_time_col, args.news_text_col])
         else:
             cand = get_candidates(news_df, args.news_time_col, t_target, args.news_window_days, args.news_topM)
-            selected = select_news(cand, policy_name, args.news_text_col, policy_kw, args.news_topK)
+            selected, avg_rate = select_news(cand, policy_name, args.news_text_col, policy_kw, args.news_topK)
             # print(len(selected))
 
         len_selected_news.append(len(selected))
@@ -257,6 +259,10 @@ def build_batch_inputs(
             )
             if news_dropout:
                 news_str = _maybe_news_dropout(news_str, args)
+
+
+        rel = avg_rate
+        rel_labels_list.append(rel)
 
         # if len(selected) > 5:
         #     print(news_str)
@@ -337,7 +343,8 @@ def build_batch_inputs(
     ts_patches, ts_patch_mask = _pad_patches(patches_list, patchmask_list, patch_len=patch_len)
     targets_z = torch.stack([torch.tensor(t, dtype=torch.float32) for t in targets_z_list], dim=0)
     # print("max = ", len_selected_news)
-    return input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts
+    rel_labels = torch.tensor(rel_labels_list, dtype=torch.float32)
+    return input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels
 
 
 # ----------------------------
@@ -379,7 +386,7 @@ def evaluate_metrics_single(
         ans_json_path = os.path.join(ckpt_dir, f"test_answers_{args.taskName}.json")
 
     for _, batch in enumerate(data_loader):
-        input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts = build_batch_inputs(
+        input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
             templates=templates,
@@ -408,6 +415,8 @@ def evaluate_metrics_single(
             ts_patches=ts_patches,
             ts_patch_mask=ts_patch_mask,
             targets=targets_z,
+            rel_targets=rel_labels,
+            rel_lambda=args.rel_lambda,
         )
         loss = out["loss"]
         pred_z = out["pred"]
@@ -493,7 +502,7 @@ def evaluate_metrics_residual(
 
     for _, batch in enumerate(data_loader):
         # build delta (with news)
-        ids_d, attn_d, ts_p, ts_pm, targets_z, metas, prompt_texts = build_batch_inputs(
+        ids_d, attn_d, ts_p, ts_pm, targets_z, metas, prompt_texts, rel_labels_d = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
             templates=templates,
@@ -510,7 +519,7 @@ def evaluate_metrics_residual(
             news_dropout=news_dropout,
         )
         # build base (no news)
-        ids_b, attn_b, _, _, _, _, _ = build_batch_inputs(
+        ids_b, attn_b, _, _, _, _, _, _ = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
             templates=templates,
@@ -557,8 +566,12 @@ def evaluate_metrics_residual(
             ts_patches=ts_p,
             ts_patch_mask=ts_pm,
             targets=delta_targets,
-            head_mode="delta"
+            head_mode="delta",
+            rel_targets=rel_labels_d,     # NEW
+            rel_lambda=args.rel_lambda,   # NEW
         )
+        loss = out_delta["loss"]
+
         delta_corr = out_delta["pred"].to(torch.float32)
 
         pred_z = base_pred + delta_corr
@@ -1001,11 +1014,15 @@ def train_base_stage(args, bundle):
     warmup_steps_base = int(getattr(args, "warmup_ratio", 0.1) * total_opt_steps_base)
     warmup_steps_base = min(warmup_steps_base, max(0, total_opt_steps_base - 1))
 
-    scheduler_base = get_cosine_schedule_with_warmup(
-        optim_base,
-        num_warmup_steps=warmup_steps_base,
-        num_training_steps=total_opt_steps_base,
-    )
+
+    if args.scheduler == 1:
+        scheduler_base = get_cosine_schedule_with_warmup(
+            optim_base,
+            num_warmup_steps=warmup_steps_base,
+            num_training_steps=total_opt_steps_base,
+        )
+    else:
+        scheduler_base = None
 
     allowed_tpl_ids = sorted([t["id"] for t in templates.values()])
     tpl_id = allowed_tpl_ids[0]
@@ -1020,7 +1037,7 @@ def train_base_stage(args, bundle):
         pbar = tqdm(train_loader, desc=f"[BASE] Epoch {epoch+1}/{base_epochs}")
 
         for _, batch in enumerate(pbar):
-            input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, _ = build_batch_inputs(
+            input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, _, _ = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
@@ -1061,7 +1078,8 @@ def train_base_stage(args, bundle):
 
             if (global_step + 1) % args.grad_accum == 0:
                 optim_base.step()
-                scheduler_base.step()
+                if args.scheduler == 1:
+                    scheduler_base.step()
                 optim_base.zero_grad(set_to_none=True)
 
             global_step += 1
@@ -1244,11 +1262,14 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     warmup_steps_delta = int(getattr(args, "warmup_ratio", 0.1) * total_opt_steps_delta)
     warmup_steps_delta = min(warmup_steps_delta, max(0, total_opt_steps_delta - 1))
 
-    scheduler_delta = get_cosine_schedule_with_warmup(
-        optim_delta,
-        num_warmup_steps=warmup_steps_delta,
-        num_training_steps=total_opt_steps_delta,
-    )
+    if args.scheduler == 1:
+        scheduler_delta = get_cosine_schedule_with_warmup(
+            optim_delta,
+            num_warmup_steps=warmup_steps_delta,
+            num_training_steps=total_opt_steps_delta,
+        )
+    else:
+        scheduler_delta = None
 
     # RL setup for DELTA stage (kept as-is)
     normalizer = RewardNormalizer(ema=args.reward_ema, use_group_norm=args.domain_reward_norm)
@@ -1365,7 +1386,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 )
 
             # build delta inputs (with news)
-            ids_d, attn_d, ts_p, ts_pm, targets_z, metas, _ = build_batch_inputs(
+            ids_d, attn_d, ts_p, ts_pm, targets_z, metas, _, rel_labels_d = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
@@ -1382,7 +1403,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 news_dropout=True,
             )
             # build base text inputs (no news)
-            ids_b, attn_b, _, _, _, _, _ = build_batch_inputs(
+            ids_b, attn_b, _, _, _, _, _, _ = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
@@ -1444,9 +1465,23 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 ts_patch_mask=ts_pm,
                 targets=delta_targets,
                 head_mode="delta",
+                rel_targets=rel_labels_d,
+                rel_lambda=args.rel_lambda,
             )
             delta_pred_real = out_delta["pred"].to(torch.float32)  # (B,H)
-            loss_res = out_delta["loss"]                            # scalar (L1 in your model)
+            # loss_res = out_delta["loss"]                            # scalar (L1 in your model)
+            w = rel_labels_d.to(device=device, dtype=torch.float32)  # (B,)
+          
+            w = w.clamp(0.0, 1.0)
+            # per-sample residual loss (L1 in z-space)
+            per_sample_res = torch.abs(delta_pred_real - delta_targets).mean(dim=1)  # (B,)
+            loss_res = (w * per_sample_res).sum() / (w.sum().clamp_min(1e-6))
+
+            pbar.set_postfix(rel_labels_d=rel_labels_d)
+            # pbar.set_postfix(w=w)
+            # loss_res = (w * per_sample_res).mean() 
+
+            
 
             # -----------------------------
             # (3) NULL delta forward (no-news, adapter_on, delta head) -> delta_pred_null
@@ -1483,14 +1518,30 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             err_null = torch.abs(pred_null_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
 
             # 4.2 hinge margin: err_null >= err_real + margin  =>  relu(margin + err_real - err_null)
-            loss_margin = torch.relu(delta_adv_margin + err_real - err_null).mean()
+            # loss_margin = torch.relu(delta_adv_margin + err_real - err_null).mean()
+
+            hinge = torch.relu(delta_adv_margin + err_real - err_null)  # (B,)
+            loss_margin = (w * hinge).sum() / (w.sum().clamp_min(1e-6))
+            # loss_margin = (w * hinge).mean() 
 
             # total loss
+
+            # 总LOSS = 相关度*residual loss + 无新闻代入时的loss * 权重 + 相关度*加入新闻的增量 * 权重
             loss_total = loss_res + delta_null_lambda * loss_null + delta_margin_lambda * loss_margin
 
             # backward with grad accumulation
             loss = loss_total / args.grad_accum
             loss.backward()
+
+            # live_logger.info(
+            #     f"\nLOSS_RES (相关度)={loss_res.item():.6f}\n"
+            #     f"LOSS_NULL (无新闻)={loss_null.item():.6f}\n"
+            #     f"LOSS_MARGIN (增量)={loss_margin.item():.6f}\n"
+            #     f"LOSS_TOTAL = {loss_total.item():.6f}\n"
+            #     f"LOSS_GRAD_ACC = {loss.item():.6f}\n"
+               
+            # )
+
 
             loss_window.append(float(loss.detach().cpu()))
             if global_step % 10 == 0:
@@ -1499,7 +1550,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
             if (global_step + 1) % args.grad_accum == 0:
                 optim_delta.step()
-                scheduler_delta.step()
+                if args.scheduler == 1:
+                    scheduler_delta.step()
                 optim_delta.zero_grad(set_to_none=True)
 
             global_step += 1

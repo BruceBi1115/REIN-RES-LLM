@@ -18,7 +18,7 @@ VAL_FILE="dataset/2019-2020NSWelecprice/2019To2020NSWData_valset.csv"
 TEST_FILE="dataset/2019-2020NSWelecprice/2019To2020NSWData_testset.csv"
 
 
-NEWS_TEXT_COL="summary"
+NEWS_TEXT_COL="summary_response"
 NEWS_TIME_COL="publication_time"
 KEYWORD_PATH="keywords/kw_2.txt"
 
@@ -46,11 +46,11 @@ REWARD_METRIC="mae"
 #test different news lookback length in days
 LOOKBACK_WINDOWS=(
   "1"
-  # "5"
-  # "5"
-  # "5"
-  # "5"
-  # "5"
+  "1"
+  "1"
+  "5"
+  "5"
+  "5"
   # "10"
   # "14"
 )
@@ -69,7 +69,7 @@ STAGE="delta"
 
 NEWS_CHOICES=(
   # ""
-  "dataset/Sum_V7_FNT_2019_2020_combined.json"
+  "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
   # "dataset/V0_Watt_NoSum_news_2015_2020.json"
   # "dataset/FNT_traffic_news.json"
   # "dataset/Sum_V6_news_2015_2016.json"
@@ -83,8 +83,13 @@ NEWS_CHOICES=(
 RUN_OR_NOT=(
     ""
     ""
-    ""
     "1"
+    ""
+)
+
+scheduler=(
+  # "0"
+  "1"
 )
 # 每个 task 对应的 rl_use
 RL_USES=(
@@ -125,14 +130,22 @@ margin=(
   # "0.1"
 )
 
-adv=(
-  "0.05"
-  "0.1"
-  "0.5"
-  "1"
-  # # "0.01"
-  # "0.005"
+# adv=(
+#   "0.05"
+#   # "0.1"
+#   # "0.5"
+#   # "1"
+#   # # "0.01"
+#   # "0.005"
+# )
+
+LRs=(
+  "1e-5"
+  # "5e-5"
+  # "1e-4"
+  # "5e-4"
 )
+
 
 
 # =======================
@@ -196,13 +209,16 @@ for i in "${!TASK_NAMES[@]}"; do
       args+=( --head_dropout 0.1)
       args+=( --news_dropout 0.4)
 
-
+      
       for null_lambda in "${null[@]}"; do
         for margin_lambda in "${margin[@]}"; do
-          for adv_margin in "${adv[@]}"; do
+          for lr in "${LRs[@]}"; do
+            for sch in "${scheduler[@]}"; do
               args+=( --delta_null_lambda "$null_lambda")
               args+=( --delta_margin_lambda "$margin_lambda")
-              args+=( --delta_adv_margin "$adv_margin")
+              # args+=( --delta_adv_margin "$adv_margin")
+              args+=( --lr "$lr")
+              args+=( --scheduler "$sch")
               if [[ -n "$run_or_not" ]]; then
                 echo "==> Running: $task"
                 "$PYTHON_BIN" "$ENTRY" "${args[@]}"
@@ -210,6 +226,7 @@ for i in "${!TASK_NAMES[@]}"; do
               # 测试后，删除保存的模型，为了节省空间的不得已之举
               # rm -rf "checkpoints/${task}/best_base_${task}"
               rm -rf "checkpoints/${task}/best_delta_${task}"
+            done
           done
         done
       done

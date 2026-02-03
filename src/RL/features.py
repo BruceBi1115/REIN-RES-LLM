@@ -196,10 +196,10 @@ def bandit_select(args, context_vector, live_logger, allowed_tpl_ids, policy_spa
         policy_name = policy_space[pol_idx]
 
         live_logger.info(
-            f"  DECISION_EPOCH_BEGIN epoch={epoch} "
-            f"      sel_template={tpl_id} policy={policy_name} "
-            f"      tpl_scores={[round(float(s),4) for s in scores_tpl]} "
-            f"      pol_scores={[round(float(s),4) for s in scores_pol]}"
+            f"****DECISION_EPOCH_BEGIN epoch={epoch} "
+            f" sel_template={tpl_id} policy={policy_name} "
+            f" tpl_scores={[round(float(s),4) for s in scores_tpl]} "
+            f" pol_scores={[round(float(s),4) for s in scores_pol]}"
         )
     # ===============================================
     elif args.select_policy_by == "batch" :

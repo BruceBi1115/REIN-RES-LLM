@@ -191,24 +191,28 @@ def select_no_sum(cand, text_col, K):
 def select_news(cand: pd.DataFrame, policy: str, text_col: str,
                 policy_kw: List[str], K: int) -> pd.DataFrame:
     # print(cand)
+    selected = cand
     if policy == 'keywords':
-        return policy_by_keywords(cand, text_col, policy_kw, K) #这里把命中关键词的都选上
+        selected = policy_by_keywords(cand, text_col, policy_kw, K) #这里把命中关键词的都选上
     elif policy == 'polarity_high':
-        return select_by_sentiment_polarity_high(cand, text_col, K)#选个
+        selected = select_by_sentiment_polarity_high(cand, text_col, K)#选个
     elif policy == 'polarity_low':
-        return select_by_sentiment_polarity_low(cand, text_col, K)#选个
+        selected = select_by_sentiment_polarity_low(cand, text_col, K)#选个
     elif policy == 'keyword_polarity_high_hybrid':
-        return keyword_polarity_high_hybrid(cand, text_col, policy_kw, K)#先按keyword筛选，然后选个
+        selected = keyword_polarity_high_hybrid(cand, text_col, policy_kw, K)#先按keyword筛选，然后选个
     elif policy == 'keyword_polarity_low_hybrid':
-        return keyword_polarity_low_hybrid(cand, text_col, policy_kw, 1)#先按keyword筛选，然后选个
+        selected = keyword_polarity_low_hybrid(cand, text_col, policy_kw, 1)#先按keyword筛选，然后选个
     elif policy == "all":
-        return cand
+        selected = cand
     elif policy == "sum_v0":
-        return cand
+        selected = cand
     elif policy == "no_sum":
-        return cand
+        selected = cand
     else:
         raise ValueError("Unknown news select policy")
+    # Return both selected news and average rating for use in base model training.
+    avg_rate = selected['rate'].mean() if not selected.empty else 0.0
+    return selected, avg_rate
 
 def lead3(text: str, max_sentences: int = 3) -> str:
     seps = ['。', '.', '；', ';', '！', '!', '？', '?', '\n']

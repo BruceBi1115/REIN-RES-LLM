@@ -12,6 +12,9 @@ from textblob import TextBlob
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Cross-domain LLaMA Forecasting with RL')
 
+    
+    parser.add_argument('--rel_lambda', type=float, default=0.3, help='weight for relative loss')
+    parser.add_argument("--rel_on", action="store_true", help="whether to use relative loss")
 
     parser.add_argument('--delta_null_lambda', type=float, default=2, help='weight for ||delta_pred(no-news)|| shrink')
     parser.add_argument('--delta_margin_lambda', type=float, default=1.0, help='weight for counterfactual margin loss')
@@ -125,7 +128,8 @@ if __name__ == '__main__':
     parser.add_argument('--lora_dropout', type=float, default=0.05, help='LoRA dropout')
     parser.add_argument('--target_modules', type=str, default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',
                         help='comma-separated target module names for LoRA')
-    parser.add_argument('--lr', type=float, default=2e-5, help='learning rate for LoRA params')
+    parser.add_argument('--lr', type=float, default=5e-6, help='learning rate for LoRA params')
+    parser.add_argument('--scheduler', type=int, default=1, help='1 =on; 0 =off for lr scheduler')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight decay')
     parser.add_argument('--warmup_ratio', type=float, default=0.03, help='warmup ratio')
     parser.add_argument('--batch_size', type=int, default=2, help='micro batch size per device')

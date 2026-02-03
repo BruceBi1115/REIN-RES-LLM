@@ -40,6 +40,9 @@ class TSForecastRegressor(nn.Module):
         self.patch_proj = nn.Linear(self.patch_dim, self.hidden_size)
         self.patch_drop = nn.Dropout(float(patch_dropout))
 
+        self.rel_head = nn.Linear(self.hidden_size, 1)
+        
+
         # -------------- base head ----------------------------
         if head_mlp:
             print("using mlp")
@@ -76,6 +79,7 @@ class TSForecastRegressor(nn.Module):
         lm_dtype = next(self.lm.parameters()).dtype
         self.base_head = self.base_head.to(dtype=lm_dtype)
         self.delta_head = self.delta_head.to(dtype=lm_dtype)
+        self.rel_head = self.rel_head.to(dtype=lm_dtype)
         if not head_mlp:
             self.delta_head_drop = self.delta_head_drop  # keep
 
@@ -103,6 +107,8 @@ class TSForecastRegressor(nn.Module):
         ts_patch_mask: torch.Tensor,
         targets: torch.Tensor | None = None,
         head_mode: str = "base",   # NEW
+        rel_targets: torch.Tensor | None = None,
+        rel_lambda: float = 0.0,
     ):
         # text token embeddings (dtype usually bf16)
         tok_emb = self.lm.get_input_embeddings()(input_ids)  # (B, T, H)
@@ -138,6 +144,7 @@ class TSForecastRegressor(nn.Module):
 
         last_hidden = outputs.hidden_states[-1]  # (B, T+P, H)
         pooled = self._pool_patch_hidden(last_hidden, ts_patch_mask)  # (B, H)
+        
 
         if head_mode == "base":
             if isinstance(self.base_head, nn.Linear):
@@ -153,14 +160,25 @@ class TSForecastRegressor(nn.Module):
             raise ValueError(f"Unknown head_mode={head_mode}")
         
     
-        out = {"pred": pred}
+        rel_logit = self.rel_head(pooled).squeeze(-1)   # (B,)
+        out = {"pred": pred, "rel_logits": rel_logit}
 
+        loss = None
         if targets is not None:
-            # targets 建议也对齐 pred dtype（避免 bf16/float32 混算警告）
             if targets.dtype != pred.dtype:
                 targets = targets.to(dtype=pred.dtype)
-            loss = F.l1_loss(pred, targets, reduction="mean")
+            loss_fore = F.l1_loss(pred, targets, reduction="mean")
+            loss = loss_fore
+
+        if rel_targets is not None:
+            rel_targets = rel_targets.to(device=rel_logit.device, dtype=rel_logit.dtype)
+            loss_rel = F.binary_cross_entropy_with_logits(rel_logit, rel_targets)
+            loss = rel_lambda * loss_rel if loss is None else (loss + rel_lambda * loss_rel)
+
+        if loss is not None:
             out["loss"] = loss
+            out["loss_fore"] = loss_fore if targets is not None else None
+            out["loss_rel"] = loss_rel if rel_targets is not None else None
 
         return out
 
@@ -263,6 +281,7 @@ def save_checkpoint(
             "patch_proj": model.patch_proj.state_dict(),
             "head": model.base_head.state_dict(),           # base
             "delta_head": model.delta_head.state_dict(),    # NEW
+            "rel_head": model.rel_head.state_dict(),
             "horizon": model.horizon,
             "patch_dim": model.patch_dim,
             "hidden_size": model.hidden_size,
@@ -362,12 +381,14 @@ def load_checkpoint(
         for p in model.delta_head.parameters():
             nn.init.zeros_(p)
 
+    model.rel_head.load_state_dict(reg["rel_head"], strict=True)
     # ✅ 关键：移动自定义层到GPU
     
     emb = model.lm.get_input_embeddings().weight
     model.patch_proj = model.patch_proj.to(emb.device, dtype=emb.dtype)
     model.head = model.head.to(emb.device, dtype=emb.dtype)
     model.delta_head = model.delta_head.to(emb.device, dtype=emb.dtype)
+    model.rel_head = model.rel_head.to(emb.device, dtype=emb.dtype)
 
 
 
