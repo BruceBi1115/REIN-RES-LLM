@@ -189,6 +189,7 @@ def build_batch_inputs(
     testing: bool = False,
     force_no_news: bool = False,
     news_dropout: bool = False,
+    prompt_path: str = None
 ):
     """
     Returns:
@@ -323,9 +324,7 @@ def build_batch_inputs(
         if record_train_prompt and epoch == 0:
             ckpt_dir = os.path.join("./checkpoints", args.taskName)
             os.makedirs(ckpt_dir, exist_ok=True)
-            news_path_clean = (args.news_path or "").replace("dataset/", "")
-            filename = f"{args.taskName}_{news_path_clean}_basefrac_{args.residual_base_frac}_epochs_{args.epochs}_lookback_{args.news_window_days}_topK_{args.news_topK}"
-            prompt_path = os.path.join(ckpt_dir, f"prompts_{filename}.json")
+
             rec = {
                 "batch_idx": i,
                 "epoch_num": epoch + 1,
@@ -344,8 +343,7 @@ def build_batch_inputs(
     targets_z = torch.stack([torch.tensor(t, dtype=torch.float32) for t in targets_z_list], dim=0)
     # print("max = ", len_selected_news)
     rel_labels = torch.tensor(rel_labels_list, dtype=torch.float32)
-    return input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels
-
+    return input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels, len(selected)
 
 # ----------------------------
 # eval
@@ -367,6 +365,7 @@ def evaluate_metrics_single(
     true_pred_csv_path: str | None = None,
     news_dropout: bool = False,
     force_no_news: bool = False,
+    filename: str = None,
 ):
     """
     Single-model evaluation: used for BASE stage.
@@ -383,10 +382,10 @@ def evaluate_metrics_single(
     if testing:
         ckpt_dir = os.path.join("./checkpoints", args.taskName)
         os.makedirs(ckpt_dir, exist_ok=True)
-        ans_json_path = os.path.join(ckpt_dir, f"test_answers_{args.taskName}.json")
+        ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
 
     for _, batch in enumerate(data_loader):
-        input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels = build_batch_inputs(
+        input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels, n_selected = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
             templates=templates,
@@ -483,6 +482,7 @@ def evaluate_metrics_residual(
     testing: bool = False,
     true_pred_csv_path: str | None = None,
     news_dropout: bool = False,
+    filename: str = None,
 ):
     """
     Residual evaluation: pred = base(no-news, adapter_off) + delta(with-news, adapter_on)
@@ -496,13 +496,11 @@ def evaluate_metrics_residual(
     if testing:
         ckpt_dir = os.path.join("./checkpoints", args.taskName)
         os.makedirs(ckpt_dir, exist_ok=True)
-        news_path_clean = (args.news_path or "").replace("dataset/", "")
-        filename = f"{args.taskName}_news_{news_path_clean}_basefrac_{args.residual_base_frac}_epochs_{args.epochs}_lookback_{args.news_window_days}_topK_{args.news_topK}"
         ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
 
     for _, batch in enumerate(data_loader):
         # build delta (with news)
-        ids_d, attn_d, ts_p, ts_pm, targets_z, metas, prompt_texts, rel_labels_d = build_batch_inputs(
+        ids_d, attn_d, ts_p, ts_pm, targets_z, metas, prompt_texts, rel_labels_d, n_selected = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
             templates=templates,
@@ -519,7 +517,7 @@ def evaluate_metrics_residual(
             news_dropout=news_dropout,
         )
         # build base (no news)
-        ids_b, attn_b, _, _, _, _, _, _ = build_batch_inputs(
+        ids_b, attn_b, _, _, _, _, _, _, _ = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
             templates=templates,
@@ -802,7 +800,7 @@ def bandit_round_update_residual(
 def setup_env_and_data(args):
     stage = str(getattr(args, "stage", "all")).lower()
     news_path_clean = (args.news_path or "").replace("dataset/", "")
-    filename = f"{args.taskName}_{args.stage}_{news_path_clean}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}_basefrac_{args.residual_base_frac}_epochs_{args.epochs}_lookback_{args.news_window_days}_topK_{args.news_topK}"
+    filename = f"{args.taskName}_{args.stage}_news_{news_path_clean}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}_{args.delta_null_lambda}_{args.delta_margin_lambda}_{args.delta_adv_margin}_basefrac_{args.residual_base_frac}_epochs_{args.epochs}_lr_{args.lr}_gradacc_{args.grad_accum}_sche_{args.scheduler}_lookback_{args.news_window_days}_topK_{args.news_topK}"
     log_filename = filename + ".log"
 
     live_logger, live_path, log_jsonl = setup_live_logger(
@@ -939,6 +937,8 @@ def setup_env_and_data(args):
         "volatility_bin": volatility_bin,
         "volatility_bin_val": volatility_bin_val,
         "volatility_bin_test": volatility_bin_test,
+        "prompt_path": prompt_path,
+        "test_filename": filename,
     }
 
 
@@ -1037,7 +1037,7 @@ def train_base_stage(args, bundle):
         pbar = tqdm(train_loader, desc=f"[BASE] Epoch {epoch+1}/{base_epochs}")
 
         for _, batch in enumerate(pbar):
-            input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, _, _ = build_batch_inputs(
+            input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, _, _, _ = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
@@ -1298,7 +1298,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     loss_window = deque(maxlen=50)
 
     tpl_id = allowed_tpl_ids[0]
-    policy_name = "polarity_high"
+    policy_name = "all"
     best_tpl_id = tpl_id
     best_policy_name = policy_name
 
@@ -1386,7 +1386,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 )
 
             # build delta inputs (with news)
-            ids_d, attn_d, ts_p, ts_pm, targets_z, metas, _, rel_labels_d = build_batch_inputs(
+            ids_d, attn_d, ts_p, ts_pm, targets_z, metas, _, rel_labels_d, n_selected = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
@@ -1397,13 +1397,14 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 policy_kw=policy_kw,
                 volatility_bin=volatility_bin,
                 epoch=epoch,
-                record_train_prompt=False,
+                record_train_prompt=True,
                 testing=False,
                 force_no_news=False,
                 news_dropout=True,
+                prompt_path=bundle["prompt_path"]
             )
             # build base text inputs (no news)
-            ids_b, attn_b, _, _, _, _, _, _ = build_batch_inputs(
+            ids_b, attn_b, _, _, _, _, _, _, _ = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
@@ -1454,6 +1455,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             # residual target for delta head
             delta_targets = (targets_z.to(torch.float32) - base_pred).detach()
 
+            
             # -----------------------------
             # (2) REAL delta forward (with-news, adapter_on, delta head) -> delta_pred_real
             #     This is your original supervised residual loss.
@@ -1527,7 +1529,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             # total loss
 
             # 总LOSS = 相关度*residual loss + 无新闻代入时的loss * 权重 + 相关度*加入新闻的增量 * 权重
-            loss_total = loss_res + delta_null_lambda * loss_null + delta_margin_lambda * loss_margin
+            loss_total = (1-delta_null_lambda-delta_margin_lambda)* loss_res + delta_null_lambda * loss_null + delta_margin_lambda * loss_margin
 
             # backward with grad accumulation
             loss = loss_total / args.grad_accum
@@ -1697,6 +1699,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             testing=True,
             true_pred_csv_path=true_pred_csv_path,
             news_dropout=False,
+            filename=bundle["test_filename"]
         )
 
         live_logger.info("---------------------testset prompt statistics--------------------------------")

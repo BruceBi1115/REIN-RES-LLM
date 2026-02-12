@@ -1,0 +1,341 @@
+*** a/base_delta_decoouple_trainer.py
+--- b/base_delta_decoouple_trainer.py
+***************
+*** 1,30 ****
+  # base_delta_decoouple_trainer.py (REGRESSION version - full file)
+  # [RESIDUAL BASE+DELTA, NO TRUE-vs-SHUFFLED]
+  # Refactor: split BASE and DELTA into separate runnable stages via args.stage in {"all","base","delta"}.
+  # - stage=base : train/save best_base only
+  # - stage=delta: load existing base checkpoint and train/save best_delta (+test)
+  # - stage=all  : base -> delta (original behavior)
+  #
+  # Notes:
+  # - This file assumes run.py (argparse) provides optional args:
+  #   --stage, --base_ckpt, --base_epochs, --delta_epochs
+  #   If not provided, getattr defaults will be used.
++ #
++ # ============================
++ # CORRELATION / RELEVANCE UPDATE (NEW)
++ # ============================
++ # You already have a relevance target per-sample: rel_labels_d = avg_rate in build_batch_inputs().
++ # This patch makes relevance actually affect training:
++ #   (1) Residual supervised loss is weighted by relevance (high-rel samples matter more).
++ #   (2) Margin (counterfactual) loss is weighted by relevance (only enforce "news helps" when news is relevant).
++ #   (3) Null-shrink loss is weighted by (1 - relevance) (enforce delta(no-news)->0 stronger when news is irrelevant).
++ #
++ # This is the minimal closed-loop to make the model learn "useful vs useless news".
+  
+  from __future__ import annotations
+  
+  import csv
+  import gc
+  import os
+  import json
+  import math
+  from collections import deque
+  from contextlib import nullcontext
+  import shutil
+***************
+*** 120,160 ****
+  def _maybe_news_dropout(news_str: str, args) -> str:
+      p = float(getattr(args, "news_dropout", 0.0) or 0.0)
+      if p <= 0:
+          return news_str
+      if np.random.rand() < p:
+          return ""
+      return news_str
++ 
++ 
++ def _rel_weight(rel: torch.Tensor, args) -> torch.Tensor:
++     """
++     Map relevance label in [0,1] -> training weight.
++ 
++     Why:
++       - If most rel are high, weighting does little; power transform (gamma>1) increases contrast.
++       - If rel is noisy, keep gamma close to 1.
++ 
++     Args (optional, via args):
++       - rel_gamma (float, default=1.0): w = rel^gamma
++       - rel_min_weight (float, default=0.05): clamp lower bound to avoid zeroing gradients completely.
++     """
++     gamma = float(getattr(args, "rel_gamma", 1.0))
++     wmin = float(getattr(args, "rel_min_weight", 0.05))
++     w = rel.clamp(0.0, 1.0)
++     if gamma != 1.0:
++         w = w.pow(gamma)
++     return w.clamp_min(wmin)
+***************
+*** 230,260 ****
+  def build_batch_inputs(
+      batch,
+      tokenizer,
+      templates,
+      tpl_id,
+      args,
+      news_df,
+      policy_name,
+      policy_kw,
+      volatility_bin,
+      epoch: int = -1,
+      record_train_prompt: bool = False,
+      testing: bool = False,
+      force_no_news: bool = False,
+      news_dropout: bool = False,
+  ):
+      """
+      Returns:
+        input_ids, attn,
+        ts_patches, ts_patch_mask,
+        targets_z, metas,
+        prompt_texts
+      """
+***************
+*** 320,370 ****
+          # news
+          avg_rate = 0.0
+          if force_no_news or (news_df is None) or (len(news_df) == 0):
+              selected = pd.DataFrame(columns=[args.news_time_col, args.news_text_col])
+          else:
+              cand = get_candidates(news_df, args.news_time_col, t_target, args.news_window_days, args.news_topM)
+              selected, avg_rate = select_news(cand, policy_name, args.news_text_col, policy_kw, args.news_topK)
+              # print(len(selected))
+  
+          len_selected_news.append(len(selected))
+  
+          news_str = ""
+          if (not force_no_news) and len(selected) > 0:
+              news_str = format_news(
+                  selected,
+                  args.news_text_col,
+                  news_budget,
+                  tokenizer,
+                  summary_method=args.news_summary_method,
+                  max_sentences=args.news_max_sentences,
+              )
+              if news_dropout:
+                  news_str = _maybe_news_dropout(news_str, args)
+  
+  
+          rel = avg_rate
+          rel_labels_list.append(rel)
+  
+          # if len(selected) > 5:
+          #     print(news_str)
+***************
+*** 420,455 ****
+      input_ids, attn = _pad_2d_int(ids_list, pad_id=tokenizer.pad_token_id)
+      ts_patches, ts_patch_mask = _pad_patches(patches_list, patchmask_list, patch_len=patch_len)
+      targets_z = torch.stack([torch.tensor(t, dtype=torch.float32) for t in targets_z_list], dim=0)
+      # print("max = ", len_selected_news)
+      rel_labels = torch.tensor(rel_labels_list, dtype=torch.float32)
+      return input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels
+***************
+*** 890,980 ****
+          for bidx, batch in enumerate(pbar):
+              # batch-level bandit selection (optional)
+              if (args.select_policy_by == "batch") and args.rl_use == 1 and global_step % 50 == 0:
+                  context_vector = get_context_features(
+                      batch,
+                      news_df,
+                      args,
+                      prev_model_loss_n=None,
+                      prev_model_loss_ema_n=None,
+                      val_state=val_state,
+                      train_loader=train_loader,
+                      volatility_bin=volatility_bin,
+                  )
+  
+                  tpl_id, policy_name, pol_idx = bandit_round_update_residual(
+                      base_model=None,
+                      delta_model=delta_model,
+                      tokenizer=tokenizer,
+                      probe_loader=val_loader,
+                      templates=templates,
+                      allowed_tpl_ids=allowed_tpl_ids,
+                      news_df=news_df,
+                      policy_space=policy_space,
+                      policy_kw=policy_kw,
+                      args=args,
+                      device=device,
+                      volatility_bin=volatility_bin_val,
+                      context_vector=context_vector,
+                      tpl_features=tpl_features,
+                      bandit_tpl=bandit_tpl,
+                      bandit_pol=bandit_pol,
+                      normalizer=normalizer,
+                      live_logger=live_logger,
+                      round_id=epoch * len(pbar) + bidx,
+                      bidx=bidx,
+                      global_step=global_step,
+                  )
+  
+              # build delta inputs (with news)
+              ids_d, attn_d, ts_p, ts_pm, targets_z, metas, _, rel_labels_d = build_batch_inputs(
+                  batch=batch,
+                  tokenizer=tokenizer,
+                  templates=templates,
+                  tpl_id=tpl_id,
+                  args=args,
+                  news_df=news_df,
+                  policy_name=policy_name,
+                  policy_kw=policy_kw,
+                  volatility_bin=volatility_bin,
+                  epoch=epoch,
+                  record_train_prompt=False,
+                  testing=False,
+                  force_no_news=False,
+                  news_dropout=True,
+              )
+              # build base text inputs (no news)
+              ids_b, attn_b, _, _, _, _, _, _ = build_batch_inputs(
+                  batch=batch,
+                  tokenizer=tokenizer,
+                  templates=templates,
+                  tpl_id=tpl_id,
+                  args=args,
+                  news_df=news_df,
+                  policy_name=policy_name,
+                  policy_kw=policy_kw,
+                  volatility_bin=volatility_bin,
+                  epoch=epoch,
+                  record_train_prompt=False,
+                  testing=False,
+                  force_no_news=True,
+                  news_dropout=False,
+              )
+  
+              ids_d = ids_d.to(device)
+              attn_d = attn_d.to(device)
+              ids_b = ids_b.to(device)
+              attn_b = attn_b.to(device)
+  
+              ts_p = ts_p.to(device)
+              ts_pm = ts_pm.to(device)
+              targets_z = targets_z.to(device)
++ 
++             # -----------------------------
++             # NEW: relevance weights (per-sample)
++             # rel_labels_d is avg_rate in [0,1] from select_news(...)
++             # Use w for "news should matter" losses; use (1-w) for "news should NOT matter" losses.
++             # -----------------------------
++             w_rel = _rel_weight(rel_labels_d.to(device=device, dtype=torch.float32), args)     # (B,)
++             w_irr = (1.0 - w_rel).clamp_min(0.0)                                               # (B,)
+  
+              delta_model.train()
+  
+              # -----------------------------
+              # (1) BASE prediction (no-news, adapter_off, base head)  -> base_pred
+              # -----------------------------
+              was_training = delta_model.training
+              delta_model.eval()
+              with torch.no_grad():
+                  with _adapter_off(delta_model.lm):
+                      out_base = delta_model(
+                          input_ids=ids_b,
+                          attention_mask=attn_b,
+                          ts_patches=ts_p,
+                          ts_patch_mask=ts_pm,
+                          targets=None,
+                          head_mode="base",
+                      )
+                      base_pred = out_base["pred"].to(torch.float32)
+  
+              if was_training:
+                  delta_model.train()
+  
+              # residual target for delta head
+              delta_targets = (targets_z.to(torch.float32) - base_pred).detach()
+  
+              # -----------------------------
+              # (2) REAL delta forward (with-news, adapter_on, delta head) -> delta_pred_real
+              #     This is your original supervised residual loss.
+              # -----------------------------
+              out_delta = delta_model(
+                  input_ids=ids_d,
+                  attention_mask=attn_d,
+                  ts_patches=ts_p,
+                  ts_patch_mask=ts_pm,
+                  targets=delta_targets,
+                  head_mode="delta",
+                  rel_targets=rel_labels_d,
+                  rel_lambda=args.rel_lambda,
+              )
+              delta_pred_real = out_delta["pred"].to(torch.float32)  # (B,H)
+-             loss_res = out_delta["loss_fore"]                            # scalar (L1 in your model)
++ 
++             # -----------------------------
++             # NEW: relevance-weighted residual loss
++             #   - compute per-sample L1 in z-space
++             #   - weight by w_rel so high-relevance samples drive learning
++             # Note: out_delta["loss_fore"] is mean over batch; we replace with weighted variant.
++             # -----------------------------
++             per_sample_res = torch.abs(delta_pred_real - delta_targets).mean(dim=1)           # (B,)
++             loss_res = (w_rel * per_sample_res).sum() / (w_rel.sum().clamp_min(1e-6))
+  
+              # -----------------------------
+              # (3) NULL delta forward (no-news, adapter_on, delta head) -> delta_pred_null
+              #     Counterfactual: same history/patch, but zero news content.
+              # -----------------------------
+              out_null = delta_model(
+                  input_ids=ids_b,
+                  attention_mask=attn_b,
+                  ts_patches=ts_p,
+                  ts_patch_mask=ts_pm,
+                  targets=None,            # IMPORTANT: do NOT regress to delta_targets here
+                  head_mode="delta",
+              )
+              delta_pred_null = out_null["pred"].to(torch.float32)    # (B,H)
+  
+              # -----------------------------
+              # (4) Counterfactual Regularization
+              #   4.1 Null-shrink: force delta(no-news) -> 0
+              #   4.2 Margin: final_pred(with-news) must beat final_pred(no-news) by a margin
+              # -----------------------------
+              delta_null_lambda = float(getattr(args, "delta_null_lambda", 0.5))
+              delta_margin_lambda = float(getattr(args, "delta_margin_lambda", 1.0))
+              delta_adv_margin = float(getattr(args, "delta_adv_margin", 0.02))
+  
+-             # 4.1 shrink delta output when news is absent
+-             loss_null = (delta_pred_null ** 2).mean()
++             # 4.1 NEW: null-shrink weighted by irrelevance (1-w_rel)
++             # If news is irrelevant, we strongly enforce delta(no-news) ~ 0, preventing spurious changes.
++             per_sample_null = (delta_pred_null ** 2).mean(dim=1)                               # (B,) mean over H
++             loss_null = (w_irr * per_sample_null).sum() / (w_irr.sum().clamp_min(1e-6))
+  
+              # final predictions in z-space
+              pred_real_z = base_pred + delta_pred_real
+              pred_null_z = base_pred + delta_pred_null
+  
+              # per-sample errors (L1 in z-space, consistent with your model loss)
+              err_real = torch.abs(pred_real_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
+              err_null = torch.abs(pred_null_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
+  
+-             # 4.2 hinge margin: err_null >= err_real + margin  =>  relu(margin + err_real - err_null)
+-             loss_margin = torch.relu(delta_adv_margin + err_real - err_null).mean()
++             # 4.2 NEW: hinge margin weighted by relevance (w_rel)
++             # Only require "news helps" when relevance is high; avoid forcing improvements from noisy/irrelevant news.
++             hinge = torch.relu(delta_adv_margin + err_real - err_null)                       # (B,)
++             loss_margin = (w_rel * hinge).sum() / (w_rel.sum().clamp_min(1e-6))
+  
+              # total loss
+-             loss_total = loss_res + delta_null_lambda * loss_null + delta_margin_lambda * loss_margin
++             loss_total = loss_res + delta_null_lambda * loss_null + delta_margin_lambda * loss_margin
+  
+              # backward with grad accumulation
+              loss = loss_total / args.grad_accum
+              loss.backward()
+  
+              loss_window.append(float(loss.detach().cpu()))
+              if global_step % 10 == 0:
+                  avg_train_loss = sum(loss_window) / len(loss_window)
+-                 pbar.set_postfix(train_loss=f"{avg_train_loss:.6f}")
++                 # NEW: also log mean relevance for sanity check
++                 pbar.set_postfix(train_loss=f"{avg_train_loss:.6f}", rel_mean=f"{float(rel_labels_d.mean()):.3f}")
+  
+              if (global_step + 1) % args.grad_accum == 0:
+                  optim_delta.step()
+                  if args.scheduler == 1:
+                      scheduler_delta.step()
+                  optim_delta.zero_grad(set_to_none=True)
+  
+              global_step += 1

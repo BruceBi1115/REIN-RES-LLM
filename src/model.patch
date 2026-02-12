@@ -1,0 +1,98 @@
+*** a/model.py
+--- b/model.py
+***************
+*** 1,40 ****
+  # model.py
+  
+  import torch
+  import torch.nn as nn
+  import torch.nn.functional as F
+  from transformers import AutoModelForCausalLM, AutoTokenizer
+  from peft import LoraConfig, get_peft_model, PeftModel
+  import os
+  import json
+  END_TOKEN = "<END>"
+  
+      
+  
+  class TSForecastRegressor(nn.Module):
+***************
+*** 120,170 ****
+      def forward(
+          self,
+          input_ids: torch.Tensor,
+          attention_mask: torch.Tensor,
+          ts_patches: torch.Tensor,
+          ts_patch_mask: torch.Tensor,
+          targets: torch.Tensor | None = None,
+          head_mode: str = "base",   # NEW
+          rel_targets: torch.Tensor | None = None,
+          rel_lambda: float = 0.0,
+      ):
+          # text token embeddings (dtype usually bf16)
+          tok_emb = self.lm.get_input_embeddings()(input_ids)  # (B, T, H)
+          tok_dtype = tok_emb.dtype
+  
+          # ---关键：让 patch 分支 dtype 对齐---
+          proj_dtype = self.patch_proj.weight.dtype
+          if ts_patches.dtype != proj_dtype:
+              ts_patches = ts_patches.to(dtype=proj_dtype)
+  
+          patch_emb = self.patch_proj(ts_patches)  # (B, P, H)  dtype = proj_dtype
+          patch_emb = self.patch_drop(patch_emb)
+  
+          # 再对齐到 tok_emb 的 dtype，保证 cat 后 inputs_embeds 统一 dtype
+          if patch_emb.dtype != tok_dtype:
+              patch_emb = patch_emb.to(dtype=tok_dtype)
+  
+          if self.training and getattr(self, "patch_mask_p", 0.0) > 0:
+              # (B,P,1)
+              keep = (torch.rand(patch_emb.size(0), patch_emb.size(1), 1, device=patch_emb.device) > self.patch_mask_p).to(patch_emb.dtype)
+              patch_emb = patch_emb * keep
+          # concat as "soft tokens": [text_tokens, patch_tokens]
+          inputs_embeds = torch.cat([tok_emb, patch_emb], dim=1)  # (B, T+P, H)
+          attn = torch.cat([attention_mask, ts_patch_mask], dim=1)  # (B, T+P)
+  
+          outputs = self.lm(
+              inputs_embeds=inputs_embeds,
+              attention_mask=attn,
+              output_hidden_states=True,
+              use_cache=False,
+              return_dict=True,
+          )
+  
+          last_hidden = outputs.hidden_states[-1]  # (B, T+P, H)
+          pooled = self._pool_patch_hidden(last_hidden, ts_patch_mask)  # (B, H)
+          
+***************
+*** 190,245 ****
+          else:
+              raise ValueError(f"Unknown head_mode={head_mode}")
+          
+      
+          rel_logit = self.rel_head(pooled).squeeze(-1)   # (B,)
+-         out = {"pred": pred, "rel_logits": rel_logit}
++         # NEW: also expose probability for logging/debugging
++         rel_prob = torch.sigmoid(rel_logit)
++         out = {"pred": pred, "rel_logits": rel_logit, "rel_prob": rel_prob}
+  
+          loss = None
++         loss_fore = None
++         loss_rel = None
+          if targets is not None:
+              if targets.dtype != pred.dtype:
+                  targets = targets.to(dtype=pred.dtype)
+              loss_fore = F.l1_loss(pred, targets, reduction="mean")
+              loss = loss_fore
+  
+          if rel_targets is not None:
+              rel_targets = rel_targets.to(device=rel_logit.device, dtype=rel_logit.dtype)
+              loss_rel = F.binary_cross_entropy_with_logits(rel_logit, rel_targets)
+              loss = rel_lambda * loss_rel if loss is None else (loss + rel_lambda * loss_rel)
+  
+          if loss is not None:
+              out["loss"] = loss
+              out["loss_fore"] = loss_fore if targets is not None else None
+              out["loss_rel"] = loss_rel if rel_targets is not None else None
+  
+          return out

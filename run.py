@@ -16,7 +16,7 @@ if __name__ == '__main__':
     parser.add_argument('--rel_lambda', type=float, default=0.3, help='weight for relative loss')
     parser.add_argument("--rel_on", action="store_true", help="whether to use relative loss")
 
-    parser.add_argument('--delta_null_lambda', type=float, default=2, help='weight for ||delta_pred(no-news)|| shrink')
+    parser.add_argument('--delta_null_lambda', type=float, default=0.0001, help='weight for ||delta_pred(no-news)|| shrink')
     parser.add_argument('--delta_margin_lambda', type=float, default=1.0, help='weight for counterfactual margin loss')
     parser.add_argument('--delta_adv_margin', type=float, default=0.02, help='margin in z-space: err_null >= err_real + margin')
 
@@ -37,7 +37,7 @@ if __name__ == '__main__':
     parser.add_argument("--base_epochs", type=int, default=-1,
                     help="If >=0, override base epochs when stage=all or stage=base.")
 
-    parser.add_argument("--delta_epochs", type=int, default=-1,
+    parser.add_argument("--delta_epochs", type=int, default=4,
                         help="If >=0, override delta epochs when stage=all or stage=delta.")
     # ==== residual loss =====
     parser.add_argument("--residual_loss", type=str, default="mse", choices = ['mse', 'mae', 'smooth_l1'])

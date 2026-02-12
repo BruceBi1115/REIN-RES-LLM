@@ -7,15 +7,15 @@ set -euo pipefail
 PYTHON_BIN="python"
 ENTRY="run.py"
 TIME_COL="SETTLEMENTDATE"
-VALUE_COL="RRP"
-UNIT="$/MWh"
-DESCRIPTION="This dataset records the electricity price data in Australia NSW from 2019 to 2020, collected from National electricity market."
+VALUE_COL="TOTALDEMAND"
+UNIT="megawatts"
+DESCRIPTION="This dataset records the electricity load demand data in Australia NSW from 2019 to 2020, collected from National electricity market."
 REGION="Australia, NSW"
 
 
-TRAIN_FILE="dataset/2019-2020NSWelecprice/2019To2020NSWData_trainset.csv"
-VAL_FILE="dataset/2019-2020NSWelecprice/2019To2020NSWData_valset.csv"
-TEST_FILE="dataset/2019-2020NSWelecprice/2019To2020NSWData_testset.csv"
+TRAIN_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_trainset.csv"
+VAL_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_valset.csv"
+TEST_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_testset.csv"
 
 
 NEWS_TEXT_COL="summary_response"
@@ -23,6 +23,7 @@ NEWS_TIME_COL="publication_time"
 KEYWORD_PATH="keywords/kw_2.txt"
 
 EPOCHS="50"
+DELTA_EPOCHS="1"
 KEYWORD_NUMBER="20"
 NEWS_WINDOW_DAYS="1"
 NEWS_TOPM="999"
@@ -68,8 +69,9 @@ TASK_NAMES=(
 STAGE="delta"
 
 NEWS_CHOICES=(
+  # ""
+  # "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
   ""
-  "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
   # "dataset/V0_Watt_NoSum_news_2015_2020.json"
   # "dataset/FNT_traffic_news.json"
   # "dataset/Sum_V6_news_2015_2016.json"
@@ -129,7 +131,8 @@ null=(
   # "0.1"
   # "0.005"
   # "0.001"
-  "0.0001"
+  # "0.0001"
+  "0.00001"
 
 )
 
@@ -223,6 +226,7 @@ for i in "${!TASK_NAMES[@]}"; do
       args+=( --head_dropout 0.1)
       args+=( --stride 1)
       args+=( --horizon 1)
+      args+=( --delta_epochs "$DELTA_EPOCHS")
       
 
       
