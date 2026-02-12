@@ -1529,7 +1529,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             # total loss
 
             # 总LOSS = 相关度*residual loss + 无新闻代入时的loss * 权重 + 相关度*加入新闻的增量 * 权重
-            loss_total = (1-delta_null_lambda-delta_margin_lambda)* loss_res + delta_null_lambda * loss_null + delta_margin_lambda * loss_margin
+            loss_total = loss_res + delta_null_lambda * loss_null + delta_margin_lambda * loss_margin
 
             # backward with grad accumulation
             loss = loss_total / args.grad_accum
