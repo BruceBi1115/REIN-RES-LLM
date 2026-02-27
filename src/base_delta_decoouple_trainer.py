@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from transformers import get_cosine_schedule_with_warmup
@@ -39,7 +40,7 @@ from .ValidationState import ValidationState
 from .utils.logger import setup_live_logger
 from .RL.features import bandit_select, get_context_features, encode_instruction
 
-from .model import load_checkpoint, load_llama_lora, save_checkpoint
+from .model2 import load_checkpoint, load_llama_lora, save_checkpoint
 from .utils.residual_utils import freeze_module, zero_regressor_head, split_two_stage_epochs
 
 from .utils.utils import (
@@ -105,6 +106,77 @@ def _maybe_news_dropout(news_str: str, args) -> str:
     return news_str
 
 
+def _bounded_sigmoid_gate(logits: torch.Tensor, args) -> torch.Tensor:
+    """
+    Sample-wise gate in [floor, 1], controlled by temperature.
+    """
+    temperature = float(getattr(args, "news_gate_temperature", 1.0) or 1.0)
+    floor = float(getattr(args, "news_gate_floor", 0.0) or 0.0)
+    temperature = max(1e-6, temperature)
+    floor = max(0.0, min(1.0, floor))
+    gate = torch.sigmoid(logits / temperature)
+    return floor + (1.0 - floor) * gate
+
+
+def _residual_elementwise(pred: torch.Tensor, target: torch.Tensor, mode: str) -> torch.Tensor:
+    if mode == "mse":
+        return (pred - target) ** 2
+    if mode == "smooth_l1":
+        return F.smooth_l1_loss(pred, target, reduction="none")
+    return torch.abs(pred - target)  # "mae"
+
+
+def _build_delta_optimizer(delta_model, args):
+    base_lr = float(args.lr)
+    wd = float(args.weight_decay)
+
+    lora_scale = float(getattr(args, "delta_lora_lr_scale", 1.0))
+    head_scale = float(getattr(args, "delta_head_lr_scale", 1.0))
+    other_scale = float(getattr(args, "delta_other_lr_scale", 1.0))
+
+    lora_params, head_params, other_params = [], [], []
+    for name, p in delta_model.named_parameters():
+        if not p.requires_grad:
+            continue
+        lname = name.lower()
+        if "lora_" in lname:
+            lora_params.append(p)
+        elif (
+            lname.startswith("delta_head")
+            or lname.startswith("delta_gate")
+            or lname.startswith("delta_fuse")
+            or lname.startswith("delta_text_ln")
+            or lname.startswith("delta_log_scale")
+            or lname.startswith("rel_head")
+        ):
+            head_params.append(p)
+        else:
+            other_params.append(p)
+
+    param_groups = []
+    if lora_params:
+        param_groups.append({"params": lora_params, "lr": base_lr * lora_scale, "weight_decay": wd})
+    if head_params:
+        param_groups.append({"params": head_params, "lr": base_lr * head_scale, "weight_decay": wd})
+    if other_params:
+        param_groups.append({"params": other_params, "lr": base_lr * other_scale, "weight_decay": wd})
+
+    if not param_groups:
+        raise ValueError("No trainable parameters found for DELTA optimizer.")
+
+    optimizer = AdamW(param_groups)
+    lr_info = {
+        "base_lr": base_lr,
+        "lora_lr": base_lr * lora_scale if lora_params else 0.0,
+        "head_lr": base_lr * head_scale if head_params else 0.0,
+        "other_lr": base_lr * other_scale if other_params else 0.0,
+        "n_lora": len(lora_params),
+        "n_head": len(head_params),
+        "n_other": len(other_params),
+    }
+    return optimizer, lr_info
+
+
 def _make_patches(seq: list[float], patch_len: int, stride: int):
     """
     seq: length L list
@@ -141,6 +213,7 @@ def history_text(history_z: list[float], mu: float, sigma: float) -> str:
         f"Last {len(last)} z: {', '.join([f'{v:.3f}' for v in last])}. "
         f"Recent slope: {slope:.3f}."
     )
+
 
 
 def _pad_2d_int(seqs: list[list[int]], pad_id: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -232,6 +305,7 @@ def build_batch_inputs(
         history_z = _zscore(history, mu, sigma)
         target_z = _zscore(target, mu, sigma)
 
+
         p, pm = _make_patches(history_z, patch_len=patch_len, stride=patch_stride)
         if policy_name == "no_sum":
             args.news_text_col = "no_sum"
@@ -262,7 +336,8 @@ def build_batch_inputs(
                 news_str = _maybe_news_dropout(news_str, args)
 
 
-        rel = avg_rate
+        rel = float(avg_rate) if np.isfinite(avg_rate) else 0.0
+        rel = max(0.0, min(1.0, rel))
         rel_labels_list.append(rel)
 
         # if len(selected) > 5:
@@ -343,7 +418,8 @@ def build_batch_inputs(
     targets_z = torch.stack([torch.tensor(t, dtype=torch.float32) for t in targets_z_list], dim=0)
     # print("max = ", len_selected_news)
     rel_labels = torch.tensor(rel_labels_list, dtype=torch.float32)
-    return input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels, len(selected)
+    news_counts = torch.tensor(len_selected_news, dtype=torch.float32)
+    return input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels, news_counts
 
 # ----------------------------
 # eval
@@ -500,7 +576,7 @@ def evaluate_metrics_residual(
 
     for _, batch in enumerate(data_loader):
         # build delta (with news)
-        ids_d, attn_d, ts_p, ts_pm, targets_z, metas, prompt_texts, rel_labels_d, n_selected = build_batch_inputs(
+        ids_d, attn_d, ts_p, ts_pm, targets_z, metas, prompt_texts, rel_labels_d, news_counts = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
             templates=templates,
@@ -568,8 +644,6 @@ def evaluate_metrics_residual(
             rel_targets=rel_labels_d,     # NEW
             rel_lambda=args.rel_lambda,   # NEW
         )
-        loss = out_delta["loss"]
-
         delta_corr = out_delta["pred"].to(torch.float32)
 
         pred_z = base_pred + delta_corr
@@ -800,7 +874,7 @@ def bandit_round_update_residual(
 def setup_env_and_data(args):
     stage = str(getattr(args, "stage", "all")).lower()
     news_path_clean = (args.news_path or "").replace("dataset/", "")
-    filename = f"{args.taskName}_{args.stage}_news_{news_path_clean}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}_{args.delta_null_lambda}_{args.delta_margin_lambda}_{args.delta_adv_margin}_basefrac_{args.residual_base_frac}_epochs_{args.epochs}_lr_{args.lr}_gradacc_{args.grad_accum}_sche_{args.scheduler}_lookback_{args.news_window_days}_topK_{args.news_topK}"
+    filename = f"{args.taskName}_{args.stage}_s{args.stride}_h{args.horizon}_news_{news_path_clean}_RL_{args.rl_use}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}_{args.delta_null_lambda}_{args.delta_margin_lambda}_{args.delta_adv_margin}_base_{args.base_epochs}_delta_{args.delta_epochs}_lr_{args.lr}_gradacc_{args.grad_accum}_sche_{args.scheduler}_lookback_{args.news_window_days}_topK_{args.news_topK}"
     log_filename = filename + ".log"
 
     live_logger, live_path, log_jsonl = setup_live_logger(
@@ -1000,6 +1074,10 @@ def train_base_stage(args, bundle):
         patch_dropout=args.patch_dropout,
         head_dropout=args.head_dropout,
         head_mlp=args.head_mlp,
+        delta_gate_init_bias=float(getattr(args, "delta_gate_init_bias", -1.0)),
+        delta_clip=float(getattr(args, "delta_clip", 3.0)),
+        delta_news_tail_tokens=int(getattr(args, "delta_news_tail_tokens", 160)),
+        delta_rel_floor=float(getattr(args, "delta_rel_floor", 0.05)),
     )
     base_train_model.to(device)
 
@@ -1227,12 +1305,38 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     # freeze base head
     for p in delta_model.base_head.parameters():
         p.requires_grad = False
-    # ensure delta head is trainable
-    for p in delta_model.delta_head.parameters():
-        p.requires_grad = True
-    # 如果你想 delta 只学 LoRA + delta_head，不动 patch_proj
-    for p in delta_model.patch_proj.parameters():
-        p.requires_grad = False
+
+    # keep backbone patch/text pooling stable so delta focuses on residual adaptation
+    freeze_modules = [
+        "patch_proj",
+        "patch_gate",
+        "patch_pos",
+        "pool_attn",
+        "pool_ln",
+        "text_ctx_ln",
+        "text2q",
+    ]
+    for name in freeze_modules:
+        if hasattr(delta_model, name):
+            m = getattr(delta_model, name)
+            if hasattr(m, "parameters"):
+                for p in m.parameters():
+                    p.requires_grad = False
+    if hasattr(delta_model, "pool_q"):
+        delta_model.pool_q.requires_grad = False
+    if hasattr(delta_model, "layer_w"):
+        delta_model.layer_w.requires_grad = False
+
+    # ensure delta-specific heads remain trainable
+    train_modules = ["delta_head", "delta_gate", "delta_fuse", "delta_text_ln", "rel_head"]
+    for name in train_modules:
+        if hasattr(delta_model, name):
+            m = getattr(delta_model, name)
+            if hasattr(m, "parameters"):
+                for p in m.parameters():
+                    p.requires_grad = True
+    if hasattr(delta_model, "delta_log_scale"):
+        delta_model.delta_log_scale.requires_grad = True
 
     # base teacher (frozen) - provides base_pred
     base_teacher = None
@@ -1252,10 +1356,13 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     #     p.requires_grad = False
 
 
-    optim_delta = AdamW(
-        filter(lambda p: p.requires_grad, delta_model.parameters()),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+    optim_delta, lr_info = _build_delta_optimizer(delta_model, args)
+    live_logger.info(
+        "[DELTA] optimizer groups: "
+        f"base_lr={lr_info['base_lr']:.3e}, "
+        f"lora_lr={lr_info['lora_lr']:.3e} (n={lr_info['n_lora']}), "
+        f"head_lr={lr_info['head_lr']:.3e} (n={lr_info['n_head']}), "
+        f"other_lr={lr_info['other_lr']:.3e} (n={lr_info['n_other']})"
     )
 
     total_opt_steps_delta = math.ceil((len(train_loader) * max(1, delta_epochs)) / max(1, args.grad_accum))
@@ -1283,24 +1390,48 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         add_cross_terms=True,
     )
     allowed_tpl_ids = sorted([t["id"] for t in templates.values()])
+    tpl_id = allowed_tpl_ids[0]
+    policy_space = args.policy_space
+    policy_name = args.default_policy
+    best_tpl_id = tpl_id
+    best_policy_name = policy_name
 
     d_tpl = len(context_vector) + len(tpl_features(allowed_tpl_ids[0], context_vector=context_vector))
     d_pol = len(context_vector)
     bandit_tpl = LinTS(d_tpl, v=args.ts_v) if args.rl_algo == "lints" else LinUCB(d_tpl, alpha=args.ucb_alpha)
-    policy_space = ["keywords", "polarity_high", "keyword_polarity_high_hybrid"]
-    # policy_space = ["sum_v0","no_sum"]
-    # policy_space = ["keywords"]
     bandit_pol = LinTS(d_pol, v=args.ts_v) if args.rl_algo == "lints" else LinUCB(d_pol, alpha=args.ucb_alpha)
-
-    # best_metric = float("inf")
-    best_metric = best_base_metric
+    if math.isfinite(float(best_base_metric)):
+        best_metric = float(best_base_metric)
+    else:
+        base_ref_loss, base_ref_mse, base_ref_mae = evaluate_metrics_single(
+            model=delta_model,
+            tokenizer=tokenizer,
+            data_loader=val_loader,
+            templates=templates,
+            tpl_id=allowed_tpl_ids[0],
+            args=args,
+            news_df=news_df,
+            policy_name=policy_name,
+            policy_kw=policy_kw,
+            device=device,
+            volatility_bin=volatility_bin_val,
+            testing=False,
+            true_pred_csv_path=None,
+            news_dropout=False,
+            force_no_news=True,
+        )
+        if args.reward_metric == "loss":
+            best_metric = float(base_ref_loss)
+        elif args.reward_metric == "mse":
+            best_metric = float(base_ref_mse)
+        else:
+            best_metric = float(base_ref_mae)
+        live_logger.info(
+            f"[DELTA] base reference on val: loss={base_ref_loss:.6f} mse={base_ref_mse:.6f} "
+            f"mae={base_ref_mae:.6f}; threshold={best_metric:.6f}"
+        )
     stale_rounds = 0
     loss_window = deque(maxlen=50)
-
-    tpl_id = allowed_tpl_ids[0]
-    policy_name = "all"
-    best_tpl_id = tpl_id
-    best_policy_name = policy_name
 
     val_loss_per_epoch, mse_loss_per_epoch, mae_loss_per_epoch = [], [], []
     global_step = 0
@@ -1386,7 +1517,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 )
 
             # build delta inputs (with news)
-            ids_d, attn_d, ts_p, ts_pm, targets_z, metas, _, rel_labels_d, n_selected = build_batch_inputs(
+            ids_d, attn_d, ts_p, ts_pm, targets_z, metas, _, rel_labels_d, news_counts_d = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
@@ -1429,6 +1560,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             ts_p = ts_p.to(device)
             ts_pm = ts_pm.to(device)
             targets_z = targets_z.to(device)
+            rel_labels_d = rel_labels_d.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+            news_counts_d = news_counts_d.to(device=device, dtype=torch.float32)
+            has_news = (news_counts_d > 0).to(dtype=torch.float32)
 
             delta_model.train()
 
@@ -1455,10 +1589,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             # residual target for delta head
             delta_targets = (targets_z.to(torch.float32) - base_pred).detach()
 
-            
             # -----------------------------
-            # (2) REAL delta forward (with-news, adapter_on, delta head) -> delta_pred_real
-            #     This is your original supervised residual loss.
+            # (2) REAL delta forward (with-news, adapter_on, delta head)
             # -----------------------------
             out_delta = delta_model(
                 input_ids=ids_d,
@@ -1467,23 +1599,11 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 ts_patch_mask=ts_pm,
                 targets=delta_targets,
                 head_mode="delta",
-                rel_targets=rel_labels_d,
-                rel_lambda=args.rel_lambda,
+                rel_targets=None,
+                rel_lambda=0.0,
             )
             delta_pred_real = out_delta["pred"].to(torch.float32)  # (B,H)
-            loss_res = out_delta["loss_fore"]                            # scalar (L1 in your model)
-            # w = rel_labels_d.to(device=device, dtype=torch.float32)  # (B,)
-          
-            # w = w.clamp(0.0, 1.0)
-            # # per-sample residual loss (L1 in z-space)
-            # per_sample_res = torch.abs(delta_pred_real - delta_targets).mean(dim=1)  # (B,)
-            # loss_res = (w * per_sample_res).sum() / (w.sum().clamp_min(1e-6))
-
-            # pbar.set_postfix(rel_labels_d=rel_labels_d)
-            # pbar.set_postfix(w=w)
-            # loss_res = (w * per_sample_res).mean() 
-
-            
+            rel_logits_real = out_delta["rel_logits"].to(torch.float32)  # (B,)
 
             # -----------------------------
             # (3) NULL delta forward (no-news, adapter_on, delta head) -> delta_pred_null
@@ -1496,17 +1616,41 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 ts_patch_mask=ts_pm,
                 targets=None,            # IMPORTANT: do NOT regress to delta_targets here
                 head_mode="delta",
+                rel_targets=None,
+                rel_lambda=0.0,
             )
             delta_pred_null = out_null["pred"].to(torch.float32)    # (B,H)
+            rel_logits_null = out_null["rel_logits"].to(torch.float32)
 
             # -----------------------------
             # (4) Counterfactual Regularization
             #   4.1 Null-shrink: force delta(no-news) -> 0
-            #   4.2 Margin: final_pred(with-news) must beat final_pred(no-news) by a margin
+            #   4.2 Margin: pred(with-news) should beat pred(no-news)
+            #   4.3 Non-degradation: pred(with-news) should not be worse than base
+            #   4.4 Gate pseudo-labeling: learn to suppress noisy news
             # -----------------------------
             delta_null_lambda = float(getattr(args, "delta_null_lambda", 0.5))
             delta_margin_lambda = float(getattr(args, "delta_margin_lambda", 1.0))
             delta_adv_margin = float(getattr(args, "delta_adv_margin", 0.02))
+            delta_non_degrade_lambda = float(getattr(args, "delta_non_degrade_lambda", 0.0))
+            delta_non_degrade_margin = float(getattr(args, "delta_non_degrade_margin", 0.0))
+            gate_lambda = float(getattr(args, "gate_lambda", 0.0))
+            gate_null_lambda = float(getattr(args, "gate_null_lambda", 0.0))
+            cf_min_weight = float(getattr(args, "cf_min_weight", 0.05))
+            cf_min_weight = max(0.0, min(1.0, cf_min_weight))
+            cf_pseudo_margin = float(getattr(args, "cf_pseudo_margin", 0.01))
+            cf_pseudo_temp = float(getattr(args, "cf_pseudo_temp", 0.02))
+            cf_pseudo_temp = max(1e-6, cf_pseudo_temp)
+            cf_pseudo_hard = int(getattr(args, "cf_pseudo_hard", 0))
+            violation_cap = float(getattr(args, "delta_violation_cap", 0.0))
+
+            gate_enable = int(getattr(args, "news_gate_enable", 1)) == 1
+            if gate_enable:
+                gate_real = _bounded_sigmoid_gate(rel_logits_real, args)
+                gate_null = _bounded_sigmoid_gate(rel_logits_null, args)
+            else:
+                gate_real = torch.ones_like(rel_logits_real)
+                gate_null = torch.ones_like(rel_logits_null)
 
             # 4.1 shrink delta output when news is absent
             loss_null = (delta_pred_null ** 2).mean()
@@ -1514,43 +1658,84 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             # final predictions in z-space
             pred_real_z = base_pred + delta_pred_real
             pred_null_z = base_pred + delta_pred_null
+            pred_base_z = base_pred
 
-            # per-sample errors (L1 in z-space, consistent with your model loss)
+            # per-sample errors in z-space
             err_real = torch.abs(pred_real_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
             err_null = torch.abs(pred_null_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
+            err_base = torch.abs(pred_base_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
 
-            # 4.2 hinge margin: err_null >= err_real + margin  =>  relu(margin + err_real - err_null)
-            loss_margin = torch.relu(delta_adv_margin + err_real - err_null).mean()
+            # pseudo label from counterfactual gain; no-news samples are always 0.
+            gain = (err_null - err_real) - cf_pseudo_margin
+            pseudo_soft = torch.sigmoid(gain / cf_pseudo_temp) * has_news
+            if cf_pseudo_hard == 1:
+                pseudo_gate = (pseudo_soft >= 0.5).to(torch.float32)
+            else:
+                pseudo_gate = pseudo_soft
+            pseudo_gate = pseudo_gate.detach()
+            pseudo_target = (0.8 * pseudo_gate + 0.2 * rel_labels_d * has_news).detach()
 
-            hinge = torch.relu(delta_adv_margin + err_real - err_null)  # (B,)
-            # loss_margin = (w * hinge).sum() / (w.sum().clamp_min(1e-6))
-            # loss_margin = (w * hinge).mean() 
+            # weighted residual target fitting
+            residual_mode = str(getattr(args, "residual_loss", "mae")).lower()
+            per_elem_res = _residual_elementwise(delta_pred_real, delta_targets, residual_mode)
+            per_sample_res = per_elem_res.mean(dim=1)
+            sample_w = cf_min_weight + (1.0 - cf_min_weight) * pseudo_soft.detach()
+            sample_w = torch.where(has_news > 0.5, sample_w, torch.ones_like(sample_w))
+            loss_res = (sample_w * per_sample_res).sum() / sample_w.sum().clamp_min(1e-6)
 
-            # total loss
+            # 4.2 hinge margin: err_null >= err_real + margin
+            hinge_margin = torch.relu(delta_adv_margin + err_real - err_null)
+            if violation_cap > 0:
+                hinge_margin = hinge_margin.clamp(max=violation_cap)
+            margin_w = pseudo_soft.detach().clamp_min(1e-3)
+            loss_margin = (margin_w * hinge_margin).sum() / margin_w.sum().clamp_min(1e-6)
 
-            # 总LOSS = 相关度*residual loss + 无新闻代入时的loss * 权重 + 相关度*加入新闻的增量 * 权重
-            loss_total = loss_res + delta_null_lambda * loss_null + delta_margin_lambda * loss_margin
+            # 4.3 non-degradation vs base
+            hinge_non_degrade = torch.relu(delta_non_degrade_margin + err_real - err_base)
+            if violation_cap > 0:
+                hinge_non_degrade = hinge_non_degrade.clamp(max=violation_cap)
+            loss_non_degrade = hinge_non_degrade.mean()
+
+            # 4.4 gate training: useful-news samples -> high gate, no-news -> low gate
+            if gate_enable:
+                loss_gate = F.binary_cross_entropy_with_logits(rel_logits_real, pseudo_target)
+                loss_gate_null = F.binary_cross_entropy_with_logits(rel_logits_null, torch.zeros_like(rel_logits_null))
+            else:
+                loss_gate = torch.zeros((), device=device, dtype=torch.float32)
+                loss_gate_null = torch.zeros((), device=device, dtype=torch.float32)
+
+            warm = int(getattr(args, "delta_curriculum_epochs", 0))
+            if warm > 0:
+                curriculum = min(1.0, float(epoch + 1) / float(warm))
+            else:
+                curriculum = 1.0
+
+            loss_total = (
+                loss_res
+                + curriculum * delta_null_lambda * loss_null
+                + curriculum * delta_margin_lambda * loss_margin
+                + curriculum * delta_non_degrade_lambda * loss_non_degrade
+                + curriculum * gate_lambda * loss_gate
+                + curriculum * gate_null_lambda * loss_gate_null
+            )
 
             # backward with grad accumulation
             loss = loss_total / args.grad_accum
             loss.backward()
 
-            # live_logger.info(
-            #     f"\nLOSS_RES (相关度)={loss_res.item():.6f}\n"
-            #     f"LOSS_NULL (无新闻)={loss_null.item():.6f}\n"
-            #     f"LOSS_MARGIN (增量)={loss_margin.item():.6f}\n"
-            #     f"LOSS_TOTAL = {loss_total.item():.6f}\n"
-            #     f"LOSS_GRAD_ACC = {loss.item():.6f}\n"
-               
-            # )
-
-
             loss_window.append(float(loss.detach().cpu()))
             if global_step % 10 == 0:
                 avg_train_loss = sum(loss_window) / len(loss_window)
-                pbar.set_postfix(train_loss=f"{avg_train_loss:.6f}")
+                pbar.set_postfix(
+                    train_loss=f"{avg_train_loss:.6f}",
+                    gate=float(gate_real.mean().detach().cpu()),
+                    useful=float(pseudo_soft.mean().detach().cpu()),
+                )
 
             if (global_step + 1) % args.grad_accum == 0:
+                grad_clip = float(getattr(args, "delta_grad_clip", 0.0))
+                if grad_clip > 0:
+                    clip_grad_norm_((p for p in delta_model.parameters() if p.requires_grad), grad_clip)
                 optim_delta.step()
                 if args.scheduler == 1:
                     scheduler_delta.step()
@@ -1603,8 +1788,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             best_policy_name = policy_name
 
             best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
-            if os.path.isfile(best_delta_path):
-                os.remove(best_delta_path)
+            shutil.rmtree(best_delta_path, ignore_errors=True)
 
             save_checkpoint(
                 best_delta_path,
@@ -1654,6 +1838,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     # TEST (combined with best delta; base computed via adapter_off)
     if test_loader is not None:
         del delta_model
+         # ---- free training-time GPU objects ----
+        # del delta_model
+        # del optim_delta
+        # if scheduler_delta is not None:
+        #     del scheduler_delta
+
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1904,7 +2094,12 @@ def main(args):
     # stage == "all"
     if stage == "all":
         cfg_base = train_base_stage(args, bundle)
-        cfg = train_delta_stage(args, bundle, best_base_path=cfg_base["best_base_path"], best_base_metric=float("inf"))
+        cfg = train_delta_stage(
+            args,
+            bundle,
+            best_base_path=cfg_base["best_base_path"],
+            best_base_metric=float(cfg_base["best_base_metric"]),
+        )
         # testing_delta(
         #     cfg["test_loader"],
         #     args,

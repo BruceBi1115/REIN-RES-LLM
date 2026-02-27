@@ -1,3 +1,4 @@
+export CUDA_VISIBLE_DEVICES=0
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -7,28 +8,27 @@ set -euo pipefail
 PYTHON_BIN="python"
 ENTRY="run.py"
 TIME_COL="SETTLEMENTDATE"
-VALUE_COL="RRP"
-UNIT="$/MWh"
-DESCRIPTION="This dataset records the electricity price data in Australia NSW from 2019 to 2020, collected from National electricity market."
+VALUE_COL="TOTALDEMAND"
+UNIT="megawatts"
+DESCRIPTION="This dataset records the electricity load demand data in Australia NSW from 2019 to 2020, collected from National electricity market."
 REGION="Australia, NSW"
 
-
-TRAIN_FILE="dataset/2019-2020NSWelecprice/2019To2020NSWData_trainset.csv"
-VAL_FILE="dataset/2019-2020NSWelecprice/2019To2020NSWData_valset.csv"
-TEST_FILE="dataset/2019-2020NSWelecprice/2019To2020NSWData_testset.csv"
-
+TRAIN_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_trainset.csv"
+VAL_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_valset.csv"
+TEST_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_testset.csv"
 
 NEWS_TEXT_COL="summary_response"
 NEWS_TIME_COL="publication_time"
 KEYWORD_PATH="keywords/kw_2.txt"
 
-EPOCHS="50"
+DELTA_EPOCHS="20"
+BASE_EPOCHS="20"
+
 KEYWORD_NUMBER="20"
 NEWS_WINDOW_DAYS="1"
 NEWS_TOPM="999"
-NEWS_TOPK="10"
+NEWS_TOPK="999"
 BATCH_SIZE="1"
-
 RL_ALGO="lints"
 # RL_ALGO="linucb"
 
@@ -42,6 +42,13 @@ NEWS_PATH="dataset/FNT_2019_2020_combined.json"
 
 RESIDUAL_LOSS="mae"
 REWARD_METRIC="mae"
+
+STRIDE="1"
+HORIZON="48"
+PATCH_DROPOUT="0"
+HEAD_DROPOUT="0.1"
+
+STAGE="all"
 
 #test different news lookback length in days
 LOOKBACK_WINDOWS=(
@@ -59,17 +66,16 @@ LOOKBACK_WINDOWS=(
 # 2) 四个 task 的“差异项”用数组列出来（for 循环跑）
 # =======================
 TASK_NAMES=(
-  "[DeltaEmptyNews]NSW_2015_2016"
-  "[DeltaWithNews]NSW_2015_2016"
-  "[DeltaWithNews]NSW_2019_2020"
-  "[Full]NSW_2019_2020"
+  "[Dataset test]NSW_19_20_LOAD"
 )
 
-STAGE="delta"
+
 
 NEWS_CHOICES=(
-  ""
+  # ""
   "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
+  # "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
+  # ""
   # "dataset/V0_Watt_NoSum_news_2015_2020.json"
   # "dataset/FNT_traffic_news.json"
   # "dataset/Sum_V6_news_2015_2016.json"
@@ -80,40 +86,33 @@ NEWS_CHOICES=(
   
 )
 
-RUN_OR_NOT=(
-    ""
-    ""
-    "1"
-    ""
-)
 
-scheduler=(
-  # "0"
+#---------basics----------
+# 每个 task 是否真的要跑（空串表示不跑），用来快速控制开关
+RUN_OR_NOT=(
   "1"
 )
 # 每个 task 对应的 rl_use
 RL_USES=(
-  "0"  # Pure
-  "0"  # NoNews
-  "0"  # NoRL
-  "1"  # Default
+  "0"
 )
-
 # 每个 task 是否带 news_path（空串表示不传这个参数）
 NEWS_PATHS=(
-  ""         # Pure: no --news_path
-  "$NEWS_PATH"         # NoNews: no --news_path
-  "$NEWS_PATH"  # NoRL: with --news_path
-  "$NEWS_PATH"  # Default: with --news_path
+  "$NEWS_PATH"
+)
+# 每个 task 是否带 template_pool（空串表示不传这个参数）
+TEMPLATE_POOLS=(          
+  "$TEMPLATE_POOL_2"                      
+)
+#-------------------
+
+
+#--------- iteration ---------
+scheduler=(
+  # "0"
+  "1"
 )
 
-# 每个 task 是否带 template_pool（空串表示不传这个参数）
-TEMPLATE_POOLS=(
-  "$TEMPLATE_POOL_1"  
-  ""                     # NoNews: no --template_pool
-  "$TEMPLATE_POOL_2"  
-  ""                     # Default: no --template_pool
-)
 
 NEWS_DROPOUT=(
   "0.4"
@@ -124,17 +123,22 @@ NEWS_DROPOUT=(
 )
 
 null=(
+  "0"
   # "0.05"
   # "0.5"
   # "0.1"
   # "0.005"
   # "0.001"
-  "0.0001"
+  # "0.0001"
+  # "0.00001"
 
 )
 
 margin=(
-  "1"
+  "10"
+  # "20"
+  # "50"
+  # "100"
   # "2"
   # "0.5"
   # "0.1"
@@ -178,7 +182,6 @@ COMMON_ARGS=(
   --news_text_col "$NEWS_TEXT_COL"
   --news_time_col "$NEWS_TIME_COL"
   --keyword_path "$KEYWORD_PATH"
-  --epochs "$EPOCHS"
   --keyword_number "$KEYWORD_NUMBER"
   --news_window_days "$NEWS_WINDOW_DAYS"
   --news_topM "$NEWS_TOPM"
@@ -219,12 +222,13 @@ for i in "${!TASK_NAMES[@]}"; do
       # OVERRIDE
       args+=( --news_window_days "${LOOKBACK_WINDOWS[$k]}" )
       args+=( --head_mlp)
-      args+=( --patch_dropout 0)
-      args+=( --head_dropout 0.1)
-      args+=( --stride 1)
-      args+=( --horizon 1)
+      args+=( --patch_dropout "$PATCH_DROPOUT")
+      args+=( --head_dropout "$HEAD_DROPOUT")
+      args+=( --stride "$STRIDE")
+      args+=( --horizon "$HORIZON")
+      args+=( --base_epochs "$BASE_EPOCHS")
+      args+=( --delta_epochs "$DELTA_EPOCHS")
       
-
       
       for null_lambda in "${null[@]}"; do
         for margin_lambda in "${margin[@]}"; do
@@ -262,7 +266,7 @@ for i in "${!TASK_NAMES[@]}"; do
       # fi
       # # 测试后，删除保存的模型，为了节省空间的不得已之举
       # # rm -rf "checkpoints/${task}/best_base_${task}"
-      rm -rf "checkpoints/${task}/best_delta_${task}"
+      # rm -rf "checkpoints/${task}/best_delta_${task}"
     done
   done
 done

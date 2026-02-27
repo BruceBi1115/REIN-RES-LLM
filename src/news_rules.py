@@ -203,7 +203,7 @@ def select_news(cand: pd.DataFrame, policy: str, text_col: str,
     elif policy == 'keyword_polarity_low_hybrid':
         selected = keyword_polarity_low_hybrid(cand, text_col, policy_kw, 1)#先按keyword筛选，然后选个
     elif policy == "all":
-        selected = cand
+        selected = cand.head(K)
     elif policy == "sum_v0":
         selected = cand
     elif policy == "no_sum":

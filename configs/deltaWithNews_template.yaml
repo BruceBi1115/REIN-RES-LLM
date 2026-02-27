@@ -15,8 +15,9 @@ templates:
   - id: 1
     name: "No_frequency_keep_time_anchors_news_first"
     text: |
-      News records (treat as exogenous signals): {NEWS}
       The historical {value_col} is: {HISTORY}
+      News records (treat as exogenous signals): {NEWS}
+      
     has_region_anchor: true
     has_history_start_end: true
     has_pred_start_end: true

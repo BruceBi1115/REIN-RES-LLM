@@ -19,11 +19,37 @@ if __name__ == '__main__':
     parser.add_argument('--delta_null_lambda', type=float, default=0.0001, help='weight for ||delta_pred(no-news)|| shrink')
     parser.add_argument('--delta_margin_lambda', type=float, default=1.0, help='weight for counterfactual margin loss')
     parser.add_argument('--delta_adv_margin', type=float, default=0.02, help='margin in z-space: err_null >= err_real + margin')
+    parser.add_argument('--delta_non_degrade_lambda', type=float, default=1.0, help='weight for non-degradation guard vs base')
+    parser.add_argument('--delta_non_degrade_margin', type=float, default=0.0, help='margin in z-space: err_real <= err_base - margin')
+
+    parser.add_argument('--news_gate_enable', type=int, default=1, choices=[0, 1], help='enable sample-wise news gate')
+    parser.add_argument('--news_gate_temperature', type=float, default=1.0, help='temperature for sigmoid news gate')
+    parser.add_argument('--news_gate_floor', type=float, default=0.0, help='lower bound for gate value to avoid over-shrink')
+    parser.add_argument('--gate_lambda', type=float, default=0.2, help='weight for gate pseudo-label BCE loss')
+    parser.add_argument('--gate_null_lambda', type=float, default=0.1, help='weight forcing no-news gate toward zero')
+    parser.add_argument('--delta_gate_init_bias', type=float, default=-1.0, help='init bias for horizon-wise delta gate head')
+    parser.add_argument('--delta_clip', type=float, default=3.0, help='tanh clip for delta outputs in z-space (<=0 to disable)')
+    parser.add_argument('--delta_news_tail_tokens', type=int, default=160, help='how many tail text tokens to pool as news context')
+    parser.add_argument('--delta_rel_floor', type=float, default=0.05, help='minimum multiplicative factor from relevance gate')
+
+    parser.add_argument('--cf_pseudo_margin', type=float, default=0.01, help='counterfactual gain margin for pseudo labels')
+    parser.add_argument('--cf_pseudo_temp', type=float, default=0.02, help='temperature for soft pseudo labels')
+    parser.add_argument('--cf_pseudo_hard', type=int, default=0, choices=[0, 1], help='use hard(1)/soft(0) pseudo labels')
+    parser.add_argument('--cf_min_weight', type=float, default=0.05, help='minimum residual weight for samples with news')
+    parser.add_argument('--delta_curriculum_epochs', type=int, default=3, help='ramp-up epochs for delta constraints')
+    parser.add_argument('--delta_grad_clip', type=float, default=1.0, help='grad clip norm for delta stage (<=0 to disable)')
+    parser.add_argument('--delta_violation_cap', type=float, default=1.0, help='cap per-sample margin/non-degrade hinge value (>0 to enable)')
+    parser.add_argument('--delta_lora_lr_scale', type=float, default=0.3, help='lr scale for LoRA params in delta stage')
+    parser.add_argument('--delta_head_lr_scale', type=float, default=1.0, help='lr scale for delta/rel heads in delta stage')
+    parser.add_argument('--delta_other_lr_scale', type=float, default=0.5, help='lr scale for other trainable params in delta stage')
 
 
     parser.add_argument("--patch_dropout", type=float, default=0.0)
     parser.add_argument("--head_dropout", type=float, default=0.0)
     parser.add_argument("--head_mlp", action="store_true", default=False)
+
+    parser.add_argument("--policy_space", type=list, default=["all"])
+    parser.add_argument("--default_policy", type=str, default="all", help="default news selection policy for training and evaluation")
 
     #TIME-SEIRES DATA PATCH LEN
     parser.add_argument("--patch_len", type=int, default=4)
