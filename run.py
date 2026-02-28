@@ -65,6 +65,22 @@ if __name__ == '__main__':
 
     parser.add_argument("--delta_epochs", type=int, default=4,
                         help="If >=0, override delta epochs when stage=all or stage=delta.")
+
+    # ==== pure TS base backbone (scheme2) ====
+    parser.add_argument("--base_backbone", type=str, default="dlinear", choices=["dlinear", "mlp"],
+                        help="pure TS backbone used in base stage")
+    parser.add_argument("--base_hidden_dim", type=int, default=256,
+                        help="hidden dim for MLP base backbone")
+    parser.add_argument("--base_moving_avg", type=int, default=25,
+                        help="moving average kernel for DLinear decomposition")
+    parser.add_argument("--base_dropout", type=float, default=0.0,
+                        help="dropout in base backbone")
+    parser.add_argument("--base_lr", type=float, default=-1.0,
+                        help="learning rate for base backbone (<=0 to reuse --lr)")
+    parser.add_argument("--base_weight_decay", type=float, default=-1.0,
+                        help="weight decay for base backbone (<0 to reuse --weight_decay)")
+    parser.add_argument("--base_loss", type=str, default="smooth_l1", choices=["mse", "mae", "smooth_l1"],
+                        help="point loss used in base stage training/eval")
     # ==== residual loss =====
     parser.add_argument("--residual_loss", type=str, default="mse", choices = ['mse', 'mae', 'smooth_l1'])
     parser.add_argument("--residual_base_frac",type=float,default=0.4)
@@ -167,14 +183,14 @@ if __name__ == '__main__':
     parser.add_argument('--save_interval', type=int, default=1000, help='save every N steps')
 
     # ===== RL / Bandit =====
-    parser.add_argument('--rl_use', type=int, default=1, help='use RL/bandit for news selection? (0/1)')
+    parser.add_argument('--rl_use', type=int, default=0, help='use RL/bandit for news selection? (0/1)')
     parser.add_argument('--rl_algo', type=str, default='lints', choices=['lints','linucb'], help='bandit algorithm')
     parser.add_argument('--rl_cycle_steps', type=int, default=100, help='short SFT steps per decision cycle (0=no-train)')
     parser.add_argument('--rl_update_times', type=int, default=1, help='update bandits every N cycles')
     parser.add_argument('--rl_val_probe_size', type=int, default=256, help='fixed validation probe size')
     parser.add_argument('--rl_val_probe_frac', type=float, default=0.5, help='fixed validation probe fraction')
 
-    parser.add_argument('--reward_metric', type=str, default='rmse', choices=['mse','mae','loss'], help='reward metric')
+    parser.add_argument('--reward_metric', type=str, default='mae', choices=['mse','mae','loss'], help='reward metric')
     parser.add_argument('--reward_mode', type=str, default='delta', choices=['delta','negative'], help='delta or negative')
     parser.add_argument('--reward_len_penalty', type=float, default=0.0, help='penalty for prompt tokens')
     parser.add_argument('--reward_k_penalty', type=float, default=0.0, help='penalty for K news')

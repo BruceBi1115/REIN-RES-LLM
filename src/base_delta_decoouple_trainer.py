@@ -41,6 +41,11 @@ from .utils.logger import setup_live_logger
 from .RL.features import bandit_select, get_context_features, encode_instruction
 
 from .model2 import load_checkpoint, load_llama_lora, save_checkpoint
+from .base_backbone import (
+    build_base_backbone,
+    save_base_backbone_checkpoint,
+    load_base_backbone_checkpoint,
+)
 from .utils.residual_utils import freeze_module, zero_regressor_head, split_two_stage_epochs
 
 from .utils.utils import (
@@ -175,6 +180,63 @@ def _build_delta_optimizer(delta_model, args):
         "n_other": len(other_params),
     }
     return optimizer, lr_info
+
+
+def _z_batch_tensors(batch, args):
+    """
+    Build z-scored tensors for pure TS backbone.
+    Returns:
+      history_z: (B, L)
+      targets_z: (B, H)
+      metas: list[{"mu": float, "sigma": float}]
+    """
+    L = int(args.history_len)
+    H = int(args.horizon)
+    eps = float(getattr(args, "zscore_eps", 1e-6))
+
+    history_z_list = []
+    targets_z_list = []
+    metas = []
+
+    B = len(batch["history_value"])
+    for i in range(B):
+        history = batch["history_value"][i].tolist()
+        target = batch["target_value"][i].tolist()
+
+        mu, sigma = _zstats(history, eps=eps)
+        history_z = np.asarray(_zscore(history, mu, sigma), dtype=np.float32)
+        target_z = np.asarray(_zscore(target, mu, sigma), dtype=np.float32)
+
+        if history_z.shape[0] > L:
+            history_z = history_z[-L:]
+        elif history_z.shape[0] < L:
+            pad = np.zeros((L,), dtype=np.float32)
+            pad[-history_z.shape[0] :] = history_z
+            history_z = pad
+
+        if target_z.shape[0] > H:
+            target_z = target_z[:H]
+        elif target_z.shape[0] < H:
+            pad = np.zeros((H,), dtype=np.float32)
+            pad[: target_z.shape[0]] = target_z
+            target_z = pad
+
+        history_z_list.append(history_z)
+        targets_z_list.append(target_z)
+        metas.append({"mu": float(mu), "sigma": float(sigma)})
+
+    history_z_t = torch.tensor(np.stack(history_z_list, axis=0), dtype=torch.float32)
+    targets_z_t = torch.tensor(np.stack(targets_z_list, axis=0), dtype=torch.float32)
+    return history_z_t, targets_z_t, metas
+
+
+def _point_loss(pred: torch.Tensor, target: torch.Tensor, mode: str) -> torch.Tensor:
+    m = str(mode).lower()
+    if m == "mse":
+        return F.mse_loss(pred, target, reduction="mean")
+    if m == "mae":
+        return F.l1_loss(pred, target, reduction="mean")
+    return F.smooth_l1_loss(pred, target, reduction="mean")
 
 
 def _make_patches(seq: list[float], patch_len: int, stride: int):
@@ -542,6 +604,81 @@ def evaluate_metrics_single(
 
 
 @torch.no_grad()
+def evaluate_metrics_backbone(
+    base_backbone,
+    data_loader,
+    args,
+    device,
+    testing: bool = False,
+    true_pred_csv_path: str | None = None,
+    filename: str | None = None,
+):
+    """
+    Pure TS backbone evaluation in z-space.
+    """
+    base_backbone.eval()
+
+    loss_sum, n_samples = 0.0, 0
+    se_sum, ae_sum, n_elems = 0.0, 0.0, 0
+
+    ans_json_path = None
+    if testing and filename is not None:
+        ckpt_dir = os.path.join("./checkpoints", args.taskName)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
+
+    for _, batch in enumerate(data_loader):
+        history_z, targets_z, metas = _z_batch_tensors(batch, args)
+        history_z = history_z.to(device)
+        targets_z = targets_z.to(device)
+
+        pred_z = base_backbone(history_z).to(torch.float32)
+        loss = _point_loss(pred_z, targets_z.to(torch.float32), mode=getattr(args, "base_loss", "smooth_l1"))
+
+        bs = pred_z.size(0)
+        loss_sum += float(loss.detach().cpu()) * bs
+        n_samples += bs
+
+        pred_z_cpu = pred_z.detach().cpu().numpy()
+        targets_cpu = batch["target_value"].detach().cpu().numpy()
+
+        for i in range(bs):
+            mu = float(metas[i]["mu"])
+            sigma = float(metas[i]["sigma"])
+
+            pred_denorm = _inv_zscore(pred_z_cpu[i].tolist(), mu, sigma)
+            true_vals = targets_cpu[i].reshape(-1).tolist()
+            true_vals = [float(x) for x in true_vals[: int(args.horizon)]]
+
+            pred = np.asarray(pred_denorm, dtype=np.float32)
+            true = np.asarray(true_vals, dtype=np.float32)
+            se_sum += float(((pred - true) ** 2).sum())
+            ae_sum += float(np.abs(pred - true).sum())
+            n_elems += int(args.horizon)
+
+            if true_pred_csv_path is not None:
+                with open(true_pred_csv_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(zip(pred_denorm, true_vals))
+
+            if ans_json_path is not None:
+                rec = {
+                    "pred_z": [float(x) for x in pred_z_cpu[i].tolist()],
+                    "pred": [float(x) for x in pred_denorm],
+                    "true": [float(x) for x in true_vals],
+                    "mu": mu,
+                    "sigma": sigma,
+                }
+                with open(ans_json_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    loss_avg = loss_sum / max(1, n_samples)
+    mse_avg = se_sum / max(1, n_elems) if n_elems > 0 else float("inf")
+    mae_avg = ae_sum / max(1, n_elems) if n_elems > 0 else float("inf")
+    return loss_avg, mse_avg, mae_avg
+
+
+@torch.no_grad()
 def evaluate_metrics_residual(
     base_model,
     delta_model,
@@ -561,9 +698,13 @@ def evaluate_metrics_residual(
     filename: str = None,
 ):
     """
-    Residual evaluation: pred = base(no-news, adapter_off) + delta(with-news, adapter_on)
+    Residual evaluation: pred = base_backbone(history_z) + delta_llm(with-news)
     Returns combined metrics.
     """
+    if base_model is None:
+        raise ValueError("evaluate_metrics_residual requires a trained base backbone model.")
+
+    base_model.eval()
     delta_model.eval()
 
     loss_sum, n_samples = 0.0, 0
@@ -592,46 +733,16 @@ def evaluate_metrics_residual(
             force_no_news=False,
             news_dropout=news_dropout,
         )
-        # build base (no news)
-        ids_b, attn_b, _, _, _, _, _, _, _ = build_batch_inputs(
-            batch=batch,
-            tokenizer=tokenizer,
-            templates=templates,
-            tpl_id=tpl_id,
-            args=args,
-            news_df=news_df,
-            policy_name=policy_name,
-            policy_kw=policy_kw,
-            volatility_bin=volatility_bin,
-            epoch=-1,
-            record_train_prompt=False,
-            testing=False,
-            force_no_news=True,
-            news_dropout=False,
-        )
 
         ids_d = ids_d.to(device)
         attn_d = attn_d.to(device)
-        ids_b = ids_b.to(device)
-        attn_b = attn_b.to(device)
         ts_p = ts_p.to(device)
         ts_pm = ts_pm.to(device)
         targets_z = targets_z.to(device)
 
-        # base pred: adapter off + no news
-        with torch.no_grad():
-            with _adapter_off(delta_model.lm):
-                out_base = delta_model(
-                    input_ids=ids_b,
-                    attention_mask=attn_b,
-                    ts_patches=ts_p,
-                    ts_patch_mask=ts_pm,
-                    targets=None,
-                    head_mode="base",   # NEW
-                )
-                base_pred = out_base["pred"].to(torch.float32)
-
-        delta_targets = (targets_z.to(torch.float32) - base_pred).detach()
+        history_z, _, _ = _z_batch_tensors(batch, args)
+        history_z = history_z.to(device)
+        base_pred = base_model(history_z).to(torch.float32)  # (B,H)
 
         # delta pred: adapter on + with news
         out_delta = delta_model(
@@ -639,10 +750,10 @@ def evaluate_metrics_residual(
             attention_mask=attn_d,
             ts_patches=ts_p,
             ts_patch_mask=ts_pm,
-            targets=delta_targets,
+            targets=None,
             head_mode="delta",
-            rel_targets=rel_labels_d,     # NEW
-            rel_lambda=args.rel_lambda,   # NEW
+            rel_targets=None,
+            rel_lambda=0.0,
         )
         delta_corr = out_delta["pred"].to(torch.float32)
 
@@ -1024,19 +1135,7 @@ def train_base_stage(args, bundle):
     device = bundle["device"]
     train_loader = bundle["train_loader"]
     val_loader = bundle["val_loader"]
-    news_df = bundle["news_df"]
-    policy_kw = bundle["policy_kw"]
     templates = bundle["templates"]
-    patch_len = bundle["patch_len"]
-    volatility_bin = bundle["volatility_bin"]
-    volatility_bin_val = bundle["volatility_bin_val"]
-
-    lora_cfg = {
-        "r": int(args.lora_r),
-        "alpha": int(args.lora_alpha),
-        "dropout": float(args.lora_dropout),
-        "target_modules": args.target_modules,
-    }
 
     # base epochs
     base_epochs_override = int(getattr(args, "base_epochs", -1))
@@ -1055,36 +1154,33 @@ def train_base_stage(args, bundle):
             base_epochs = max(0, min(base_epochs, int(args.epochs) - 1))
 
     live_logger.info("-----------------------------------------------------")
-    live_logger.info(f"[BASE] Training BASE only: epochs={base_epochs} (force_no_news=True)")
+    live_logger.info(
+        f"[BASE] Training pure TS backbone ({getattr(args, 'base_backbone', 'dlinear')}), "
+        f"epochs={base_epochs} (no-news)"
+    )
     live_logger.info("-----------------------------------------------------")
 
-    tokenizer, base_train_model = load_llama_lora(
-        base_model=args.base_model,
-        tokenizer_id=args.tokenizer,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=args.target_modules,
-        load_in_4bit=args.load_in_4bit,
-        gradient_checkpointing=args.gradient_checkpointing,
-        max_seq_len=args.max_seq_len,
-        device=device,
-        horizon=args.horizon,
-        patch_dim=patch_len,
-        patch_dropout=args.patch_dropout,
-        head_dropout=args.head_dropout,
-        head_mlp=args.head_mlp,
-        delta_gate_init_bias=float(getattr(args, "delta_gate_init_bias", -1.0)),
-        delta_clip=float(getattr(args, "delta_clip", 3.0)),
-        delta_news_tail_tokens=int(getattr(args, "delta_news_tail_tokens", 160)),
-        delta_rel_floor=float(getattr(args, "delta_rel_floor", 0.05)),
+    base_train_model = build_base_backbone(
+        backbone_name=getattr(args, "base_backbone", "dlinear"),
+        history_len=int(args.history_len),
+        horizon=int(args.horizon),
+        hidden_dim=int(getattr(args, "base_hidden_dim", 256)),
+        moving_avg=int(getattr(args, "base_moving_avg", 25)),
+        dropout=float(getattr(args, "base_dropout", 0.0)),
     )
     base_train_model.to(device)
 
+    base_lr = float(getattr(args, "base_lr", -1.0))
+    if base_lr <= 0:
+        base_lr = float(args.lr)
+    base_wd = float(getattr(args, "base_weight_decay", -1.0))
+    if base_wd < 0:
+        base_wd = float(args.weight_decay)
+
     optim_base = AdamW(
-        filter(lambda p: p.requires_grad, base_train_model.parameters()),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+        base_train_model.parameters(),
+        lr=base_lr,
+        weight_decay=base_wd,
     )
 
     num_batches = len(train_loader)
@@ -1102,10 +1198,6 @@ def train_base_stage(args, bundle):
     else:
         scheduler_base = None
 
-    allowed_tpl_ids = sorted([t["id"] for t in templates.values()])
-    tpl_id = allowed_tpl_ids[0]
-    policy_name_base = "all"
-
     best_base_metric = float("inf")
     stale_rounds = 0
     loss_window = deque(maxlen=50)
@@ -1115,38 +1207,13 @@ def train_base_stage(args, bundle):
         pbar = tqdm(train_loader, desc=f"[BASE] Epoch {epoch+1}/{base_epochs}")
 
         for _, batch in enumerate(pbar):
-            input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, _, _, _ = build_batch_inputs(
-                batch=batch,
-                tokenizer=tokenizer,
-                templates=templates,
-                tpl_id=tpl_id,
-                args=args,
-                news_df=news_df,
-                policy_name=policy_name_base,
-                policy_kw=policy_kw,
-                volatility_bin=volatility_bin,
-                epoch=epoch,
-                record_train_prompt=False,
-                testing=False,
-                force_no_news=True,
-                news_dropout=False,
-            )
-
-            input_ids = input_ids.to(device)
-            attn = attn.to(device)
-            ts_patches = ts_patches.to(device)
-            ts_patch_mask = ts_patch_mask.to(device)
+            history_z, targets_z, _ = _z_batch_tensors(batch, args)
+            history_z = history_z.to(device)
             targets_z = targets_z.to(device)
 
             base_train_model.train()
-            out = base_train_model(
-                input_ids=input_ids,
-                attention_mask=attn,
-                ts_patches=ts_patches,
-                ts_patch_mask=ts_patch_mask,
-                targets=targets_z,
-            )
-            loss = out["loss_fore"] / args.grad_accum
+            pred_z = base_train_model(history_z)
+            loss = _point_loss(pred_z, targets_z, mode=getattr(args, "base_loss", "smooth_l1")) / args.grad_accum
             loss.backward()
 
             loss_window.append(float(loss.detach().cpu()))
@@ -1162,22 +1229,14 @@ def train_base_stage(args, bundle):
 
             global_step += 1
 
-        val_loss, val_mse, val_mae = evaluate_metrics_single(
-            model=base_train_model,
-            tokenizer=tokenizer,
+        val_loss, val_mse, val_mae = evaluate_metrics_backbone(
+            base_backbone=base_train_model,
             data_loader=val_loader,
-            templates=templates,
-            tpl_id=tpl_id,
             args=args,
-            news_df=news_df,
-            policy_name=policy_name_base,
-            policy_kw=policy_kw,
             device=device,
-            volatility_bin=volatility_bin_val,
             testing=False,
             true_pred_csv_path=None,
-            news_dropout=False,
-            force_no_news=True,
+            filename=None,
         )
 
         if args.reward_metric == "loss":
@@ -1188,7 +1247,7 @@ def train_base_stage(args, bundle):
             metric_now = val_mae
 
         live_logger.info(
-            f"[BASE][EVAL] epoch={epoch+1} tpl_id={tpl_id} "
+            f"[BASE][EVAL] epoch={epoch+1} "
             f"val_loss(zMSE)={val_loss:.6f} val_mse(raw)={val_mse:.6f} val_mae(raw)={val_mae:.6f}"
         )
 
@@ -1200,13 +1259,15 @@ def train_base_stage(args, bundle):
             #     os.remove(best_base_path)
             shutil.rmtree(best_base_path, ignore_errors=True)
 
-            save_checkpoint(
+            save_base_backbone_checkpoint(
                 best_base_path,
-                tokenizer,
                 base_train_model,
-                base_model_id=args.base_model,
-                tokenizer_id=args.tokenizer or args.base_model,
-                lora_cfg=lora_cfg,
+                backbone_name=getattr(args, "base_backbone", "dlinear"),
+                history_len=int(args.history_len),
+                horizon=int(args.horizon),
+                hidden_dim=int(getattr(args, "base_hidden_dim", 256)),
+                moving_avg=int(getattr(args, "base_moving_avg", 25)),
+                dropout=float(getattr(args, "base_dropout", 0.0)),
                 optimizer=optim_base,
                 scheduler=scheduler_base,
                 epoch=epoch,
@@ -1234,10 +1295,7 @@ def train_base_stage(args, bundle):
         "best_base_path":best_base_path,
         "device": device,
         "live_logger": live_logger,
-        "tpl_id":tpl_id,
         "templates":templates,
-        "news_df":news_df,
-        "policy_kw":policy_kw,
         "best_base_metric": best_base_metric,
     }
 
@@ -1255,6 +1313,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     news_df = bundle["news_df"]
     policy_kw = bundle["policy_kw"]
     templates = bundle["templates"]
+    patch_len = bundle["patch_len"]
     volatility_bin = bundle["volatility_bin"]
     volatility_bin_val = bundle["volatility_bin_val"]
     volatility_bin_test = bundle["volatility_bin_test"]
@@ -1288,16 +1347,37 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     live_logger.info(f"[DELTA] Training DELTA: epochs={delta_epochs}, base_ckpt={best_base_path}")
     live_logger.info("-----------------------------------------------------")
 
-    # delta model init from base checkpoint but trainable
-    tokenizer, delta_model = load_checkpoint(
+    base_backbone, base_meta = load_base_backbone_checkpoint(
         best_base_path,
+        device=device,
+        is_trainable=False,
+    )
+    live_logger.info(
+        f"[DELTA] Loaded base backbone: {base_meta.get('backbone_name')} "
+        f"(L={base_meta.get('history_len')}, H={base_meta.get('horizon')})"
+    )
+
+    # delta model init from pretrained LLM + LoRA (base comes from pure TS backbone)
+    tokenizer, delta_model = load_llama_lora(
+        base_model=args.base_model,
+        tokenizer_id=args.tokenizer,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=args.target_modules,
         load_in_4bit=args.load_in_4bit,
         gradient_checkpointing=args.gradient_checkpointing,
-        device_map=_single_device_map(args),
-        is_trainable=True,
+        max_seq_len=args.max_seq_len,
+        device=device,
+        horizon=args.horizon,
+        patch_dim=patch_len,
+        patch_dropout=args.patch_dropout,
+        head_dropout=args.head_dropout,
         head_mlp=args.head_mlp,
-        hd=args.head_dropout,
-        pd=args.patch_dropout
+        delta_gate_init_bias=float(getattr(args, "delta_gate_init_bias", -1.0)),
+        delta_clip=float(getattr(args, "delta_clip", 3.0)),
+        delta_news_tail_tokens=int(getattr(args, "delta_news_tail_tokens", 160)),
+        delta_rel_floor=float(getattr(args, "delta_rel_floor", 0.05)),
     )
     delta_model.to(device)
     # zero_regressor_head(delta_model)
@@ -1338,24 +1418,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     if hasattr(delta_model, "delta_log_scale"):
         delta_model.delta_log_scale.requires_grad = True
 
-    # base teacher (frozen) - provides base_pred
-    base_teacher = None
-    # _, base_teacher = load_checkpoint(
-    #     best_base_path,
-    #     load_in_4bit=args.load_in_4bit,
-    #     gradient_checkpointing=args.gradient_checkpointing,
-    #     device_map=_single_device_map(args),
-    #     is_trainable=False,
-    #     head_mlp=args.head_mlp,
-    #     hd=args.head_dropout,
-    #     pd=args.patch_dropout
-    # )
-    # base_teacher.to(device)
-    # base_teacher.eval()
-    # for p in base_teacher.parameters():
-    #     p.requires_grad = False
-
-
     optim_delta, lr_info = _build_delta_optimizer(delta_model, args)
     live_logger.info(
         "[DELTA] optimizer groups: "
@@ -1378,8 +1440,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     else:
         scheduler_delta = None
 
-    # RL setup for DELTA stage (kept as-is)
-    normalizer = RewardNormalizer(ema=args.reward_ema, use_group_norm=args.domain_reward_norm)
+    # Scheme2: bypass RL/bandit and keep fixed template/policy.
+    use_bandit = False
+    if int(getattr(args, "rl_use", 0)) == 1:
+        live_logger.info("[DELTA] Scheme2 disables RL/bandit; using fixed template/policy.")
+
+    normalizer = RewardNormalizer(ema=args.reward_ema, use_group_norm=args.domain_reward_norm) if use_bandit else None
     val_state = ValidationState(ema_alpha=args.val_ema_alpha)
     context_vector = encode_instruction(args, ctx={}, volatility_bin=volatility_bin)
 
@@ -1398,27 +1464,23 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
     d_tpl = len(context_vector) + len(tpl_features(allowed_tpl_ids[0], context_vector=context_vector))
     d_pol = len(context_vector)
-    bandit_tpl = LinTS(d_tpl, v=args.ts_v) if args.rl_algo == "lints" else LinUCB(d_tpl, alpha=args.ucb_alpha)
-    bandit_pol = LinTS(d_pol, v=args.ts_v) if args.rl_algo == "lints" else LinUCB(d_pol, alpha=args.ucb_alpha)
+    bandit_tpl = LinTS(d_tpl, v=args.ts_v) if (use_bandit and args.rl_algo == "lints") else (
+        LinUCB(d_tpl, alpha=args.ucb_alpha) if use_bandit else None
+    )
+    bandit_pol = LinTS(d_pol, v=args.ts_v) if (use_bandit and args.rl_algo == "lints") else (
+        LinUCB(d_pol, alpha=args.ucb_alpha) if use_bandit else None
+    )
     if math.isfinite(float(best_base_metric)):
         best_metric = float(best_base_metric)
     else:
-        base_ref_loss, base_ref_mse, base_ref_mae = evaluate_metrics_single(
-            model=delta_model,
-            tokenizer=tokenizer,
+        base_ref_loss, base_ref_mse, base_ref_mae = evaluate_metrics_backbone(
+            base_backbone=base_backbone,
             data_loader=val_loader,
-            templates=templates,
-            tpl_id=allowed_tpl_ids[0],
             args=args,
-            news_df=news_df,
-            policy_name=policy_name,
-            policy_kw=policy_kw,
             device=device,
-            volatility_bin=volatility_bin_val,
             testing=False,
             true_pred_csv_path=None,
-            news_dropout=False,
-            force_no_news=True,
+            filename=None,
         )
         if args.reward_metric == "loss":
             best_metric = float(base_ref_loss)
@@ -1440,7 +1502,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         pbar = tqdm(train_loader, desc=f"[DELTA] Epoch {epoch+1}/{delta_epochs}")
 
         # epoch-level bandit selection (optional)
-        if (args.select_policy_by == "epoch") and args.rl_use == 1:
+        if (args.select_policy_by == "epoch") and use_bandit:
             context_vector = get_context_features(
                 None,
                 news_df,
@@ -1453,7 +1515,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             )
 
             tpl_id, policy_name, pol_idx = bandit_round_update_residual(
-                base_model=None,
+                base_model=base_backbone,
                 delta_model=delta_model,
                 tokenizer=tokenizer,
                 probe_loader=val_loader,
@@ -1480,7 +1542,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
         for bidx, batch in enumerate(pbar):
             # batch-level bandit selection (optional)
-            if (args.select_policy_by == "batch") and args.rl_use == 1 and global_step % 50 == 0:
+            if (args.select_policy_by == "batch") and use_bandit and global_step % 50 == 0:
                 context_vector = get_context_features(
                     batch,
                     news_df,
@@ -1493,7 +1555,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 )
 
                 tpl_id, policy_name, pol_idx = bandit_round_update_residual(
-                    base_model=None,
+                    base_model=base_backbone,
                     delta_model=delta_model,
                     tokenizer=tokenizer,
                     probe_loader=val_loader,
@@ -1567,24 +1629,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             delta_model.train()
 
             # -----------------------------
-            # (1) BASE prediction (no-news, adapter_off, base head)  -> base_pred
+            # (1) BASE prediction from pure TS backbone -> base_pred
             # -----------------------------
-            was_training = delta_model.training
-            delta_model.eval()
             with torch.no_grad():
-                with _adapter_off(delta_model.lm):
-                    out_base = delta_model(
-                        input_ids=ids_b,
-                        attention_mask=attn_b,
-                        ts_patches=ts_p,
-                        ts_patch_mask=ts_pm,
-                        targets=None,
-                        head_mode="base",
-                    )
-                    base_pred = out_base["pred"].to(torch.float32)
-
-            if was_training:
-                delta_model.train()
+                history_z, _, _ = _z_batch_tensors(batch, args)
+                history_z = history_z.to(device)
+                base_pred = base_backbone(history_z).to(torch.float32)
 
             # residual target for delta head
             delta_targets = (targets_z.to(torch.float32) - base_pred).detach()
@@ -1745,7 +1795,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
         # end-of-epoch eval (combined)
         val_loss, val_mse, val_mae = evaluate_metrics_residual(
-            base_model=base_teacher,
+            base_model=base_backbone,
             delta_model=delta_model,
             tokenizer=tokenizer,
             data_loader=val_loader,
@@ -1867,14 +1917,14 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         model_best.eval()
 
         live_logger.info(
-            "Loaded best DELTA model for testing (final = base(adapter_off,no-news) + delta(adapter_on,news))."
+            f"Loaded best DELTA model for testing (final = {base_meta.get('backbone_name')} + delta(adapter_on,news))."
         )
 
-        tpl_for_test = best_tpl_id if args.rl_use == 1 else tpl_id
-        pol_for_test = best_policy_name if args.rl_use == 1 else policy_name
+        tpl_for_test = best_tpl_id if use_bandit else tpl_id
+        pol_for_test = best_policy_name if use_bandit else policy_name
 
         test_loss, test_mse, test_mae = evaluate_metrics_residual(
-            base_model=base_teacher,
+            base_model=base_backbone,
             delta_model=model_best,
             tokenizer=tokenizer,
             data_loader=test_loader,
@@ -1923,46 +1973,29 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 # ----------------------------
 def testing_base(test_loader, args, device, live_logger, templates, volatility_bin_test,true_pred_csv_path):
     if test_loader is not None:
-        # del base_model
         gc.collect()
         torch.cuda.empty_cache()
 
         best_base_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_base_{args.taskName}")
 
-        tok_d, model_best = load_checkpoint(
+        model_best, base_meta = load_base_backbone_checkpoint(
             best_base_path,
-            args.load_in_4bit,
-            args.gradient_checkpointing,
-            _single_device_map(args),
-            False,
-            head_mlp=args.head_mlp,
-            hd=args.head_dropout,
-            pd=args.patch_dropout
+            device=device,
+            is_trainable=False,
         )
-
-        tokenizer = tok_d
-        model_best.to(device)
-        model_best.eval()
 
         live_logger.info(
-            "Loaded best BASE model for testing (final = base(no-news))."
+            f"Loaded best BASE backbone for testing: {base_meta.get('backbone_name')} (final = base(no-news))."
         )
 
-        tpl_for_test = 1
-
-        test_loss, test_mse, test_mae = evaluate_metrics_single(
-            model=model_best,
-            tokenizer=tokenizer,
+        test_loss, test_mse, test_mae = evaluate_metrics_backbone(
+            base_backbone=model_best,
             data_loader=test_loader,
-            templates=templates,
-            tpl_id=tpl_for_test,
             args=args,
-            news_df=None,
-            policy_name=None,
-            policy_kw=None,
             device=device,
-            volatility_bin=volatility_bin_test,
             testing=True,
+            true_pred_csv_path=true_pred_csv_path,
+            filename=getattr(args, "taskName", "base_only"),
         )
 
         live_logger.info("---------------------testset prompt statistics--------------------------------")
@@ -1977,9 +2010,15 @@ def testing_base(test_loader, args, device, live_logger, templates, volatility_b
 
 def testing_delta(test_loader, args, device, live_logger, best_tpl_id, best_policy_name, tpl_id, policy_name, templates,news_df,policy_kw,volatility_bin_test,true_pred_csv_path):
     if test_loader is not None:
-        # del delta_model
         gc.collect()
         torch.cuda.empty_cache()
+
+        best_base_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_base_{args.taskName}")
+        base_backbone, base_meta = load_base_backbone_checkpoint(
+            best_base_path,
+            device=device,
+            is_trainable=False,
+        )
 
         best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
 
@@ -1999,14 +2038,15 @@ def testing_delta(test_loader, args, device, live_logger, best_tpl_id, best_poli
         model_best.eval()
 
         live_logger.info(
-            "Loaded best DELTA model for testing (final = base(adapter_off,no-news) + delta(adapter_on,news))."
+            f"Loaded best DELTA model for testing (final = {base_meta.get('backbone_name')} + delta(adapter_on,news))."
         )
 
-        tpl_for_test = best_tpl_id if args.rl_use == 1 else tpl_id
-        pol_for_test = best_policy_name if args.rl_use == 1 else policy_name
+        use_bandit = False
+        tpl_for_test = best_tpl_id if use_bandit else tpl_id
+        pol_for_test = best_policy_name if use_bandit else policy_name
 
         test_loss, test_mse, test_mae = evaluate_metrics_residual(
-            base_model=None,
+            base_model=base_backbone,
             delta_model=model_best,
             tokenizer=tokenizer,
             data_loader=test_loader,

@@ -42,7 +42,19 @@ STRIDE="48"
 HORIZON="48"
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
-STAGE="all"
+STAGE="delta"
+
+# pure TS base backbone (scheme2)
+BASE_BACKBONES=(
+  "dlinear"
+  # "mlp"
+)
+BASE_HIDDEN_DIM="256"
+BASE_MOVING_AVG="25"
+BASE_DROPOUT="0.0"
+BASE_LOSS="smooth_l1"
+BASE_LR="1e-3"
+BASE_WEIGHT_DECAY="1e-4"
 
 # -----------------------
 # New denoise/gating defaults for upgraded code
@@ -114,22 +126,24 @@ NEWS_DROPOUTS=(
 )
 
 NULL_LAMBDAS=(
-  "0.0"
+  # "0.0"
   "0.01"
 )
 
 MARGIN_LAMBDAS=(
   "0.5"
-  "1.0"
+  # "1.0"
 )
 
 LRS=(
   "5e-6"
-  "1e-5"
+  # "1e-5"
 )
 
 GRAD_ACCS=(
-  "4"
+  # "1"
+  "8"
+  # "16"
 )
 
 # =======================
@@ -200,45 +214,55 @@ for i in "${!TASK_NAMES[@]}"; do
       npath="${NEWS_PATHS[$i]}"
       tpool="${TEMPLATE_POOLS[$i]}"
 
-      for null_lambda in "${NULL_LAMBDAS[@]}"; do
-        for margin_lambda in "${MARGIN_LAMBDAS[@]}"; do
-          for lr in "${LRS[@]}"; do
-            for sch in "${SCHEDULERS[@]}"; do
-              for grad_acc in "${GRAD_ACCS[@]}"; do
-                for news_dropout in "${NEWS_DROPOUTS[@]}"; do
-                  args=( --taskName "$task" --rl_use "$rl_use" "${COMMON_ARGS[@]}" )
+      for base_backbone in "${BASE_BACKBONES[@]}"; do
+        for null_lambda in "${NULL_LAMBDAS[@]}"; do
+          for margin_lambda in "${MARGIN_LAMBDAS[@]}"; do
+            for lr in "${LRS[@]}"; do
+              for sch in "${SCHEDULERS[@]}"; do
+                for grad_acc in "${GRAD_ACCS[@]}"; do
+                  for news_dropout in "${NEWS_DROPOUTS[@]}"; do
+                    run_task="${task}_${base_backbone}"
+                    args=( --taskName "$run_task" --rl_use "$rl_use" "${COMMON_ARGS[@]}" )
 
-                  if [[ -n "$npath" ]]; then
-                    args+=( --news_path "${NEWS_CHOICES[$j]}" )
-                  fi
-                  if [[ -n "$tpool" ]]; then
-                    args+=( --template_pool "$tpool" )
-                  fi
+                    if [[ -n "$npath" ]]; then
+                      args+=( --news_path "${NEWS_CHOICES[$j]}" )
+                    fi
+                    if [[ -n "$tpool" ]]; then
+                      args+=( --template_pool "$tpool" )
+                    fi
 
-                  args+=( --news_window_days "${LOOKBACK_WINDOWS[$k]}" )
-                  args+=( --head_mlp )
-                  args+=( --patch_dropout "$PATCH_DROPOUT" )
-                  args+=( --head_dropout "$HEAD_DROPOUT" )
-                  args+=( --stride "$STRIDE" )
-                  args+=( --horizon "$HORIZON" )
-                  args+=( --base_epochs "$BASE_EPOCHS" )
-                  args+=( --delta_epochs "$DELTA_EPOCHS" )
+                    args+=( --news_window_days "${LOOKBACK_WINDOWS[$k]}" )
+                    args+=( --head_mlp )
+                    args+=( --patch_dropout "$PATCH_DROPOUT" )
+                    args+=( --head_dropout "$HEAD_DROPOUT" )
+                    args+=( --stride "$STRIDE" )
+                    args+=( --horizon "$HORIZON" )
+                    args+=( --base_epochs "$BASE_EPOCHS" )
+                    args+=( --delta_epochs "$DELTA_EPOCHS" )
+                    args+=( --base_backbone "$base_backbone" )
+                    args+=( --base_hidden_dim "$BASE_HIDDEN_DIM" )
+                    args+=( --base_moving_avg "$BASE_MOVING_AVG" )
+                    args+=( --base_dropout "$BASE_DROPOUT" )
+                    args+=( --base_loss "$BASE_LOSS" )
+                    args+=( --base_lr "$BASE_LR" )
+                    args+=( --base_weight_decay "$BASE_WEIGHT_DECAY" )
 
-                  args+=( --news_dropout "$news_dropout" )
-                  args+=( --grad_acc "$grad_acc" )
-                  args+=( --delta_null_lambda "$null_lambda" )
-                  args+=( --delta_margin_lambda "$margin_lambda" )
-                  args+=( --lr "$lr" )
-                  args+=( --scheduler "$sch" )
+                    args+=( --news_dropout "$news_dropout" )
+                    args+=( --grad_acc "$grad_acc" )
+                    args+=( --delta_null_lambda "$null_lambda" )
+                    args+=( --delta_margin_lambda "$margin_lambda" )
+                    args+=( --lr "$lr" )
+                    args+=( --scheduler "$sch" )
 
-                  if [[ -n "$run_or_not" ]]; then
-                    echo "==> Running: $task"
-                    "$PYTHON_BIN" "$ENTRY" "${args[@]}"
-                  fi
+                    if [[ -n "$run_or_not" ]]; then
+                      echo "==> Running: ${run_task} (base_backbone=${base_backbone})"
+                      "$PYTHON_BIN" "$ENTRY" "${args[@]}"
+                    fi
 
-                  # Optional cleanup for disk space after each run:
-                  # rm -rf "checkpoints/${task}/best_base_${task}"
-                  # rm -rf "checkpoints/${task}/best_delta_${task}"
+                    # Optional cleanup for disk space after each run:
+                    # rm -rf "checkpoints/${run_task}/best_base_${run_task}"
+                    # rm -rf "checkpoints/${run_task}/best_delta_${run_task}"
+                  done
                 done
               done
             done
