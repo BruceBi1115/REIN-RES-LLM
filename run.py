@@ -14,6 +14,8 @@ if __name__ == '__main__':
 
     
     parser.add_argument('--rel_lambda', type=float, default=0.3, help='weight for relative loss')
+    parser.add_argument('--rel_supervise_lambda', type=float, default=0.5,
+                        help='weight for supervised rel_head BCE in delta stage')
     parser.add_argument("--rel_on", action="store_true", help="whether to use relative loss")
 
     parser.add_argument('--delta_null_lambda', type=float, default=0.0001, help='weight for ||delta_pred(no-news)|| shrink')
@@ -27,21 +29,41 @@ if __name__ == '__main__':
     parser.add_argument('--news_gate_floor', type=float, default=0.0, help='lower bound for gate value to avoid over-shrink')
     parser.add_argument('--gate_lambda', type=float, default=0.2, help='weight for gate pseudo-label BCE loss')
     parser.add_argument('--gate_null_lambda', type=float, default=0.1, help='weight forcing no-news gate toward zero')
-    parser.add_argument('--delta_gate_init_bias', type=float, default=-1.0, help='init bias for horizon-wise delta gate head')
+    parser.add_argument('--delta_gate_init_bias', type=float, default=0.0, help='init bias for horizon-wise delta gate head')
+    parser.add_argument('--delta_internal_gate', type=int, default=1, choices=[0, 1],
+                        help='enable internal delta gating in model head (1=on, 0=bypass gate/rel/clip)')
+    parser.add_argument('--delta_head_init_std', type=float, default=0.01, help='std for delta head weight init')
     parser.add_argument('--delta_clip', type=float, default=3.0, help='tanh clip for delta outputs in z-space (<=0 to disable)')
     parser.add_argument('--delta_news_tail_tokens', type=int, default=160, help='how many tail text tokens to pool as news context')
     parser.add_argument('--delta_rel_floor', type=float, default=0.05, help='minimum multiplicative factor from relevance gate')
 
     parser.add_argument('--cf_pseudo_margin', type=float, default=0.01, help='counterfactual gain margin for pseudo labels')
-    parser.add_argument('--cf_pseudo_temp', type=float, default=0.02, help='temperature for soft pseudo labels')
+    parser.add_argument('--cf_pseudo_temp', type=float, default=0.2, help='temperature for soft pseudo labels')
     parser.add_argument('--cf_pseudo_hard', type=int, default=0, choices=[0, 1], help='use hard(1)/soft(0) pseudo labels')
-    parser.add_argument('--cf_min_weight', type=float, default=0.05, help='minimum residual weight for samples with news')
+    parser.add_argument('--cf_min_weight', type=float, default=0.30, help='minimum residual weight for samples with news')
+    parser.add_argument('--delta_cold_start_steps', type=int, default=200, help='force sample_w=1 for first N delta steps')
+    parser.add_argument('--delta_null_warmup_steps', type=int, default=500, help='delay null loss for first N delta steps')
+    parser.add_argument('--delta_null_ramp_steps', type=int, default=500, help='ramp null loss weight for next N delta steps')
+    parser.add_argument('--news_contrastive_lambda', type=float, default=0.1, help='weight for news-vs-null rel-logit contrastive loss')
+    parser.add_argument('--base_pred_noise', type=float, default=0.5, help='std of Gaussian noise added to base_pred in delta training')
+    parser.add_argument('--delta_warmup_epochs', type=int, default=2,
+                        help='disable gate/counterfactual regularizers in first N delta epochs')
     parser.add_argument('--delta_curriculum_epochs', type=int, default=3, help='ramp-up epochs for delta constraints')
     parser.add_argument('--delta_grad_clip', type=float, default=1.0, help='grad clip norm for delta stage (<=0 to disable)')
     parser.add_argument('--delta_violation_cap', type=float, default=1.0, help='cap per-sample margin/non-degrade hinge value (>0 to enable)')
     parser.add_argument('--delta_lora_lr_scale', type=float, default=0.3, help='lr scale for LoRA params in delta stage')
     parser.add_argument('--delta_head_lr_scale', type=float, default=1.0, help='lr scale for delta/rel heads in delta stage')
     parser.add_argument('--delta_other_lr_scale', type=float, default=0.5, help='lr scale for other trainable params in delta stage')
+    parser.add_argument('--delta_freeze_feature_modules', type=int, default=0, choices=[0, 1],
+                        help='freeze patch/pooling feature modules in delta stage (legacy behavior)')
+    parser.add_argument('--delta_auto_alpha', type=int, default=0, choices=[0, 1],
+                        help='deprecated: alpha fusion is disabled; kept for backward compatibility')
+    parser.add_argument('--delta_alpha_candidates', type=str, default='1.0',
+                        help='deprecated: alpha fusion is disabled; kept for backward compatibility')
+    parser.add_argument('--utility_rank_lambda', type=float, default=0.2,
+                        help='weight for real-vs-null utility ranking loss on rel logits')
+    parser.add_argument('--utility_rank_margin', type=float, default=0.10,
+                        help='margin for ranking loss: rel_real - rel_null should exceed this value')
 
 
     parser.add_argument("--patch_dropout", type=float, default=0.0)
@@ -49,7 +71,28 @@ if __name__ == '__main__':
     parser.add_argument("--head_mlp", action="store_true", default=False)
 
     parser.add_argument("--policy_space", type=list, default=["all"])
-    parser.add_argument("--default_policy", type=str, default="all", help="default news selection policy for training and evaluation")
+    parser.add_argument("--default_policy", type=str, default="smart", help="default news selection policy for training and evaluation")
+    parser.add_argument("--smart_rel_weight", type=float, default=0.55, help="weight of semantic relevance in smart news retrieval")
+    parser.add_argument("--smart_kw_weight", type=float, default=0.15, help="weight of keyword coverage in smart news retrieval")
+    parser.add_argument("--smart_rate_weight", type=float, default=0.15, help="weight of external news rating in smart news retrieval")
+    parser.add_argument("--smart_recency_weight", type=float, default=0.15, help="weight of recency prior in smart news retrieval")
+    parser.add_argument("--smart_recency_tau", type=float, default=8.0, help="rank-decay temperature for recency in smart retrieval")
+    parser.add_argument("--smart_mmr_lambda", type=float, default=0.75, help="MMR relevance-vs-diversity tradeoff in smart retrieval")
+    parser.add_argument("--smart_dedup_threshold", type=float, default=0.92, help="cosine threshold for near-duplicate news suppression")
+    parser.add_argument("--utility_rerank_enable", type=int, default=1, choices=[0, 1],
+                        help="rerank selected news by utility score before prompt composition")
+    parser.add_argument("--utility_keyword_weight", type=float, default=0.35, help="utility score weight: keyword coverage")
+    parser.add_argument("--utility_recency_weight", type=float, default=0.25, help="utility score weight: recency")
+    parser.add_argument("--utility_rate_weight", type=float, default=0.35, help="utility score weight: external rate column")
+    parser.add_argument("--utility_sentiment_weight", type=float, default=0.05, help="utility score weight: sentiment magnitude")
+    parser.add_argument("--utility_recency_tau_hours", type=float, default=24.0, help="time-decay tau in hours for utility rerank")
+    parser.add_argument("--utility_mmr_enable", type=int, default=1, choices=[0, 1], help="enable MMR diversification in utility rerank")
+    parser.add_argument("--utility_mmr_lambda", type=float, default=0.8, help="MMR lambda in utility rerank")
+    parser.add_argument("--utility_dedup_threshold", type=float, default=0.95, help="dedup threshold in utility rerank")
+    parser.add_argument("--utility_keep_topk", type=int, default=-1, help="optional post-rerank truncation; <=0 disables")
+    parser.add_argument("--utility_min_score", type=float, default=-1.0, help="drop selected news below this utility score; <0 disables")
+    parser.add_argument("--utility_show_in_prompt", type=int, default=1, choices=[0, 1],
+                        help="show utility score tag for each news item in prompt")
 
     #TIME-SEIRES DATA PATCH LEN
     parser.add_argument("--patch_len", type=int, default=4)
@@ -110,7 +153,7 @@ if __name__ == '__main__':
     parser.add_argument('--unit', type=str, default='', help='unit string')
     parser.add_argument('--season', type=str, default='', help='DJF/MAM/JJA/SON or empty')
     parser.add_argument('--volatility_bin_tiers', type=int, default=100, help='the tiers to bin volatility')
-    parser.add_argument('--token_budget', type=int, default=1200, help='max tokens for composed prompt')
+    parser.add_argument('--token_budget', type=int, default=700, help='max tokens for composed prompt')
     parser.add_argument('--val_ema_alpha', type=float, default=0.9, help='EMA alpha for validation loss smoothing')
 
     # Whether to include explanations in the prompt template
@@ -162,7 +205,7 @@ if __name__ == '__main__':
     parser.add_argument('--tokenizer', type=str, default='', help='HF tokenizer id (default: same as base_model)')
     parser.add_argument('--load_in_4bit', action='store_true', help='use 4-bit quantization (QLoRA)')
     parser.add_argument('--gradient_checkpointing', action='store_true', help='enable gradient checkpointing')
-    parser.add_argument('--max_seq_len', type=int, default=1280, help='max sequence length')
+    parser.add_argument('--max_seq_len', type=int, default=768, help='max sequence length')
 
     # LoRA hyperparameters
     parser.add_argument('--lora_r', type=int, default=8, help='LoRA rank')
@@ -199,6 +242,24 @@ if __name__ == '__main__':
     parser.add_argument('--ucb_alpha', type=float, default=1.0, help='LinUCB alpha')
     parser.add_argument('--ts_v', type=float, default=1.0, help='LinTS prior scale v')
     parser.add_argument('--epsilon', type=float, default=0.05, help='epsilon-greedy fallback')
+    parser.add_argument('--news_rl_enable', type=int, default=1, choices=[0, 1],
+                        help='enable contextual bandit for per-prompt news item selection in delta stage')
+    parser.add_argument('--news_rl_algo', type=str, default='auto', choices=['auto', 'lints', 'linucb'],
+                        help='algo for news bandit; auto follows --rl_algo')
+    parser.add_argument('--news_rl_k_choices', type=str, default='1,2,3,5,7,10',
+                        help='candidate K values for RL to choose per prompt')
+    parser.add_argument('--news_rl_allow_over_topk', type=int, default=0, choices=[0, 1],
+                        help='allow RL-selected K to exceed --news_topK')
+    parser.add_argument('--news_rl_epsilon', type=float, default=0.05,
+                        help='epsilon-greedy exploration for news item/K selection')
+    parser.add_argument('--news_rl_prefilter_mult', type=int, default=4,
+                        help='prefilter pool size multiplier over max(K) before RL item selection')
+    parser.add_argument('--news_rl_pool_cap', type=int, default=128,
+                        help='max candidate pool size for RL item selection')
+    parser.add_argument('--news_rl_reward_clip', type=float, default=3.0,
+                        help='clip absolute reward when updating news bandits')
+    parser.add_argument('--news_rl_recency_tau_hours', type=float, default=24.0,
+                        help='recency decay tau (hours) in news item features for RL')
 
     # ===== Eval & Logging =====
     parser.add_argument('--early_stop_patience', type=int, default=5, help='patience in eval rounds')

@@ -20,19 +20,34 @@ def format_history(hist_values, unit: str, budget_tokens: int, tokenizer):
         text = ', '.join([f'{float(v):.4f}' for v in hist_values])
     return text
 
-def format_news(news_rows, text_col: str, budget_tokens: int, tokenizer, summary_method='lead3', max_sentences=3):
+def format_news(
+    news_rows,
+    text_col: str,
+    budget_tokens: int,
+    tokenizer,
+    summary_method="lead3",
+    max_sentences=3,
+    show_utility: bool = False,
+):
     bullets = []
     num = 1
     for _, r in news_rows.iterrows():
-        txt = str(r.get(text_col, ''))
-        if summary_method == 'lead3':
+        txt = str(r.get(text_col, ""))
+        if summary_method == "lead3":
             txt = lead3(txt, max_sentences=max_sentences)
-        bullets.append(f"{num}. {txt}")
-        num+=1
-    text = '\n'.join(bullets)
+        prefix = f"{num}. "
+        if show_utility and "utility_score" in news_rows.columns:
+            try:
+                u = float(r.get("utility_score", 0.0))
+            except Exception:
+                u = 0.0
+            prefix = f"{num}. [u={u:.3f}] "
+        bullets.append(f"{prefix}{txt}")
+        num += 1
+    text = "\n".join(bullets)
     while count_tokens(tokenizer, text) > budget_tokens and len(bullets) > 1:
         bullets = bullets[:-1]
-        text = '\n'.join(bullets)
+        text = "\n".join(bullets)
     return text
 
 def build_prompt(template_text: str, L: int, H: int, unit: str, description: str,

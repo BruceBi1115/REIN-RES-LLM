@@ -17,20 +17,21 @@ TRAIN_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_trainset.csv"
 VAL_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_valset.csv"
 TEST_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_testset.csv"
 
-NEWS_TEXT_COL="summary_response"
+NEWS_TEXT_COL="summary"
 NEWS_TIME_COL="publication_time"
 KEYWORD_PATH="keywords/kw_2.txt"
 
 DELTA_EPOCHS="20"
 BASE_EPOCHS="20"
 KEYWORD_NUMBER="20"
-NEWS_WINDOW_DAYS="1"
+# NEWS_WINDOW_DAYS="7"
 NEWS_TOPM="999"
 NEWS_TOPK="10"
 BATCH_SIZE="1"
 RL_ALGO="lints"
 RL_CYCLE_STEPS="1"
 SELECT_POLICY_BY="epoch"
+DEFAULT_POLICY="smart"
 
 TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 NEWS_PATH="dataset/FNT_2019_2020_combined.json"
@@ -42,7 +43,7 @@ STRIDE="48"
 HORIZON="48"
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
-STAGE="delta"
+STAGE="all"
 
 # pure TS base backbone (scheme2)
 BASE_BACKBONES=(
@@ -85,6 +86,32 @@ DELTA_CLIP="2.5"
 DELTA_NEWS_TAIL_TOKENS="180"
 DELTA_REL_FLOOR="0.0"
 REL_LAMBDA="0.0"
+DELTA_FREEZE_FEATURE_MODULES="0"
+DELTA_AUTO_ALPHA="0"
+DELTA_ALPHA_CANDIDATES="1.0"
+NEWS_RL_ENABLE="1"
+NEWS_RL_ALGO="auto"
+NEWS_RL_K_CHOICES="1,2,3,5,7,10"
+NEWS_RL_ALLOW_OVER_TOPK="0"
+NEWS_RL_EPSILON="0.05"
+NEWS_RL_PREFILTER_MULT="4"
+NEWS_RL_POOL_CAP="128"
+NEWS_RL_REWARD_CLIP="3.0"
+NEWS_RL_RECENCY_TAU_HOURS="24"
+UTILITY_RERANK_ENABLE="1"
+UTILITY_KEYWORD_WEIGHT="0.35"
+UTILITY_RECENCY_WEIGHT="0.25"
+UTILITY_RATE_WEIGHT="0.35"
+UTILITY_SENTIMENT_WEIGHT="0.05"
+UTILITY_RECENCY_TAU_HOURS="24"
+UTILITY_MMR_ENABLE="1"
+UTILITY_MMR_LAMBDA="0.8"
+UTILITY_DEDUP_THRESHOLD="0.95"
+UTILITY_KEEP_TOPK="-1"
+UTILITY_MIN_SCORE="-1.0"
+UTILITY_SHOW_IN_PROMPT="1"
+UTILITY_RANK_LAMBDA="0.2"
+UTILITY_RANK_MARGIN="0.10"
 
 # =======================
 # 2) Sweep spaces (same style as your original)
@@ -94,7 +121,8 @@ TASK_NAMES=(
 )
 
 NEWS_CHOICES=(
-  "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
+  # "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
+  "dataset/FNT_2019_2020_combined.json"
 )
 
 RUN_OR_NOT=(
@@ -114,7 +142,7 @@ TEMPLATE_POOLS=(
 )
 
 LOOKBACK_WINDOWS=(
-  "1"
+  "30"
 )
 
 SCHEDULERS=(
@@ -163,7 +191,7 @@ COMMON_ARGS=(
   --news_time_col "$NEWS_TIME_COL"
   --keyword_path "$KEYWORD_PATH"
   --keyword_number "$KEYWORD_NUMBER"
-  --news_window_days "$NEWS_WINDOW_DAYS"
+  # --news_window_days "$NEWS_WINDOW_DAYS"
   --news_topM "$NEWS_TOPM"
   --news_topK "$NEWS_TOPK"
   --batch_size "$BATCH_SIZE"
@@ -171,6 +199,28 @@ COMMON_ARGS=(
   --reward_metric "$REWARD_METRIC"
   --rl_cycle_steps "$RL_CYCLE_STEPS"
   --select_policy_by "$SELECT_POLICY_BY"
+  --default_policy "$DEFAULT_POLICY"
+  --news_rl_enable "$NEWS_RL_ENABLE"
+  --news_rl_algo "$NEWS_RL_ALGO"
+  --news_rl_k_choices "$NEWS_RL_K_CHOICES"
+  --news_rl_allow_over_topk "$NEWS_RL_ALLOW_OVER_TOPK"
+  --news_rl_epsilon "$NEWS_RL_EPSILON"
+  --news_rl_prefilter_mult "$NEWS_RL_PREFILTER_MULT"
+  --news_rl_pool_cap "$NEWS_RL_POOL_CAP"
+  --news_rl_reward_clip "$NEWS_RL_REWARD_CLIP"
+  --news_rl_recency_tau_hours "$NEWS_RL_RECENCY_TAU_HOURS"
+  --utility_rerank_enable "$UTILITY_RERANK_ENABLE"
+  --utility_keyword_weight "$UTILITY_KEYWORD_WEIGHT"
+  --utility_recency_weight "$UTILITY_RECENCY_WEIGHT"
+  --utility_rate_weight "$UTILITY_RATE_WEIGHT"
+  --utility_sentiment_weight "$UTILITY_SENTIMENT_WEIGHT"
+  --utility_recency_tau_hours "$UTILITY_RECENCY_TAU_HOURS"
+  --utility_mmr_enable "$UTILITY_MMR_ENABLE"
+  --utility_mmr_lambda "$UTILITY_MMR_LAMBDA"
+  --utility_dedup_threshold "$UTILITY_DEDUP_THRESHOLD"
+  --utility_keep_topk "$UTILITY_KEEP_TOPK"
+  --utility_min_score "$UTILITY_MIN_SCORE"
+  --utility_show_in_prompt "$UTILITY_SHOW_IN_PROMPT"
   --residual_loss "$RESIDUAL_LOSS"
   --stage "$STAGE"
 
@@ -194,6 +244,11 @@ COMMON_ARGS=(
   --delta_lora_lr_scale "$DELTA_LORA_LR_SCALE"
   --delta_head_lr_scale "$DELTA_HEAD_LR_SCALE"
   --delta_other_lr_scale "$DELTA_OTHER_LR_SCALE"
+  --delta_freeze_feature_modules "$DELTA_FREEZE_FEATURE_MODULES"
+  --delta_auto_alpha "$DELTA_AUTO_ALPHA"
+  --delta_alpha_candidates "$DELTA_ALPHA_CANDIDATES"
+  --utility_rank_lambda "$UTILITY_RANK_LAMBDA"
+  --utility_rank_margin "$UTILITY_RANK_MARGIN"
 
   --delta_gate_init_bias "$DELTA_GATE_INIT_BIAS"
   --delta_clip "$DELTA_CLIP"

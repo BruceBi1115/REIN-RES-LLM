@@ -98,6 +98,7 @@ def save_base_backbone_checkpoint(
     scheduler=None,
     epoch: int | None = None,
     global_step: int | None = None,
+    global_zstats: dict | None = None,
 ):
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -109,6 +110,12 @@ def save_base_backbone_checkpoint(
         "moving_avg": int(moving_avg),
         "dropout": float(dropout),
     }
+    if isinstance(global_zstats, dict):
+        mu = global_zstats.get("mu_global", global_zstats.get("mu", None))
+        sigma = global_zstats.get("sigma_global", global_zstats.get("sigma", None))
+        if mu is not None and sigma is not None:
+            meta["mu_global"] = float(mu)
+            meta["sigma_global"] = max(float(sigma), 1e-6)
     with open(os.path.join(ckpt_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 

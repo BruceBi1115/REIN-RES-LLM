@@ -40,7 +40,9 @@ class TSForecastRegressor(nn.Module):
         huber_beta: float = 0.5,
         use_horizon_weight: bool = True,
         horizon_weight_end: float = 0.5,
-        delta_gate_init_bias: float = -1.0,
+        delta_gate_init_bias: float = 0.0,
+        delta_head_init_std: float = 0.01,
+        delta_internal_gate: bool = True,
         delta_clip: float = 3.0,
         delta_news_tail_tokens: int = 160,
         delta_rel_floor: float = 0.05,
@@ -100,7 +102,7 @@ class TSForecastRegressor(nn.Module):
                 nn.Dropout(float(head_dropout)),
                 nn.Linear(self.hidden_size, self.horizon),
             )
-            nn.init.zeros_(self.delta_head[-1].weight)
+            nn.init.normal_(self.delta_head[-1].weight, mean=0.0, std=float(delta_head_init_std))
             nn.init.zeros_(self.delta_head[-1].bias)
             self.delta_gate = nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size),
@@ -118,7 +120,7 @@ class TSForecastRegressor(nn.Module):
 
             self.delta_head_drop = nn.Dropout(float(head_dropout))
             self.delta_head = nn.Linear(self.hidden_size, self.horizon)
-            nn.init.zeros_(self.delta_head.weight)
+            nn.init.normal_(self.delta_head.weight, mean=0.0, std=float(delta_head_init_std))
             nn.init.zeros_(self.delta_head.bias)
             self.delta_gate = nn.Sequential(
                 nn.Linear(self.hidden_size, self.hidden_size),
@@ -129,6 +131,7 @@ class TSForecastRegressor(nn.Module):
             nn.init.constant_(self.delta_gate[-1].bias, float(delta_gate_init_bias))
 
         self.delta_log_scale = nn.Parameter(torch.zeros(1))
+        self.delta_internal_gate = bool(delta_internal_gate)
         self.delta_clip = float(delta_clip)
         self.delta_news_tail_tokens = int(delta_news_tail_tokens)
         self.delta_rel_floor = float(max(0.0, min(1.0, delta_rel_floor)))
@@ -169,6 +172,7 @@ class TSForecastRegressor(nn.Module):
         text_len: int,
         ts_patch_mask: torch.Tensor,
         text_mask: torch.Tensor | None = None,
+        include_text_in_kv: bool = False,
     ) -> torch.Tensor:
         """
         mixed_hidden: (B, T_text + P, H)
@@ -178,7 +182,7 @@ class TSForecastRegressor(nn.Module):
         """
         P = ts_patch_mask.size(1)
         patch_hid = mixed_hidden[:, text_len : text_len + P, :]  # (B,P,H)
-        key_padding = (ts_patch_mask == 0)  # (B,P) True indicates pad
+        patch_key_padding = (ts_patch_mask == 0)  # (B,P) True indicates pad
 
         text_hid = mixed_hidden[:, :text_len, :]  # (B,T,H)
         if text_hid.size(1) == 0:
@@ -193,7 +197,20 @@ class TSForecastRegressor(nn.Module):
         text_ctx = self.text_ctx_ln(text_ctx)
         q_delta = self.text2q(text_ctx).view(text_ctx.size(0), self.pool_queries, self.hidden_size)
         q = self.pool_q.expand(patch_hid.size(0), -1, -1) + q_delta  # (B,Q,H)
-        attn_out, _ = self.pool_attn(q, patch_hid, patch_hid, key_padding_mask=key_padding)  # (B,Q,H)
+        if include_text_in_kv:
+            kv_hid = torch.cat([text_hid, patch_hid], dim=1)  # (B,T+P,H)
+            if text_mask is None:
+                text_key_padding = torch.zeros(
+                    (patch_hid.size(0), text_len), device=patch_hid.device, dtype=torch.bool
+                )
+            else:
+                text_key_padding = (text_mask[:, :text_len] == 0)
+            key_padding = torch.cat([text_key_padding, patch_key_padding], dim=1)
+        else:
+            kv_hid = patch_hid
+            key_padding = patch_key_padding
+
+        attn_out, _ = self.pool_attn(q, kv_hid, kv_hid, key_padding_mask=key_padding)  # (B,Q,H)
         pooled = attn_out.mean(dim=1)  # (B,H)
         return self.pool_ln(pooled)
 
@@ -283,16 +300,22 @@ class TSForecastRegressor(nn.Module):
         # layer-mix + attentive pooling on patch part
         mixed = self._mix_last_layers(outputs.hidden_states)  # (B,T+P,H)
         text_len = attention_mask.size(1)
-        pooled = self._attn_pool_patches(mixed, text_len=text_len, ts_patch_mask=ts_patch_mask, text_mask=attention_mask)  # (B,H)
 
-        # head
-        rel_input = pooled
+        pooled = None  # 延迟计算
+
         if head_mode == "base":
-            if isinstance(self.base_head, nn.Linear):
-                pred = self.base_head(self.head_drop(pooled))
-            else:
-                pred = self.base_head(pooled)
+            pooled = self._attn_pool_patches(mixed, text_len=text_len, 
+                                            ts_patch_mask=ts_patch_mask, 
+                                            text_mask=attention_mask)
+            rel_input = pooled
+            pred = self.base_head(self.head_drop(pooled)) if isinstance(self.base_head, nn.Linear) \
+                else self.base_head(pooled)
+
         elif head_mode == "delta":
+            pooled = self._attn_pool_patches(mixed, text_len=text_len,
+                                            ts_patch_mask=ts_patch_mask,
+                                            text_mask=attention_mask,
+                                            include_text_in_kv=True)
             text_tail = self._tail_text_pool(mixed, text_len=text_len, text_mask=attention_mask)
             delta_feat = torch.cat([pooled, text_tail, pooled * text_tail, pooled - text_tail], dim=-1)
             delta_feat = self.delta_fuse(delta_feat)
@@ -305,22 +328,30 @@ class TSForecastRegressor(nn.Module):
 
             delta_gate = torch.sigmoid(self.delta_gate(delta_feat))
             delta_scale = torch.exp(self.delta_log_scale).to(device=raw_delta.device, dtype=raw_delta.dtype).clamp(max=5.0)
-            rel_prob = torch.sigmoid(self.rel_head(rel_input).squeeze(-1)).unsqueeze(-1)
-            rel_gate = float(self.delta_rel_floor) + (1.0 - float(self.delta_rel_floor)) * rel_prob
-            pred = raw_delta * delta_gate * delta_scale * rel_gate
-            if self.delta_clip > 0:
-                c = torch.tensor(self.delta_clip, device=pred.device, dtype=pred.dtype)
-                pred = c * torch.tanh(pred / c)
+            if self.delta_internal_gate:
+                pred = raw_delta * delta_gate * delta_scale
+                if self.delta_clip > 0:
+                    c = torch.tensor(self.delta_clip, device=pred.device, dtype=pred.dtype)
+                    pred = c * torch.tanh(pred / c)
+            else:
+                # quick ablation: bypass internal gate/rel-gate/clip, keep only optional global scale
+                pred = raw_delta * delta_scale
         else:
             raise ValueError(f"Unknown head_mode={head_mode}")
 
         # relevance
+        pred = pred.to(torch.float32)
         rel_logit = self.rel_head(rel_input).squeeze(-1)  # (B,)
+        pred = pred.to(torch.float32)
+        rel_logit = rel_logit.to(torch.float32)
+
         out = {"pred": pred, "rel_logits": rel_logit}
         if head_mode == "delta":
+            rel_gate = torch.ones_like(delta_gate)
             out["delta_gate_mean"] = delta_gate.mean().detach()
             out["delta_scale"] = delta_scale.detach()
             out["delta_rel_gate_mean"] = rel_gate.mean().detach()
+            out["delta_internal_gate"] = int(self.delta_internal_gate)
 
         # losses
         loss = None
@@ -380,7 +411,9 @@ def load_llama_lora(
     huber_beta: float = 0.5,
     use_horizon_weight: bool = True,
     horizon_weight_end: float = 0.5,
-    delta_gate_init_bias: float = -1.0,
+    delta_gate_init_bias: float = 0.0,
+    delta_head_init_std: float = 0.01,
+    delta_internal_gate: bool = True,
     delta_clip: float = 3.0,
     delta_news_tail_tokens: int = 160,
     delta_rel_floor: float = 0.05,
@@ -436,6 +469,8 @@ def load_llama_lora(
         use_horizon_weight=bool(use_horizon_weight),
         horizon_weight_end=float(horizon_weight_end),
         delta_gate_init_bias=float(delta_gate_init_bias),
+        delta_head_init_std=float(delta_head_init_std),
+        delta_internal_gate=bool(delta_internal_gate),
         delta_clip=float(delta_clip),
         delta_news_tail_tokens=int(delta_news_tail_tokens),
         delta_rel_floor=float(delta_rel_floor),
@@ -455,6 +490,7 @@ def save_checkpoint(
     scheduler=None,
     epoch: int | None = None,
     global_step: int | None = None,
+    extra_meta: dict | None = None,
 ):
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -497,6 +533,7 @@ def save_checkpoint(
             "huber_beta": getattr(model, "huber_beta", 0.5),
             "use_horizon_weight": getattr(model, "use_horizon_weight", True),
             "horizon_weight_end": getattr(model, "horizon_weight_end", 0.5),
+            "delta_internal_gate": int(bool(getattr(model, "delta_internal_gate", True))),
             "delta_clip": getattr(model, "delta_clip", 3.0),
             "delta_news_tail_tokens": getattr(model, "delta_news_tail_tokens", 160),
             "delta_rel_floor": getattr(model, "delta_rel_floor", 0.05),
@@ -518,10 +555,14 @@ def save_checkpoint(
         "huber_beta": float(getattr(model, "huber_beta", 0.5)),
         "use_horizon_weight": bool(getattr(model, "use_horizon_weight", True)),
         "horizon_weight_end": float(getattr(model, "horizon_weight_end", 0.5)),
+        "delta_internal_gate": int(bool(getattr(model, "delta_internal_gate", True))),
         "delta_clip": float(getattr(model, "delta_clip", 3.0)),
         "delta_news_tail_tokens": int(getattr(model, "delta_news_tail_tokens", 160)),
         "delta_rel_floor": float(getattr(model, "delta_rel_floor", 0.05)),
     }
+    if isinstance(extra_meta, dict):
+        for k, v in extra_meta.items():
+            meta[str(k)] = v
     with open(os.path.join(ckpt_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
@@ -563,6 +604,7 @@ def load_checkpoint(
     huber_beta = float(meta.get("huber_beta", 0.5))
     use_horizon_weight = bool(meta.get("use_horizon_weight", True))
     horizon_weight_end = float(meta.get("horizon_weight_end", 0.5))
+    delta_internal_gate = bool(int(meta.get("delta_internal_gate", 1)))
     delta_clip = float(meta.get("delta_clip", 3.0))
     delta_news_tail_tokens = int(meta.get("delta_news_tail_tokens", 160))
     delta_rel_floor = float(meta.get("delta_rel_floor", 0.05))
@@ -602,6 +644,7 @@ def load_checkpoint(
         huber_beta=huber_beta,
         use_horizon_weight=use_horizon_weight,
         horizon_weight_end=horizon_weight_end,
+        delta_internal_gate=delta_internal_gate,
         delta_clip=delta_clip,
         delta_news_tail_tokens=delta_news_tail_tokens,
         delta_rel_floor=delta_rel_floor,

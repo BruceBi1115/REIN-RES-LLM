@@ -33,7 +33,13 @@ from transformers import get_cosine_schedule_with_warmup
 
 from src.data_construction.DataStatistic import DataStatistic
 from .data_construction.data import make_loader
-from .news_rules import load_news, get_candidates, select_news, _load_keywords
+from .news_rules import (
+    load_news,
+    get_candidates,
+    select_news,
+    rerank_selected_news_by_utility,
+    _load_keywords,
+)
 from .data_construction.prompt import format_news, load_templates, build_prompt
 from .RL.rl_bandit import LinTS, LinUCB, RewardNormalizer
 from .ValidationState import ValidationState
@@ -102,6 +108,32 @@ def _inv_zscore(z, mu, sigma):
     return (z * sigma + mu).tolist()
 
 
+def _coerce_global_zstats(global_zstats, args, required: bool = True):
+    if isinstance(global_zstats, dict):
+        mu = global_zstats.get("mu_global", global_zstats.get("mu", None))
+        sigma = global_zstats.get("sigma_global", global_zstats.get("sigma", None))
+        if mu is not None and sigma is not None:
+            eps = float(getattr(args, "zscore_eps", 1e-6))
+            sigma = max(float(sigma), eps)
+            return {"mu_global": float(mu), "sigma_global": float(sigma)}
+    if required:
+        raise ValueError("global_zstats must contain mu_global and sigma_global.")
+    return None
+
+
+def _compute_global_zstats_from_train_df(train_df: pd.DataFrame, args):
+    if train_df is None or len(train_df) == 0:
+        raise ValueError("Cannot compute global z-score stats from empty train_df.")
+    if args.value_col not in train_df.columns:
+        raise KeyError(f"value_col not found in train_df: {args.value_col}")
+    vals = pd.to_numeric(train_df[args.value_col], errors="coerce").to_numpy(dtype=np.float32)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        raise ValueError("Train data has no finite values for global z-score statistics.")
+    mu, sigma = _zstats(vals, eps=float(getattr(args, "zscore_eps", 1e-6)))
+    return {"mu_global": float(mu), "sigma_global": float(sigma)}
+
+
 def _maybe_news_dropout(news_str: str, args) -> str:
     p = float(getattr(args, "news_dropout", 0.0) or 0.0)
     if p <= 0:
@@ -130,6 +162,307 @@ def _residual_elementwise(pred: torch.Tensor, target: torch.Tensor, mode: str) -
         return F.smooth_l1_loss(pred, target, reduction="none")
     return torch.abs(pred - target)  # "mae"
 
+
+def _select_metric(loss_v: float, mse_v: float, mae_v: float, reward_metric: str) -> float:
+    rm = str(reward_metric).lower()
+    if rm == "loss":
+        return float(loss_v)
+    if rm == "mse":
+        return float(mse_v)
+    return float(mae_v)
+
+
+def _parse_delta_alpha_candidates(args) -> list[float]:
+    # Deprecated: alpha fusion is disabled and always fixed to 1.0.
+    _ = args
+    return [1.0]
+
+
+def _parse_int_choices_csv(raw: str, default: list[int]) -> list[int]:
+    vals = []
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+        except Exception:
+            continue
+        if v > 0:
+            vals.append(v)
+    if not vals:
+        vals = list(default)
+    uniq = []
+    seen = set()
+    for v in vals:
+        if v in seen:
+            continue
+        seen.add(v)
+        uniq.append(int(v))
+    return uniq
+
+
+class NewsRLBanditSelector:
+    """
+    Contextual bandit for per-prompt news selection:
+    - choose how many items (K)
+    - choose which items to keep
+    """
+    def __init__(self, args, live_logger=None):
+        self.enable = int(getattr(args, "news_rl_enable", 0)) == 1
+        self.live_logger = live_logger
+        self.epsilon = float(getattr(args, "news_rl_epsilon", 0.05))
+        self.epsilon = max(0.0, min(1.0, self.epsilon))
+        self.prefilter_mult = int(getattr(args, "news_rl_prefilter_mult", 4))
+        self.prefilter_mult = max(1, self.prefilter_mult)
+        self.pool_cap = int(getattr(args, "news_rl_pool_cap", 128))
+        self.pool_cap = max(8, self.pool_cap)
+        self.reward_clip = float(getattr(args, "news_rl_reward_clip", 3.0))
+        self.reward_clip = max(1e-3, self.reward_clip)
+        self.recency_tau_h = float(getattr(args, "news_rl_recency_tau_hours", 24.0))
+        self.recency_tau_h = max(1e-6, self.recency_tau_h)
+
+        default_k = max(1, int(getattr(args, "news_topK", 5)))
+        k_raw = getattr(args, "news_rl_k_choices", "1,2,3,5,7,10")
+        self.k_choices = _parse_int_choices_csv(k_raw, default=[default_k])
+        allow_over_topk = int(getattr(args, "news_rl_allow_over_topk", 0)) == 1
+        if not allow_over_topk:
+            self.k_choices = [k for k in self.k_choices if int(k) <= default_k]
+            if not self.k_choices:
+                self.k_choices = [default_k]
+        if default_k not in self.k_choices:
+            self.k_choices.append(default_k)
+            self.k_choices = sorted(self.k_choices)
+        self.max_k = max(self.k_choices)
+
+        algo = str(getattr(args, "news_rl_algo", "auto")).lower()
+        if algo == "auto":
+            algo = str(getattr(args, "rl_algo", "lints")).lower()
+        if algo not in {"lints", "linucb"}:
+            algo = "lints"
+        self.algo = algo
+        self.ts_v = float(getattr(args, "ts_v", 1.0))
+        self.ucb_alpha = float(getattr(args, "ucb_alpha", 1.0))
+
+        # item features: [1, kw, recency, rate, utility, text_len, mix]
+        self.item_dim = 7
+        # context for K-arm: [1, pool_n, hist_std, trend_abs, hour_sin, hour_cos] + onehot(K)
+        self.ctx_dim = 6
+        self.k_dim = self.ctx_dim + len(self.k_choices)
+
+        if self.algo == "linucb":
+            self.item_bandit = LinUCB(self.item_dim, alpha=self.ucb_alpha)
+            self.k_bandit = LinUCB(self.k_dim, alpha=self.ucb_alpha)
+        else:
+            self.item_bandit = LinTS(self.item_dim, v=self.ts_v)
+            self.k_bandit = LinTS(self.k_dim, v=self.ts_v)
+
+        self.total_updates = 0
+
+        if self.enable and self.live_logger is not None:
+            self.live_logger.info(
+                "[DELTA][NEWS_RL] enabled: "
+                f"algo={self.algo}, k_choices={self.k_choices}, "
+                f"prefilter_mult={self.prefilter_mult}, pool_cap={self.pool_cap}"
+            )
+
+    @staticmethod
+    def _norm01(x: np.ndarray) -> np.ndarray:
+        if x.size == 0:
+            return x
+        lo = float(np.nanmin(x))
+        hi = float(np.nanmax(x))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-8:
+            return np.zeros_like(x, dtype=np.float32)
+        return ((x - lo) / (hi - lo)).astype(np.float32)
+
+    def policy_pool_k(self, default_k: int, n_cand: int) -> int:
+        if n_cand <= 0:
+            return 0
+        target = max(int(default_k), int(self.max_k * self.prefilter_mult))
+        target = min(target, self.pool_cap)
+        return max(1, min(int(target), int(n_cand)))
+
+    def _bandit_score(self, bandit, x: np.ndarray, explore: bool) -> float:
+        x = np.asarray(x, dtype=np.float32)
+        if isinstance(bandit, LinTS):
+            if explore:
+                return float(bandit.sample_score(x))
+            A_inv = np.linalg.inv(bandit.A)
+            mu = A_inv @ bandit.b
+            return float(mu @ x)
+        if isinstance(bandit, LinUCB):
+            if explore:
+                return float(bandit.ucb_score(x))
+            A_inv = np.linalg.inv(bandit.A)
+            mu = A_inv @ bandit.b
+            return float(mu @ x)
+        return 0.0
+
+    def _k_arm_feature(self, ctx: np.ndarray, k: int) -> np.ndarray:
+        onehot = np.zeros((len(self.k_choices),), dtype=np.float32)
+        if k in self.k_choices:
+            onehot[self.k_choices.index(int(k))] = 1.0
+        return np.concatenate([ctx.astype(np.float32), onehot], axis=0).astype(np.float32)
+
+    def _context_features(self, history_z, pool_n: int, target_time) -> np.ndarray:
+        hz = np.asarray(history_z, dtype=np.float32)
+        if hz.size == 0:
+            hz = np.zeros((1,), dtype=np.float32)
+        hist_std = float(np.clip(float(np.std(hz)) / 2.5, 0.0, 1.0))
+        if hz.size >= 2:
+            look = int(min(12, hz.size - 1))
+            trend = float(abs(float(hz[-1] - hz[-1 - look])))
+        else:
+            trend = 0.0
+        trend_n = float(np.clip(trend / 6.0, 0.0, 1.0))
+        pool_n_norm = float(np.clip(float(pool_n) / float(max(1, self.pool_cap)), 0.0, 1.0))
+
+        hour_sin, hour_cos = 0.0, 0.0
+        try:
+            tt = pd.to_datetime(target_time, errors="coerce")
+            if not pd.isna(tt):
+                h = float(tt.hour) + float(tt.minute) / 60.0
+                hour_sin = float(np.sin(2.0 * np.pi * h / 24.0))
+                hour_cos = float(np.cos(2.0 * np.pi * h / 24.0))
+        except Exception:
+            pass
+
+        return np.asarray(
+            [1.0, pool_n_norm, hist_std, trend_n, hour_sin, hour_cos],
+            dtype=np.float32,
+        )
+
+    def _item_features(self, pool_df: pd.DataFrame, target_time, time_col: str, text_col: str, policy_kw) -> np.ndarray:
+        n = len(pool_df)
+        if n == 0:
+            return np.zeros((0, self.item_dim), dtype=np.float32)
+
+        texts = pool_df[text_col].fillna("").astype(str)
+        texts_l = texts.str.lower()
+
+        kw_list = [str(k).strip().lower() for k in (policy_kw or []) if str(k).strip()]
+        if kw_list:
+            kw_raw = texts_l.apply(lambda s: sum((kw in s) for kw in kw_list) / float(len(kw_list))).to_numpy(dtype=np.float32)
+        else:
+            kw_raw = np.zeros((n,), dtype=np.float32)
+        kw = np.clip(kw_raw, 0.0, 1.0).astype(np.float32)
+
+        recency = np.ones((n,), dtype=np.float32)
+        if time_col in pool_df.columns:
+            try:
+                ts = pd.to_datetime(pool_df[time_col], errors="coerce")
+                tt = pd.to_datetime(target_time, errors="coerce")
+                if not pd.isna(tt):
+                    age_h = (tt - ts).dt.total_seconds() / 3600.0
+                    age_h = age_h.fillna(1e9).clip(lower=0.0)
+                    recency = np.exp(-(age_h.to_numpy(dtype=np.float32) / self.recency_tau_h)).astype(np.float32)
+                    recency = self._norm01(recency)
+            except Exception:
+                recency = np.ones((n,), dtype=np.float32)
+
+        if "rate" in pool_df.columns:
+            rate = pool_df["rate"].fillna(0.0).astype(float).to_numpy(dtype=np.float32)
+            rate = self._norm01(rate)
+        else:
+            rate = np.zeros((n,), dtype=np.float32)
+
+        if "utility_score" in pool_df.columns:
+            utility = pool_df["utility_score"].fillna(0.0).astype(float).to_numpy(dtype=np.float32)
+            utility = self._norm01(utility)
+        else:
+            utility = np.zeros((n,), dtype=np.float32)
+
+        text_len = np.minimum(texts.str.len().to_numpy(dtype=np.float32) / 400.0, 1.0).astype(np.float32)
+        mix = np.clip(0.5 * kw + 0.5 * recency, 0.0, 1.0).astype(np.float32)
+
+        ones = np.ones((n,), dtype=np.float32)
+        return np.stack([ones, kw, recency, rate, utility, text_len, mix], axis=1).astype(np.float32)
+
+    def select(
+        self,
+        pool_df: pd.DataFrame,
+        target_time,
+        time_col: str,
+        text_col: str,
+        policy_kw,
+        history_z,
+        default_k: int,
+        explore: bool,
+    ) -> tuple[pd.DataFrame, dict | None]:
+        if (not self.enable) or pool_df is None or len(pool_df) == 0:
+            return pool_df, None
+
+        pool = pool_df.reset_index(drop=True).copy()
+        n = len(pool)
+        valid_default_k = max(1, min(int(default_k), n))
+
+        valid_k = [k for k in self.k_choices if 1 <= int(k) <= n]
+        if not valid_k:
+            valid_k = [valid_default_k]
+
+        X = self._item_features(pool, target_time, time_col=time_col, text_col=text_col, policy_kw=policy_kw)
+        ctx = self._context_features(history_z=history_z, pool_n=n, target_time=target_time)
+
+        k_feats = [self._k_arm_feature(ctx, k) for k in valid_k]
+        k_scores = [self._bandit_score(self.k_bandit, xk, explore=explore) for xk in k_feats]
+        if explore and np.random.rand() < self.epsilon:
+            k_idx = int(np.random.randint(len(valid_k)))
+        else:
+            k_idx = int(np.argmax(np.asarray(k_scores, dtype=np.float32)))
+        chosen_k = int(valid_k[k_idx])
+        chosen_k_feat = k_feats[k_idx]
+
+        item_scores = np.asarray(
+            [self._bandit_score(self.item_bandit, x, explore=explore) for x in X],
+            dtype=np.float32,
+        )
+        if explore and np.random.rand() < self.epsilon:
+            order = np.random.permutation(n).tolist()
+        else:
+            order = np.argsort(-item_scores).tolist()
+
+        chosen_idx = order[:chosen_k]
+        selected = pool.iloc[chosen_idx].copy()
+        selected["news_rl_score"] = item_scores[chosen_idx]
+        selected = selected.sort_values("news_rl_score", ascending=False).reset_index(drop=True)
+
+        meta = {
+            "k_x": chosen_k_feat.astype(np.float32),
+            "item_x": [X[int(i)].astype(np.float32) for i in chosen_idx],
+            "chosen_k": int(chosen_k),
+            "pool_n": int(n),
+        }
+        return selected, meta
+
+    def update_batch(self, metas: list[dict | None], rewards: np.ndarray | list[float]):
+        if (not self.enable) or metas is None:
+            return
+        if rewards is None:
+            return
+
+        rew = np.asarray(rewards, dtype=np.float32).reshape(-1)
+        for i, meta in enumerate(metas):
+            if meta is None:
+                continue
+            if i >= rew.shape[0]:
+                break
+            r = float(rew[i])
+            if not np.isfinite(r):
+                continue
+            r = float(np.clip(r, -self.reward_clip, self.reward_clip))
+
+            k_x = meta.get("k_x", None)
+            if isinstance(k_x, np.ndarray):
+                self.k_bandit.update(k_x.astype(np.float32), r)
+
+            item_xs = meta.get("item_x", [])
+            for x in item_xs:
+                if x is None:
+                    continue
+                self.item_bandit.update(np.asarray(x, dtype=np.float32), r)
+
+            self.total_updates += 1
 
 def _build_delta_optimizer(delta_model, args):
     base_lr = float(args.lr)
@@ -182,17 +515,19 @@ def _build_delta_optimizer(delta_model, args):
     return optimizer, lr_info
 
 
-def _z_batch_tensors(batch, args):
+def _z_batch_tensors(batch, args, global_zstats):
     """
-    Build z-scored tensors for pure TS backbone.
+    Build global z-scored tensors for pure TS backbone.
     Returns:
       history_z: (B, L)
       targets_z: (B, H)
-      metas: list[{"mu": float, "sigma": float}]
+      metas: list[{"mu_global": float, "sigma_global": float}]
     """
     L = int(args.history_len)
     H = int(args.horizon)
-    eps = float(getattr(args, "zscore_eps", 1e-6))
+    stats = _coerce_global_zstats(global_zstats, args, required=True)
+    mu_global = float(stats["mu_global"])
+    sigma_global = float(stats["sigma_global"])
 
     history_z_list = []
     targets_z_list = []
@@ -203,9 +538,8 @@ def _z_batch_tensors(batch, args):
         history = batch["history_value"][i].tolist()
         target = batch["target_value"][i].tolist()
 
-        mu, sigma = _zstats(history, eps=eps)
-        history_z = np.asarray(_zscore(history, mu, sigma), dtype=np.float32)
-        target_z = np.asarray(_zscore(target, mu, sigma), dtype=np.float32)
+        history_z = np.asarray(_zscore(history, mu_global, sigma_global), dtype=np.float32)
+        target_z = np.asarray(_zscore(target, mu_global, sigma_global), dtype=np.float32)
 
         if history_z.shape[0] > L:
             history_z = history_z[-L:]
@@ -223,7 +557,15 @@ def _z_batch_tensors(batch, args):
 
         history_z_list.append(history_z)
         targets_z_list.append(target_z)
-        metas.append({"mu": float(mu), "sigma": float(sigma)})
+        metas.append(
+            {
+                "mu_global": float(mu_global),
+                "sigma_global": float(sigma_global),
+                # keep legacy keys for downstream compatibility
+                "mu": float(mu_global),
+                "sigma": float(sigma_global),
+            }
+        )
 
     history_z_t = torch.tensor(np.stack(history_z_list, axis=0), dtype=torch.float32)
     targets_z_t = torch.tensor(np.stack(targets_z_list, axis=0), dtype=torch.float32)
@@ -266,12 +608,12 @@ def _make_patches(seq: list[float], patch_len: int, stride: int):
     return patches, mask
 
 
-def history_text(history_z: list[float], mu: float, sigma: float) -> str:
+def history_text(history_z: list[float], mu_global: float, sigma_global: float) -> str:
     hz = np.asarray(history_z, dtype=np.float32)
     last = hz.tolist() if len(hz) >= 8 else hz.tolist()
     slope = float(hz[-1] - hz[-9]) if len(hz) >= 9 else float(hz[-1] - hz[0]) if len(hz) >= 2 else 0.0
     return (
-        f"History z-scored (mu={mu:.4f}, std={sigma:.4f}). "
+        f"History z-scored (global mu={mu_global:.4f}, std={sigma_global:.4f}). "
         f"Last {len(last)} z: {', '.join([f'{v:.3f}' for v in last])}. "
         f"Recent slope: {slope:.3f}."
     )
@@ -315,6 +657,7 @@ def build_batch_inputs(
     templates,
     tpl_id,
     args,
+    global_zstats,
     news_df,
     policy_name,
     policy_kw,
@@ -324,7 +667,10 @@ def build_batch_inputs(
     testing: bool = False,
     force_no_news: bool = False,
     news_dropout: bool = False,
-    prompt_path: str = None
+    prompt_path: str = None,
+    news_rl_selector: NewsRLBanditSelector | None = None,
+    news_rl_explore: bool = False,
+    return_news_rl_meta: bool = False,
 ):
     """
     Returns:
@@ -333,6 +679,10 @@ def build_batch_inputs(
       targets_z, metas,
       prompt_texts
     """
+    stats = _coerce_global_zstats(global_zstats, args, required=True)
+    mu_global = float(stats["mu_global"])
+    sigma_global = float(stats["sigma_global"])
+
     L, H = int(args.history_len), int(args.horizon)
     news_budget = int(args.token_budget * args.token_budget_news_frac)
 
@@ -357,42 +707,80 @@ def build_batch_inputs(
     pred_ends = []
 
     len_selected_news = []
+    news_rl_meta_list = [] if return_news_rl_meta else None
 
     for i in range(B):
         history = batch["history_value"][i].tolist()
         target = batch["target_value"][i].tolist()
         t_target = batch["target_time"][i]
 
-        mu, sigma = _zstats(history, eps=float(getattr(args, "zscore_eps", 1e-6)))
-        history_z = _zscore(history, mu, sigma)
-        target_z = _zscore(target, mu, sigma)
+        history_z = _zscore(history, mu_global, sigma_global)
+        target_z = _zscore(target, mu_global, sigma_global)
 
 
         p, pm = _make_patches(history_z, patch_len=patch_len, stride=patch_stride)
+        news_text_col = args.news_text_col
         if policy_name == "no_sum":
-            args.news_text_col = "no_sum"
+            news_text_col = "no_sum"
         elif policy_name == "sum_v0":
-            args.news_text_col = "sum_v0"
+            news_text_col = "sum_v0"
         # news
         avg_rate = 0.0
+        news_rl_meta = None
         if force_no_news or (news_df is None) or (len(news_df) == 0):
-            selected = pd.DataFrame(columns=[args.news_time_col, args.news_text_col])
+            selected = pd.DataFrame(columns=[args.news_time_col, news_text_col])
         else:
             cand = get_candidates(news_df, args.news_time_col, t_target, args.news_window_days, args.news_topM)
-            selected, avg_rate = select_news(cand, policy_name, args.news_text_col, policy_kw, args.news_topK)
-            # print(len(selected))
+            policy_k = int(args.news_topK)
+            if news_rl_selector is not None and news_rl_selector.enable:
+                policy_k = news_rl_selector.policy_pool_k(default_k=int(args.news_topK), n_cand=len(cand))
+
+            selected, avg_rate = select_news(
+                cand, policy_name, news_text_col, policy_kw, policy_k, args=args
+            )
+
+            if len(selected) > policy_k:
+                selected = selected.head(policy_k)
+
+            if int(getattr(args, "utility_rerank_enable", 1)) == 1 and len(selected) > 0:
+                selected = rerank_selected_news_by_utility(
+                    selected=selected,
+                    target_time=t_target,
+                    time_col=args.news_time_col,
+                    text_col=news_text_col,
+                    policy_kw=policy_kw,
+                    args=args,
+                )
+
+            if news_rl_selector is not None and news_rl_selector.enable and len(selected) > 0:
+                selected, news_rl_meta = news_rl_selector.select(
+                    pool_df=selected,
+                    target_time=t_target,
+                    time_col=args.news_time_col,
+                    text_col=news_text_col,
+                    policy_kw=policy_kw,
+                    history_z=history_z,
+                    default_k=int(args.news_topK),
+                    explore=bool(news_rl_explore),
+                )
+
+            if (not selected.empty) and ("rate" in selected.columns):
+                avg_rate = float(selected["rate"].mean())
 
         len_selected_news.append(len(selected))
+        if return_news_rl_meta:
+            news_rl_meta_list.append(news_rl_meta)
 
         news_str = ""
         if (not force_no_news) and len(selected) > 0:
             news_str = format_news(
                 selected,
-                args.news_text_col,
+                news_text_col,
                 news_budget,
                 tokenizer,
                 summary_method=args.news_summary_method,
                 max_sentences=args.news_max_sentences,
+                show_utility=int(getattr(args, "utility_show_in_prompt", 1)) == 1,
             )
             if news_dropout:
                 news_str = _maybe_news_dropout(news_str, args)
@@ -413,9 +801,17 @@ def build_batch_inputs(
         targets_z_list.append(np.asarray(target_z, dtype=np.float32))
         patches_list.append(p)
         patchmask_list.append(pm)
-        metas.append({"mu": mu, "sigma": sigma})
+        metas.append(
+            {
+                "mu_global": float(mu_global),
+                "sigma_global": float(sigma_global),
+                # keep legacy keys for downstream compatibility
+                "mu": float(mu_global),
+                "sigma": float(sigma_global),
+            }
+        )
 
-        hist_strs.append(history_text(history_z, mu, sigma))
+        hist_strs.append(history_text(history_z, mu_global, sigma_global))
         news_str_list.append(news_str)
 
         start_dates.append(start_date)
@@ -469,6 +865,8 @@ def build_batch_inputs(
                 "policy": str(policy_name),
                 "force_no_news": bool(force_no_news),
                 "prompt": prompt,
+                "mu_global": float(metas[i]["mu_global"]),
+                "sigma_global": float(metas[i]["sigma_global"]),
                 "mu": float(metas[i]["mu"]),
                 "sigma": float(metas[i]["sigma"]),
             }
@@ -481,6 +879,8 @@ def build_batch_inputs(
     # print("max = ", len_selected_news)
     rel_labels = torch.tensor(rel_labels_list, dtype=torch.float32)
     news_counts = torch.tensor(len_selected_news, dtype=torch.float32)
+    if return_news_rl_meta:
+        return input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels, news_counts, news_rl_meta_list
     return input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels, news_counts
 
 # ----------------------------
@@ -494,6 +894,7 @@ def evaluate_metrics_single(
     templates,
     tpl_id,
     args,
+    global_zstats,
     news_df,
     policy_name,
     policy_kw,
@@ -513,6 +914,9 @@ def evaluate_metrics_single(
       - mae_avg: raw-scale MAE
     """
     model.eval()
+    stats = _coerce_global_zstats(global_zstats, args, required=True)
+    mu_global = float(stats["mu_global"])
+    sigma_global = float(stats["sigma_global"])
 
     loss_sum, n_samples = 0.0, 0
     se_sum, ae_sum, n_elems = 0.0, 0.0, 0
@@ -529,6 +933,7 @@ def evaluate_metrics_single(
             templates=templates,
             tpl_id=tpl_id,
             args=args,
+            global_zstats=stats,
             news_df=news_df,
             policy_name=policy_name,
             policy_kw=policy_kw,
@@ -566,10 +971,7 @@ def evaluate_metrics_single(
         targets_cpu = batch["target_value"].detach().cpu().numpy()  # raw
 
         for i in range(bs):
-            mu = float(metas[i]["mu"])
-            sigma = float(metas[i]["sigma"])
-
-            pred_denorm = _inv_zscore(pred_z_cpu[i].tolist(), mu, sigma)
+            pred_denorm = _inv_zscore(pred_z_cpu[i].tolist(), mu_global, sigma_global)
             true_vals = targets_cpu[i].reshape(-1).tolist()
             true_vals = [float(x) for x in true_vals[: int(args.horizon)]]
 
@@ -591,8 +993,10 @@ def evaluate_metrics_single(
                     "pred_z": [float(x) for x in pred_z_cpu[i].tolist()],
                     "pred": [float(x) for x in pred_denorm],
                     "true": [float(x) for x in true_vals],
-                    "mu": mu,
-                    "sigma": sigma,
+                    "mu_global": mu_global,
+                    "sigma_global": sigma_global,
+                    "mu": mu_global,
+                    "sigma": sigma_global,
                 }
                 with open(ans_json_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -608,6 +1012,7 @@ def evaluate_metrics_backbone(
     base_backbone,
     data_loader,
     args,
+    global_zstats,
     device,
     testing: bool = False,
     true_pred_csv_path: str | None = None,
@@ -617,6 +1022,9 @@ def evaluate_metrics_backbone(
     Pure TS backbone evaluation in z-space.
     """
     base_backbone.eval()
+    stats = _coerce_global_zstats(global_zstats, args, required=True)
+    mu_global = float(stats["mu_global"])
+    sigma_global = float(stats["sigma_global"])
 
     loss_sum, n_samples = 0.0, 0
     se_sum, ae_sum, n_elems = 0.0, 0.0, 0
@@ -628,7 +1036,7 @@ def evaluate_metrics_backbone(
         ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
 
     for _, batch in enumerate(data_loader):
-        history_z, targets_z, metas = _z_batch_tensors(batch, args)
+        history_z, targets_z, metas = _z_batch_tensors(batch, args, global_zstats=stats)
         history_z = history_z.to(device)
         targets_z = targets_z.to(device)
 
@@ -643,10 +1051,7 @@ def evaluate_metrics_backbone(
         targets_cpu = batch["target_value"].detach().cpu().numpy()
 
         for i in range(bs):
-            mu = float(metas[i]["mu"])
-            sigma = float(metas[i]["sigma"])
-
-            pred_denorm = _inv_zscore(pred_z_cpu[i].tolist(), mu, sigma)
+            pred_denorm = _inv_zscore(pred_z_cpu[i].tolist(), mu_global, sigma_global)
             true_vals = targets_cpu[i].reshape(-1).tolist()
             true_vals = [float(x) for x in true_vals[: int(args.horizon)]]
 
@@ -666,8 +1071,10 @@ def evaluate_metrics_backbone(
                     "pred_z": [float(x) for x in pred_z_cpu[i].tolist()],
                     "pred": [float(x) for x in pred_denorm],
                     "true": [float(x) for x in true_vals],
-                    "mu": mu,
-                    "sigma": sigma,
+                    "mu_global": mu_global,
+                    "sigma_global": sigma_global,
+                    "mu": mu_global,
+                    "sigma": sigma_global,
                 }
                 with open(ans_json_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -687,6 +1094,7 @@ def evaluate_metrics_residual(
     templates,
     tpl_id,
     args,
+    global_zstats,
     news_df,
     policy_name,
     policy_kw,
@@ -696,17 +1104,27 @@ def evaluate_metrics_residual(
     true_pred_csv_path: str | None = None,
     news_dropout: bool = False,
     filename: str = None,
+    delta_alpha: float = 1.0,
+    delta_alphas: list[float] | None = None,
+    news_rl_selector: NewsRLBanditSelector | None = None,
 ):
     """
-    Residual evaluation: pred = base_backbone(history_z) + delta_llm(with-news)
-    Returns combined metrics.
+    Residual evaluation: pred = base_backbone(history_z) + delta_llm(with-news).
+    Alpha fusion is intentionally disabled; final prediction is always base + delta.
     """
     if base_model is None:
         raise ValueError("evaluate_metrics_residual requires a trained base backbone model.")
+    stats = _coerce_global_zstats(global_zstats, args, required=True)
+    mu_global = float(stats["mu_global"])
+    sigma_global = float(stats["sigma_global"])
 
     base_model.eval()
     delta_model.eval()
 
+    # Keep args for backward compatibility but force pure residual composition.
+    _ = delta_alpha
+    _ = delta_alphas
+    fixed_alpha = 1.0
     loss_sum, n_samples = 0.0, 0
     se_sum, ae_sum, n_elems = 0.0, 0.0, 0
 
@@ -723,6 +1141,7 @@ def evaluate_metrics_residual(
             templates=templates,
             tpl_id=tpl_id,
             args=args,
+            global_zstats=stats,
             news_df=news_df,
             policy_name=policy_name,
             policy_kw=policy_kw,
@@ -732,6 +1151,8 @@ def evaluate_metrics_residual(
             testing=testing,
             force_no_news=False,
             news_dropout=news_dropout,
+            news_rl_selector=news_rl_selector,
+            news_rl_explore=False,
         )
 
         ids_d = ids_d.to(device)
@@ -740,7 +1161,7 @@ def evaluate_metrics_residual(
         ts_pm = ts_pm.to(device)
         targets_z = targets_z.to(device)
 
-        history_z, _, _ = _z_batch_tensors(batch, args)
+        history_z, _, _ = _z_batch_tensors(batch, args, global_zstats=stats)
         history_z = history_z.to(device)
         base_pred = base_model(history_z).to(torch.float32)  # (B,H)
 
@@ -757,22 +1178,21 @@ def evaluate_metrics_residual(
         )
         delta_corr = out_delta["pred"].to(torch.float32)
 
-        pred_z = base_pred + delta_corr
-
-        loss = F.l1_loss(pred_z.to(torch.float32), targets_z.to(torch.float32), reduction="mean")
+        targets_cpu = batch["target_value"].detach().cpu().numpy()  # raw
 
         bs = ids_d.size(0)
+        targets_z_f = targets_z.to(torch.float32)
+        base_pred_f = base_pred.to(torch.float32)
+        delta_corr_f = delta_corr.to(torch.float32)
+
+        pred_z = base_pred_f + fixed_alpha * delta_corr_f
+        loss = F.l1_loss(pred_z, targets_z_f, reduction="mean")
+        pred_z_cpu = pred_z.detach().cpu().numpy()
         loss_sum += float(loss.detach().cpu()) * bs
         n_samples += bs
 
-        pred_z_cpu = pred_z.detach().to(torch.float32).cpu().numpy()
-        targets_cpu = batch["target_value"].detach().cpu().numpy()  # raw
-
         for i in range(bs):
-            mu = float(metas[i]["mu"])
-            sigma = float(metas[i]["sigma"])
-
-            pred_denorm = _inv_zscore(pred_z_cpu[i].tolist(), mu, sigma)
+            pred_denorm = _inv_zscore(pred_z_cpu[i].tolist(), mu_global, sigma_global)
             true_vals = targets_cpu[i].reshape(-1).tolist()
             true_vals = [float(x) for x in true_vals[: int(args.horizon)]]
 
@@ -794,10 +1214,13 @@ def evaluate_metrics_residual(
                     "pred_z": [float(x) for x in pred_z_cpu[i].tolist()],
                     "pred": [float(x) for x in pred_denorm],
                     "true": [float(x) for x in true_vals],
-                    "mu": mu,
-                    "sigma": sigma,
+                    "mu_global": mu_global,
+                    "sigma_global": sigma_global,
+                    "mu": mu_global,
+                    "sigma": sigma_global,
                     "policy": str(policy_name),
                     "template_id": int(tpl_id),
+                    "delta_alpha": float(fixed_alpha),
                 }
                 with open(ans_json_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -913,6 +1336,7 @@ def bandit_round_update_residual(
     round_id,
     bidx,
     global_step,
+    global_zstats,
 ):
     delta_model.eval()
 
@@ -942,6 +1366,7 @@ def bandit_round_update_residual(
         templates=templates,
         tpl_id=tpl_id,
         args=args,
+        global_zstats=global_zstats,
         news_df=news_df,
         policy_name=policy_name,
         policy_kw=policy_kw,
@@ -1012,6 +1437,12 @@ def setup_env_and_data(args):
     train_df = _read(args.train_file)
     val_df = _read(args.val_file)
     test_df = _read(args.test_file)
+
+    global_zstats = _compute_global_zstats_from_train_df(train_df, args)
+    live_logger.info(
+        "[ZSCORE] global stats from train_df: "
+        f"mu_global={global_zstats['mu_global']:.6f}, sigma_global={global_zstats['sigma_global']:.6f}"
+    )
 
     train_df[args.time_col] = pd.to_datetime(train_df[args.time_col], dayfirst=args.dayFirst)
     val_df[args.time_col] = pd.to_datetime(val_df[args.time_col], dayfirst=args.dayFirst)
@@ -1122,6 +1553,7 @@ def setup_env_and_data(args):
         "volatility_bin": volatility_bin,
         "volatility_bin_val": volatility_bin_val,
         "volatility_bin_test": volatility_bin_test,
+        "global_zstats": global_zstats,
         "prompt_path": prompt_path,
         "test_filename": filename,
     }
@@ -1136,6 +1568,7 @@ def train_base_stage(args, bundle):
     train_loader = bundle["train_loader"]
     val_loader = bundle["val_loader"]
     templates = bundle["templates"]
+    global_zstats = _coerce_global_zstats(bundle.get("global_zstats", None), args, required=True)
 
     # base epochs
     base_epochs_override = int(getattr(args, "base_epochs", -1))
@@ -1207,7 +1640,7 @@ def train_base_stage(args, bundle):
         pbar = tqdm(train_loader, desc=f"[BASE] Epoch {epoch+1}/{base_epochs}")
 
         for _, batch in enumerate(pbar):
-            history_z, targets_z, _ = _z_batch_tensors(batch, args)
+            history_z, targets_z, _ = _z_batch_tensors(batch, args, global_zstats=global_zstats)
             history_z = history_z.to(device)
             targets_z = targets_z.to(device)
 
@@ -1233,6 +1666,7 @@ def train_base_stage(args, bundle):
             base_backbone=base_train_model,
             data_loader=val_loader,
             args=args,
+            global_zstats=global_zstats,
             device=device,
             testing=False,
             true_pred_csv_path=None,
@@ -1272,6 +1706,7 @@ def train_base_stage(args, bundle):
                 scheduler=scheduler_base,
                 epoch=epoch,
                 global_step=global_step,
+                global_zstats=global_zstats,
             )
             live_logger.info(f"[BASE] New best saved to {best_base_path} ({args.reward_metric}={best_base_metric:.6f})")
         else:
@@ -1297,6 +1732,7 @@ def train_base_stage(args, bundle):
         "live_logger": live_logger,
         "templates":templates,
         "best_base_metric": best_base_metric,
+        "global_zstats": global_zstats,
     }
 
 
@@ -1318,6 +1754,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     volatility_bin_val = bundle["volatility_bin_val"]
     volatility_bin_test = bundle["volatility_bin_test"]
     true_pred_csv_path = bundle["true_pred_csv_path"]
+    global_zstats_bundle = _coerce_global_zstats(bundle.get("global_zstats", None), args, required=True)
     
 
     lora_cfg = {
@@ -1356,6 +1793,20 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         f"[DELTA] Loaded base backbone: {base_meta.get('backbone_name')} "
         f"(L={base_meta.get('history_len')}, H={base_meta.get('horizon')})"
     )
+    global_zstats = _coerce_global_zstats(base_meta, args, required=False)
+    if global_zstats is None:
+        global_zstats = global_zstats_bundle
+        live_logger.info(
+            "[DELTA] base checkpoint has no global z-score stats; "
+            f"fallback to train_df stats: mu_global={global_zstats['mu_global']:.6f}, "
+            f"sigma_global={global_zstats['sigma_global']:.6f}"
+        )
+    else:
+        live_logger.info(
+            "[DELTA] using global z-score stats from base checkpoint: "
+            f"mu_global={global_zstats['mu_global']:.6f}, "
+            f"sigma_global={global_zstats['sigma_global']:.6f}"
+        )
 
     # delta model init from pretrained LLM + LoRA (base comes from pure TS backbone)
     tokenizer, delta_model = load_llama_lora(
@@ -1374,7 +1825,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         patch_dropout=args.patch_dropout,
         head_dropout=args.head_dropout,
         head_mlp=args.head_mlp,
-        delta_gate_init_bias=float(getattr(args, "delta_gate_init_bias", -1.0)),
+        delta_gate_init_bias=float(getattr(args, "delta_gate_init_bias", 0.0)),
+        delta_head_init_std=float(getattr(args, "delta_head_init_std", 0.01)),
+        delta_internal_gate=bool(int(getattr(args, "delta_internal_gate", 1))),
         delta_clip=float(getattr(args, "delta_clip", 3.0)),
         delta_news_tail_tokens=int(getattr(args, "delta_news_tail_tokens", 160)),
         delta_rel_floor=float(getattr(args, "delta_rel_floor", 0.05)),
@@ -1386,26 +1839,31 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     for p in delta_model.base_head.parameters():
         p.requires_grad = False
 
-    # keep backbone patch/text pooling stable so delta focuses on residual adaptation
-    freeze_modules = [
-        "patch_proj",
-        "patch_gate",
-        "patch_pos",
-        "pool_attn",
-        "pool_ln",
-        "text_ctx_ln",
-        "text2q",
-    ]
-    for name in freeze_modules:
-        if hasattr(delta_model, name):
-            m = getattr(delta_model, name)
-            if hasattr(m, "parameters"):
-                for p in m.parameters():
-                    p.requires_grad = False
-    if hasattr(delta_model, "pool_q"):
-        delta_model.pool_q.requires_grad = False
-    if hasattr(delta_model, "layer_w"):
-        delta_model.layer_w.requires_grad = False
+    freeze_feature_modules = int(getattr(args, "delta_freeze_feature_modules", 0)) == 1
+    if freeze_feature_modules:
+        # legacy option: keep feature extractor fixed during delta adaptation
+        freeze_modules = [
+            "patch_proj",
+            "patch_gate",
+            "patch_pos",
+            "pool_attn",
+            "pool_ln",
+            "text_ctx_ln",
+            "text2q",
+        ]
+        for name in freeze_modules:
+            if hasattr(delta_model, name):
+                m = getattr(delta_model, name)
+                if hasattr(m, "parameters"):
+                    for p in m.parameters():
+                        p.requires_grad = False
+        if hasattr(delta_model, "pool_q"):
+            delta_model.pool_q.requires_grad = False
+        if hasattr(delta_model, "layer_w"):
+            delta_model.layer_w.requires_grad = False
+        live_logger.info("[DELTA] feature modules frozen (legacy mode).")
+    else:
+        live_logger.info("[DELTA] feature modules remain trainable (recommended).")
 
     # ensure delta-specific heads remain trainable
     train_modules = ["delta_head", "delta_gate", "delta_fuse", "delta_text_ln", "rel_head"]
@@ -1461,6 +1919,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     policy_name = args.default_policy
     best_tpl_id = tpl_id
     best_policy_name = policy_name
+    news_rl_selector = NewsRLBanditSelector(args=args, live_logger=live_logger)
 
     d_tpl = len(context_vector) + len(tpl_features(allowed_tpl_ids[0], context_vector=context_vector))
     d_pol = len(context_vector)
@@ -1477,6 +1936,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             base_backbone=base_backbone,
             data_loader=val_loader,
             args=args,
+            global_zstats=global_zstats,
             device=device,
             testing=False,
             true_pred_csv_path=None,
@@ -1493,10 +1953,14 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             f"mae={base_ref_mae:.6f}; threshold={best_metric:.6f}"
         )
     stale_rounds = 0
+    has_saved_delta = False
     loss_window = deque(maxlen=50)
 
     val_loss_per_epoch, mse_loss_per_epoch, mae_loss_per_epoch = [], [], []
     global_step = 0
+    best_delta_alpha = 1.0
+    if int(getattr(args, "delta_auto_alpha", 0)) == 1:
+        live_logger.info("[DELTA] alpha fusion is disabled in current trainer; forcing alpha=1.0.")
 
     for epoch in range(delta_epochs):
         pbar = tqdm(train_loader, desc=f"[DELTA] Epoch {epoch+1}/{delta_epochs}")
@@ -1536,6 +2000,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 round_id=epoch + 1,
                 bidx=None,
                 global_step=global_step,
+                global_zstats=global_zstats,
             )
 
             live_logger.info(f"[DELTA] EPOCH_BEGIN epoch={epoch+1}, tpl_id={tpl_id}, policy={policy_name}")
@@ -1576,15 +2041,17 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     round_id=epoch * len(pbar) + bidx,
                     bidx=bidx,
                     global_step=global_step,
+                    global_zstats=global_zstats,
                 )
 
             # build delta inputs (with news)
-            ids_d, attn_d, ts_p, ts_pm, targets_z, metas, _, rel_labels_d, news_counts_d = build_batch_inputs(
+            ids_d, attn_d, ts_p, ts_pm, targets_z, metas, _, rel_labels_d, news_counts_d, news_rl_meta_d = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
                 tpl_id=tpl_id,
                 args=args,
+                global_zstats=global_zstats,
                 news_df=news_df,
                 policy_name=policy_name,
                 policy_kw=policy_kw,
@@ -1594,7 +2061,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 testing=False,
                 force_no_news=False,
                 news_dropout=True,
-                prompt_path=bundle["prompt_path"]
+                prompt_path=bundle["prompt_path"],
+                news_rl_selector=news_rl_selector,
+                news_rl_explore=True,
+                return_news_rl_meta=True,
             )
             # build base text inputs (no news)
             ids_b, attn_b, _, _, _, _, _, _, _ = build_batch_inputs(
@@ -1603,6 +2073,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 templates=templates,
                 tpl_id=tpl_id,
                 args=args,
+                global_zstats=global_zstats,
                 news_df=news_df,
                 policy_name=policy_name,
                 policy_kw=policy_kw,
@@ -1632,9 +2103,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             # (1) BASE prediction from pure TS backbone -> base_pred
             # -----------------------------
             with torch.no_grad():
-                history_z, _, _ = _z_batch_tensors(batch, args)
+                history_z, _, _ = _z_batch_tensors(batch, args, global_zstats=global_zstats)
                 history_z = history_z.to(device)
                 base_pred = base_backbone(history_z).to(torch.float32)
+                noise_scale = float(getattr(args, "base_pred_noise", 0.05))
+                if delta_model.training and noise_scale > 0:
+                    base_pred = base_pred + torch.randn_like(base_pred) * noise_scale
 
             # residual target for delta head
             delta_targets = (targets_z.to(torch.float32) - base_pred).detach()
@@ -1649,11 +2123,16 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 ts_patch_mask=ts_pm,
                 targets=delta_targets,
                 head_mode="delta",
-                rel_targets=None,
-                rel_lambda=0.0,
+                rel_targets=rel_labels_d,
+                rel_lambda=float(getattr(args, "rel_supervise_lambda", 0.5)),
             )
-            delta_pred_real = out_delta["pred"].to(torch.float32)  # (B,H)
-            rel_logits_real = out_delta["rel_logits"].to(torch.float32)  # (B,)
+            delta_pred_real = out_delta["pred"]  # (B,H)
+            rel_logits_real = out_delta["rel_logits"] # (B,)
+            loss_rel_supervise = out_delta.get("loss_rel", None)
+            if loss_rel_supervise is None:
+                loss_rel_supervise = torch.zeros((), device=device, dtype=torch.float32)
+            else:
+                loss_rel_supervise = loss_rel_supervise.to(torch.float32)
 
             # -----------------------------
             # (3) NULL delta forward (no-news, adapter_on, delta head) -> delta_pred_null
@@ -1664,13 +2143,18 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 attention_mask=attn_b,
                 ts_patches=ts_p,
                 ts_patch_mask=ts_pm,
-                targets=None,            # IMPORTANT: do NOT regress to delta_targets here
+                targets=torch.zeros_like(delta_targets),
                 head_mode="delta",
                 rel_targets=None,
                 rel_lambda=0.0,
             )
-            delta_pred_null = out_null["pred"].to(torch.float32)    # (B,H)
-            rel_logits_null = out_null["rel_logits"].to(torch.float32)
+            delta_pred_null = out_null["pred"]    # (B,H)
+            rel_logits_null = out_null["rel_logits"]
+            loss_null_sup = out_null.get("loss_fore", None)
+            if loss_null_sup is None:
+                loss_null_sup = torch.zeros((), device=device, dtype=torch.float32)
+            else:
+                loss_null_sup = loss_null_sup.to(torch.float32)
 
             # -----------------------------
             # (4) Counterfactual Regularization
@@ -1679,22 +2163,31 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             #   4.3 Non-degradation: pred(with-news) should not be worse than base
             #   4.4 Gate pseudo-labeling: learn to suppress noisy news
             # -----------------------------
-            delta_null_lambda = float(getattr(args, "delta_null_lambda", 0.5))
+            delta_null_lambda = float(getattr(args, "delta_null_lambda", 0.0001))
             delta_margin_lambda = float(getattr(args, "delta_margin_lambda", 1.0))
             delta_adv_margin = float(getattr(args, "delta_adv_margin", 0.02))
-            delta_non_degrade_lambda = float(getattr(args, "delta_non_degrade_lambda", 0.0))
+            delta_non_degrade_lambda = float(getattr(args, "delta_non_degrade_lambda", 1.0))
             delta_non_degrade_margin = float(getattr(args, "delta_non_degrade_margin", 0.0))
-            gate_lambda = float(getattr(args, "gate_lambda", 0.0))
-            gate_null_lambda = float(getattr(args, "gate_null_lambda", 0.0))
-            cf_min_weight = float(getattr(args, "cf_min_weight", 0.05))
-            cf_min_weight = max(0.0, min(1.0, cf_min_weight))
+            utility_rank_lambda = float(getattr(args, "utility_rank_lambda", 0.2))
+            utility_rank_margin = float(getattr(args, "utility_rank_margin", 0.10))
+            gate_lambda = float(getattr(args, "gate_lambda", 0.2))
+            gate_null_lambda = float(getattr(args, "gate_null_lambda", 0.1))
+            rel_supervise_lambda = float(getattr(args, "rel_supervise_lambda", 0.5))
             cf_pseudo_margin = float(getattr(args, "cf_pseudo_margin", 0.01))
-            cf_pseudo_temp = float(getattr(args, "cf_pseudo_temp", 0.02))
+            cf_pseudo_temp = float(getattr(args, "cf_pseudo_temp", 0.2))
             cf_pseudo_temp = max(1e-6, cf_pseudo_temp)
             cf_pseudo_hard = int(getattr(args, "cf_pseudo_hard", 0))
             violation_cap = float(getattr(args, "delta_violation_cap", 0.0))
 
             gate_enable = int(getattr(args, "news_gate_enable", 1)) == 1
+            delta_warmup_epochs = max(0, int(getattr(args, "delta_warmup_epochs", 2)))
+            if epoch < delta_warmup_epochs:
+                gate_enable = False
+                delta_null_lambda = 0.0
+                delta_margin_lambda = 0.0
+                gate_lambda = 0.0
+                gate_null_lambda = 0.0
+                utility_rank_lambda = 0.0
             if gate_enable:
                 gate_real = _bounded_sigmoid_gate(rel_logits_real, args)
                 gate_null = _bounded_sigmoid_gate(rel_logits_null, args)
@@ -1711,9 +2204,11 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             pred_base_z = base_pred
 
             # per-sample errors in z-space
-            err_real = torch.abs(pred_real_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
-            err_null = torch.abs(pred_null_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
-            err_base = torch.abs(pred_base_z - targets_z.to(torch.float32)).mean(dim=1)  # (B,)
+            targets_z_typed = targets_z.to(dtype=delta_pred_real.dtype)
+            err_real = torch.abs((base_pred.to(delta_pred_real.dtype) + delta_pred_real) - targets_z_typed).mean(dim=1)
+            err_null = torch.abs((base_pred.to(delta_pred_null.dtype) + delta_pred_null) - targets_z_typed).mean(dim=1)
+            err_base = torch.abs(base_pred.to(targets_z_typed.dtype) - targets_z_typed).mean(dim=1)
+
 
             # pseudo label from counterfactual gain; no-news samples are always 0.
             gain = (err_null - err_real) - cf_pseudo_margin
@@ -1725,19 +2220,34 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             pseudo_gate = pseudo_gate.detach()
             pseudo_target = (0.8 * pseudo_gate + 0.2 * rel_labels_d * has_news).detach()
 
+            # Online RL reward for news selection (higher means news helped more than null-news).
+            if news_rl_selector is not None and news_rl_selector.enable:
+                rl_reward = (err_null - err_real).detach().float().cpu().numpy()
+                news_rl_selector.update_batch(news_rl_meta_d, rl_reward)
+
             # weighted residual target fitting
             residual_mode = str(getattr(args, "residual_loss", "mae")).lower()
             per_elem_res = _residual_elementwise(delta_pred_real, delta_targets, residual_mode)
             per_sample_res = per_elem_res.mean(dim=1)
-            sample_w = cf_min_weight + (1.0 - cf_min_weight) * pseudo_soft.detach()
-            sample_w = torch.where(has_news > 0.5, sample_w, torch.ones_like(sample_w))
+            cold_start_steps = int(getattr(args, "delta_cold_start_steps", 200))
+            if global_step < cold_start_steps:
+                sample_w = torch.ones_like(pseudo_soft)
+            else:
+                cf_min_weight = float(getattr(args, "cf_min_weight", 0.30))
+                cf_min_weight = max(0.0, min(1.0, cf_min_weight))
+                sample_w = cf_min_weight + (1.0 - cf_min_weight) * pseudo_soft.detach()
+                sample_w = torch.where(has_news > 0.5, sample_w, torch.ones_like(sample_w))
             loss_res = (sample_w * per_sample_res).sum() / sample_w.sum().clamp_min(1e-6)
+            loss_res = loss_res + loss_null_sup
 
             # 4.2 hinge margin: err_null >= err_real + margin
             hinge_margin = torch.relu(delta_adv_margin + err_real - err_null)
             if violation_cap > 0:
                 hinge_margin = hinge_margin.clamp(max=violation_cap)
-            margin_w = pseudo_soft.detach().clamp_min(1e-3)
+            if global_step < cold_start_steps:
+                margin_w = has_news.clamp_min(1e-3)
+            else:
+                margin_w = (has_news * pseudo_soft.detach() + (1.0 - has_news)).clamp_min(1e-3)
             loss_margin = (margin_w * hinge_margin).sum() / margin_w.sum().clamp_min(1e-6)
 
             # 4.3 non-degradation vs base
@@ -1754,19 +2264,46 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 loss_gate = torch.zeros((), device=device, dtype=torch.float32)
                 loss_gate_null = torch.zeros((), device=device, dtype=torch.float32)
 
+            # Ranking loss: useful-news samples should have stronger real-news logit than null-news logit.
+            rank_w = torch.where(has_news > 0.5, pseudo_soft.detach().clamp_min(1e-3), torch.zeros_like(pseudo_soft))
+            rank_gap = rel_logits_real - rel_logits_null
+            rank_violation = torch.relu(utility_rank_margin - rank_gap)
+            if violation_cap > 0:
+                rank_violation = rank_violation.clamp(max=violation_cap)
+            if float(rank_w.sum().detach().cpu()) > 1e-8:
+                loss_rank = (rank_w * rank_violation).sum() / rank_w.sum().clamp_min(1e-6)
+            else:
+                loss_rank = torch.zeros((), device=device, dtype=torch.float32)
+
             warm = int(getattr(args, "delta_curriculum_epochs", 0))
             if warm > 0:
                 curriculum = min(1.0, float(epoch + 1) / float(warm))
             else:
                 curriculum = 1.0
 
+            null_warmup_steps = int(getattr(args, "delta_null_warmup_steps", 500))
+            null_ramp_steps = int(getattr(args, "delta_null_ramp_steps", 500))
+            if global_step < null_warmup_steps:
+                null_weight = 0.0
+            elif null_ramp_steps > 0 and global_step < (null_warmup_steps + null_ramp_steps):
+                null_weight = float(global_step - null_warmup_steps) / float(null_ramp_steps)
+            else:
+                null_weight = 1.0
+
+            nc_lambda = float(getattr(args, "news_contrastive_lambda", 0.1))
+            news_contrast = has_news * torch.relu(0.2 - (rel_logits_real - rel_logits_null))
+            loss_contrast = news_contrast.mean()
+
             loss_total = (
                 loss_res
-                + curriculum * delta_null_lambda * loss_null
+                + curriculum * delta_null_lambda * null_weight * loss_null
                 + curriculum * delta_margin_lambda * loss_margin
                 + curriculum * delta_non_degrade_lambda * loss_non_degrade
                 + curriculum * gate_lambda * loss_gate
                 + curriculum * gate_null_lambda * loss_gate_null
+                + curriculum * utility_rank_lambda * loss_rank
+                + rel_supervise_lambda * loss_rel_supervise
+                + nc_lambda * loss_contrast
             )
 
             # backward with grad accumulation
@@ -1776,11 +2313,41 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             loss_window.append(float(loss.detach().cpu()))
             if global_step % 10 == 0:
                 avg_train_loss = sum(loss_window) / len(loss_window)
+                k_now = 0.0
+                k_cnt = 0
+                for _m in news_rl_meta_d:
+                    if _m is None:
+                        continue
+                    k_now += float(_m.get("chosen_k", 0))
+                    k_cnt += 1
+                if k_cnt > 0:
+                    k_now /= float(k_cnt)
                 pbar.set_postfix(
                     train_loss=f"{avg_train_loss:.6f}",
                     gate=float(gate_real.mean().detach().cpu()),
                     useful=float(pseudo_soft.mean().detach().cpu()),
+                    rank=float(loss_rank.detach().cpu()),
+                    k=float(k_now),
                 )
+                if global_step % 100 == 0:
+                    dh_grad = 0.0
+                    dh_grad_terms = []
+                    for n, p in delta_model.named_parameters():
+                        if n.startswith("delta_head") and p.grad is not None:
+                            g = float(p.grad.norm().cpu())
+                            if np.isfinite(g):
+                                dh_grad_terms.append(g * g)
+                    if dh_grad_terms:
+                        dh_grad = float(np.sqrt(sum(dh_grad_terms)))
+                    lora_grad = sum(
+                        float(p.grad.norm().cpu()) for n, p in delta_model.named_parameters()
+                        if "lora_" in n and p.grad is not None
+                    )
+                    live_logger.info(
+                        f"[GRAD] step={global_step} delta_head_grad={dh_grad:.6f} "
+                        f"lora_grad={lora_grad:.6f} "
+                        f"delta_scale={float(delta_model.delta_log_scale.exp().detach().cpu()):.4f}"
+                    )
 
             if (global_step + 1) % args.grad_accum == 0:
                 grad_clip = float(getattr(args, "delta_grad_clip", 0.0))
@@ -1802,6 +2369,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             templates=templates,
             tpl_id=tpl_id,
             args=args,
+            global_zstats=global_zstats,
             news_df=news_df,
             policy_name=policy_name,
             policy_kw=policy_kw,
@@ -1810,6 +2378,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             testing=False,
             true_pred_csv_path=None,
             news_dropout=False,
+            delta_alpha=1.0,
+            news_rl_selector=news_rl_selector,
         )
         val_loss_per_epoch.append(val_loss)
         mse_loss_per_epoch.append(val_mse)
@@ -1817,25 +2387,24 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
         live_logger.info(
             f"[DELTA][EVAL] epoch={epoch+1} tpl_id={tpl_id} policy={policy_name} "
-            f"val_loss(zMSE)={val_loss:.6f} val_mse(raw)={val_mse:.6f} val_mae(raw)={val_mae:.6f}"
+            f"val_loss(zMSE)={val_loss:.6f} "
+            f"val_mse(raw)={val_mse:.6f} val_mae(raw)={val_mae:.6f}"
         )
+        if news_rl_selector is not None and news_rl_selector.enable:
+            live_logger.info(f"[DELTA][NEWS_RL] cumulative_updates={news_rl_selector.total_updates}")
 
         # update val_state for context
-        if args.reward_metric == "loss":
-            val_state.update(val_loss)
-            metric_now = val_loss
-        elif args.reward_metric == "mse":
-            val_state.update(val_mse)
-            metric_now = val_mse
-        else:
-            val_state.update(val_mae)
-            metric_now = val_mae
+        metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
+        val_state.update(metric_now)
 
-        if metric_now < best_metric - 1e-6:
-            best_metric = metric_now
+        should_save = (not has_saved_delta) or (metric_now < best_metric - 1e-6)
+        if should_save:
+            best_metric = min(best_metric, metric_now)
             stale_rounds = 0
+            has_saved_delta = True
             best_tpl_id = tpl_id
             best_policy_name = policy_name
+            best_delta_alpha = 1.0
 
             best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
             shutil.rmtree(best_delta_path, ignore_errors=True)
@@ -1851,6 +2420,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 scheduler=scheduler_delta,
                 epoch=epoch,
                 global_step=global_step,
+                extra_meta={
+                    "mu_global": float(global_zstats["mu_global"]),
+                    "sigma_global": float(global_zstats["sigma_global"]),
+                },
             )
 
             with open(os.path.join(f"./checkpoints/{args.taskName}", "residual_pair.json"), "w", encoding="utf-8") as f:
@@ -1860,6 +2433,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                         "best_delta": f"best_delta_{args.taskName}",
                         "best_tpl_id": int(best_tpl_id),
                         "best_policy_name": str(best_policy_name),
+                        "best_delta_alpha": float(best_delta_alpha),
                         "reward_metric": str(args.reward_metric),
                         "best_metric": float(best_metric),
                     },
@@ -1867,8 +2441,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     ensure_ascii=False,
                     indent=2,
                 )
-
-            live_logger.info(f"[DELTA] New best delta saved: {best_delta_path} ({args.reward_metric}={best_metric:.6f})")
+            live_logger.info(
+                f"[DELTA] New best delta saved: {best_delta_path} "
+                f"({args.reward_metric}={best_metric:.6f})"
+            )
         else:
             stale_rounds += 1
             live_logger.info(f"[DELTA] stale_rounds={stale_rounds}/{args.early_stop_patience} best={best_metric:.6f}")
@@ -1898,6 +2474,39 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         torch.cuda.empty_cache()
 
         best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
+        if not os.path.exists(best_delta_path):
+            live_logger.info("[DELTA] best delta checkpoint not found; fallback to base-only test.")
+            test_loss, test_mse, test_mae = evaluate_metrics_backbone(
+                base_backbone=base_backbone,
+                data_loader=test_loader,
+                args=args,
+                global_zstats=global_zstats,
+                device=device,
+                testing=True,
+                true_pred_csv_path=true_pred_csv_path,
+                filename=bundle["test_filename"],
+            )
+            tqdm.write(f"[TEST][FALLBACK-BASE] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}")
+            live_logger.info(
+                f"[TEST][FALLBACK-BASE] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}"
+            )
+            record_test_results_csv(args, live_logger, test_mse, test_mae)
+            draw_pred_true(live_logger, args, true_pred_csv_path)
+            return {
+                "test_loader": test_loader,
+                "device": device,
+                "live_logger": live_logger,
+                "best_tpl_id": best_tpl_id,
+                "best_policy_name": best_policy_name,
+                "tpl_id": tpl_id,
+                "policy_name": policy_name,
+                "templates": templates,
+                "news_df": news_df,
+                "policy_kw": policy_kw,
+                "volatility_bin_test": volatility_bin_test,
+                "true_pred_csv_path": true_pred_csv_path,
+                "global_zstats": global_zstats,
+            }
 
         tok_d, model_best = load_checkpoint(
             best_delta_path,
@@ -1916,13 +2525,30 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         model_best.to(device)
         model_best.eval()
 
+        delta_meta = {}
+        delta_meta_path = os.path.join(best_delta_path, "meta.json")
+        if os.path.isfile(delta_meta_path):
+            try:
+                with open(delta_meta_path, "r", encoding="utf-8") as f:
+                    delta_meta = json.load(f)
+            except Exception:
+                delta_meta = {}
+        global_zstats_eval = _coerce_global_zstats(delta_meta, args, required=False)
+        if global_zstats_eval is None:
+            global_zstats_eval = global_zstats
+        else:
+            live_logger.info(
+                "[DELTA] loaded global z-score stats from delta checkpoint meta: "
+                f"mu_global={global_zstats_eval['mu_global']:.6f}, "
+                f"sigma_global={global_zstats_eval['sigma_global']:.6f}"
+            )
+
         live_logger.info(
             f"Loaded best DELTA model for testing (final = {base_meta.get('backbone_name')} + delta(adapter_on,news))."
         )
 
         tpl_for_test = best_tpl_id if use_bandit else tpl_id
         pol_for_test = best_policy_name if use_bandit else policy_name
-
         test_loss, test_mse, test_mae = evaluate_metrics_residual(
             base_model=base_backbone,
             delta_model=model_best,
@@ -1931,6 +2557,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             templates=templates,
             tpl_id=tpl_for_test,
             args=args,
+            global_zstats=global_zstats_eval,
             news_df=news_df,
             policy_name=pol_for_test,
             policy_kw=policy_kw,
@@ -1939,15 +2566,21 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             testing=True,
             true_pred_csv_path=true_pred_csv_path,
             news_dropout=False,
-            filename=bundle["test_filename"]
+            filename=bundle["test_filename"],
+            delta_alpha=1.0,
+            news_rl_selector=news_rl_selector,
         )
 
         live_logger.info("---------------------testset prompt statistics--------------------------------")
         print_prompt_stats(live_logger, dataStatistic)
         live_logger.info("-----------------------------------------------------")
 
-        tqdm.write(f"[TEST][FINAL] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}")
-        live_logger.info(f"[TEST][FINAL] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}")
+        tqdm.write(
+            f"[TEST][FINAL] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}"
+        )
+        live_logger.info(
+            f"[TEST][FINAL] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}"
+        )
 
         record_test_results_csv(args, live_logger, test_mse, test_mae)
         draw_pred_true(live_logger, args, true_pred_csv_path)
@@ -1964,14 +2597,15 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         "news_df":news_df,
         "policy_kw":policy_kw,
         "volatility_bin_test": volatility_bin_test,
-        "true_pred_csv_path": true_pred_csv_path
+        "true_pred_csv_path": true_pred_csv_path,
+        "global_zstats": global_zstats,
     }
 
 
 # ----------------------------
 # main entry (refactored)
 # ----------------------------
-def testing_base(test_loader, args, device, live_logger, templates, volatility_bin_test,true_pred_csv_path):
+def testing_base(test_loader, args, device, live_logger, templates, volatility_bin_test, true_pred_csv_path, global_zstats):
     if test_loader is not None:
         gc.collect()
         torch.cuda.empty_cache()
@@ -1987,11 +2621,15 @@ def testing_base(test_loader, args, device, live_logger, templates, volatility_b
         live_logger.info(
             f"Loaded best BASE backbone for testing: {base_meta.get('backbone_name')} (final = base(no-news))."
         )
+        stats = _coerce_global_zstats(base_meta, args, required=False)
+        if stats is None:
+            stats = _coerce_global_zstats(global_zstats, args, required=True)
 
         test_loss, test_mse, test_mae = evaluate_metrics_backbone(
             base_backbone=model_best,
             data_loader=test_loader,
             args=args,
+            global_zstats=stats,
             device=device,
             testing=True,
             true_pred_csv_path=true_pred_csv_path,
@@ -2008,7 +2646,22 @@ def testing_base(test_loader, args, device, live_logger, templates, volatility_b
         record_test_results_csv(args, live_logger, test_mse, test_mae)
         draw_pred_true(live_logger, args, true_pred_csv_path)
 
-def testing_delta(test_loader, args, device, live_logger, best_tpl_id, best_policy_name, tpl_id, policy_name, templates,news_df,policy_kw,volatility_bin_test,true_pred_csv_path):
+def testing_delta(
+    test_loader,
+    args,
+    device,
+    live_logger,
+    best_tpl_id,
+    best_policy_name,
+    tpl_id,
+    policy_name,
+    templates,
+    news_df,
+    policy_kw,
+    volatility_bin_test,
+    true_pred_csv_path,
+    global_zstats,
+):
     if test_loader is not None:
         gc.collect()
         torch.cuda.empty_cache()
@@ -2040,6 +2693,20 @@ def testing_delta(test_loader, args, device, live_logger, best_tpl_id, best_poli
         live_logger.info(
             f"Loaded best DELTA model for testing (final = {base_meta.get('backbone_name')} + delta(adapter_on,news))."
         )
+        stats = _coerce_global_zstats(base_meta, args, required=False)
+        delta_meta = {}
+        delta_meta_path = os.path.join(best_delta_path, "meta.json")
+        if os.path.isfile(delta_meta_path):
+            try:
+                with open(delta_meta_path, "r", encoding="utf-8") as f:
+                    delta_meta = json.load(f)
+            except Exception:
+                delta_meta = {}
+        stats_delta = _coerce_global_zstats(delta_meta, args, required=False)
+        if stats_delta is not None:
+            stats = stats_delta
+        if stats is None:
+            stats = _coerce_global_zstats(global_zstats, args, required=True)
 
         use_bandit = False
         tpl_for_test = best_tpl_id if use_bandit else tpl_id
@@ -2053,6 +2720,7 @@ def testing_delta(test_loader, args, device, live_logger, best_tpl_id, best_poli
             templates=templates,
             tpl_id=tpl_for_test,
             args=args,
+            global_zstats=stats,
             news_df=news_df,
             policy_name=pol_for_test,
             policy_kw=policy_kw,
@@ -2105,6 +2773,7 @@ def main(args):
             cfg["templates"],
             bundle["volatility_bin_test"],
             bundle["true_pred_csv_path"],
+            cfg.get("global_zstats", bundle.get("global_zstats")),
         )
         return
 

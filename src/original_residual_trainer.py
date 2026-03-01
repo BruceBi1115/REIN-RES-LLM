@@ -20,7 +20,13 @@ from transformers import get_cosine_schedule_with_warmup
 
 from src.data_construction.DataStatistic import DataStatistic
 from .data_construction.data import make_loader
-from .news_rules import load_news, get_candidates, select_news, _load_keywords
+from .news_rules import (
+    load_news,
+    get_candidates,
+    select_news,
+    rerank_selected_news_by_utility,
+    _load_keywords,
+)
 from .data_construction.prompt import format_news, load_templates, build_prompt
 from .RL.rl_bandit import LinTS, LinUCB, RewardNormalizer
 from .ValidationState import ValidationState
@@ -216,7 +222,16 @@ def build_batch_inputs(
             selected = pd.DataFrame(columns=[args.news_time_col, args.news_text_col])
         else:
             cand = get_candidates(news_df, args.news_time_col, t_target, args.news_window_days, args.news_topM)
-            selected = select_news(cand, policy_name, args.news_text_col, policy_kw, args.news_topK)
+            selected, _ = select_news(cand, policy_name, args.news_text_col, policy_kw, args.news_topK, args=args)
+            if int(getattr(args, "utility_rerank_enable", 1)) == 1 and len(selected) > 0:
+                selected = rerank_selected_news_by_utility(
+                    selected=selected,
+                    target_time=t_target,
+                    time_col=args.news_time_col,
+                    text_col=args.news_text_col,
+                    policy_kw=policy_kw,
+                    args=args,
+                )
 
         len_selected_news.append(len(selected))
 
@@ -229,6 +244,7 @@ def build_batch_inputs(
                 tokenizer,
                 summary_method=args.news_summary_method,
                 max_sentences=args.news_max_sentences,
+                show_utility=int(getattr(args, "utility_show_in_prompt", 1)) == 1,
             )
             if news_dropout:
                 news_str = _maybe_news_dropout(news_str, args)

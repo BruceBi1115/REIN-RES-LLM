@@ -1,14 +1,10 @@
-import pandas as pd
-import numpy as np
-from datetime import timedelta
-import pytz
-from typing import List
-from numpy.linalg import norm
-from dataclasses import dataclass
 import os
+from typing import List
+
+import numpy as np
 import pandas as pd
-from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from textblob import TextBlob
 
 def _load_keywords(path: str):
@@ -111,6 +107,260 @@ def policy_by_keywords(cand: pd.DataFrame, text_col: str, keywords: List[str], K
         return cand.head(K)
     return filtered.head(K)
 
+
+def _arg_or_default(args, key: str, default):
+    if args is None:
+        return default
+    v = getattr(args, key, default)
+    return default if v is None else v
+
+
+def _normalize01(x: np.ndarray) -> np.ndarray:
+    if x.size == 0:
+        return x
+    lo = float(np.min(x))
+    hi = float(np.max(x))
+    if hi - lo < 1e-12:
+        return np.zeros_like(x, dtype=np.float32)
+    return ((x - lo) / (hi - lo)).astype(np.float32)
+
+
+def _keyword_ratio(text_series: pd.Series, keywords: List[str]) -> np.ndarray:
+    if not keywords:
+        return np.zeros((len(text_series),), dtype=np.float32)
+    kws = [kw.strip().lower() for kw in keywords if kw and kw.strip()]
+    if not kws:
+        return np.zeros((len(text_series),), dtype=np.float32)
+
+    lowered = text_series.fillna("").astype(str).str.lower()
+    vals = []
+    for s in lowered.tolist():
+        hits = sum(1 for kw in kws if kw in s)
+        vals.append(float(hits) / float(len(kws)))
+    return np.asarray(vals, dtype=np.float32)
+
+
+def _smart_select_news(
+    cand: pd.DataFrame,
+    text_col: str,
+    policy_kw: List[str],
+    K: int,
+    args=None,
+) -> pd.DataFrame:
+    """
+    Hybrid retrieval:
+      1) relevance (TF-IDF query similarity)
+      2) time decay (recent first)
+      3) optional rating prior
+      4) MMR diversification + near-duplicate suppression
+    """
+    if len(cand) == 0 or K <= 0:
+        return cand.head(0)
+
+    texts = cand[text_col].fillna("").astype(str)
+    n = len(texts)
+    if n == 1:
+        return cand.head(1)
+
+    try:
+        vec = TfidfVectorizer(lowercase=True, stop_words="english", max_features=5000)
+        mat = vec.fit_transform(texts.tolist())  # (N,V)
+    except Exception:
+        # Fallback to recency when vectorization fails on degenerate text.
+        return cand.head(K)
+
+    # relevance from keyword query
+    kw_query = " ".join([kw.strip() for kw in (policy_kw or []) if kw and kw.strip()])
+    if kw_query.strip():
+        qv = vec.transform([kw_query])
+        rel = cosine_similarity(mat, qv).reshape(-1).astype(np.float32)
+    else:
+        rel = np.zeros((n,), dtype=np.float32)
+
+    kw_ratio = _keyword_ratio(texts, policy_kw)
+
+    # rating prior (if available)
+    if "rate" in cand.columns:
+        rate = cand["rate"].fillna(0.0).astype(float).to_numpy()
+        rate = _normalize01(rate)
+    else:
+        rate = np.zeros((n,), dtype=np.float32)
+
+    # recency prior: cand is already sorted by time descending in get_candidates
+    rec_tau = float(_arg_or_default(args, "smart_recency_tau", 8.0))
+    rec_tau = max(1e-6, rec_tau)
+    rank = np.arange(n, dtype=np.float32)
+    recency = np.exp(-rank / rec_tau).astype(np.float32)
+    recency = _normalize01(recency)
+
+    rel_w = float(_arg_or_default(args, "smart_rel_weight", 0.55))
+    kw_w = float(_arg_or_default(args, "smart_kw_weight", 0.15))
+    rate_w = float(_arg_or_default(args, "smart_rate_weight", 0.15))
+    rec_w = float(_arg_or_default(args, "smart_recency_weight", 0.15))
+    w_sum = rel_w + kw_w + rate_w + rec_w
+    if w_sum <= 1e-12:
+        rel_w, kw_w, rate_w, rec_w = 1.0, 0.0, 0.0, 0.0
+        w_sum = 1.0
+    rel_w, kw_w, rate_w, rec_w = rel_w / w_sum, kw_w / w_sum, rate_w / w_sum, rec_w / w_sum
+
+    base_score = (
+        rel_w * _normalize01(rel)
+        + kw_w * _normalize01(kw_ratio)
+        + rate_w * rate
+        + rec_w * recency
+    ).astype(np.float32)
+
+    sim = cosine_similarity(mat).astype(np.float32)
+    mmr_lambda = float(_arg_or_default(args, "smart_mmr_lambda", 0.75))
+    mmr_lambda = max(0.0, min(1.0, mmr_lambda))
+    dedup_th = float(_arg_or_default(args, "smart_dedup_threshold", 0.92))
+    dedup_th = max(0.0, min(1.0, dedup_th))
+
+    selected = []
+    pool = list(range(n))
+    while pool and len(selected) < K:
+        best_i, best_val = None, -1e18
+        for i in pool:
+            if selected:
+                redundancy = float(np.max(sim[i, selected]))
+            else:
+                redundancy = 0.0
+            mmr = mmr_lambda * float(base_score[i]) - (1.0 - mmr_lambda) * redundancy
+            if mmr > best_val:
+                best_val = mmr
+                best_i = i
+
+        if best_i is None:
+            break
+        pool.remove(best_i)
+
+        # hard de-dup for near-identical summaries
+        if selected:
+            max_dup = float(np.max(sim[best_i, selected]))
+            if max_dup >= dedup_th:
+                continue
+        selected.append(best_i)
+
+    # fill if overly strict de-dup removed too many items
+    if len(selected) < K:
+        remain = [i for i in np.argsort(-base_score).tolist() if i not in selected]
+        selected.extend(remain[: max(0, K - len(selected))])
+
+    return cand.iloc[selected[:K]]
+
+
+def rerank_selected_news_by_utility(
+    selected: pd.DataFrame,
+    target_time,
+    time_col: str,
+    text_col: str,
+    policy_kw: List[str],
+    args=None,
+) -> pd.DataFrame:
+    """
+    Utility rerank for already-selected news items.
+    Produces a `utility_score` column and sorts rows descending by utility.
+    """
+    if selected is None or len(selected) == 0:
+        return selected
+
+    out = selected.copy()
+    texts = out[text_col].fillna("").astype(str)
+    n = len(out)
+
+    kw = _normalize01(_keyword_ratio(texts, policy_kw))
+
+    # recency utility: closer to target_time => higher score
+    recency = np.ones((n,), dtype=np.float32)
+    if time_col in out.columns and target_time is not None:
+        ts = pd.to_datetime(out[time_col], errors="coerce")
+        tt = _align_ts_to_series_tz(target_time, ts)
+        if not pd.isna(tt):
+            age_h = (tt - ts).dt.total_seconds() / 3600.0
+            age_h = age_h.fillna(1e9).clip(lower=0.0)
+            tau_h = float(_arg_or_default(args, "utility_recency_tau_hours", 24.0))
+            tau_h = max(1e-6, tau_h)
+            recency = np.exp(-(age_h.to_numpy(dtype=np.float32) / tau_h)).astype(np.float32)
+            recency = _normalize01(recency)
+
+    # external rating prior
+    if "rate" in out.columns:
+        rate = _normalize01(out["rate"].fillna(0.0).astype(float).to_numpy(dtype=np.float32))
+    else:
+        rate = np.zeros((n,), dtype=np.float32)
+
+    # sentiment magnitude as a weak "event strength" signal
+    sent_w_raw = float(_arg_or_default(args, "utility_sentiment_weight", 0.0))
+    if sent_w_raw > 0.0:
+        sent = texts.apply(lambda x: abs(float(TextBlob(x).sentiment.polarity))).to_numpy(dtype=np.float32)
+        sent = _normalize01(sent)
+    else:
+        sent = np.zeros((n,), dtype=np.float32)
+
+    kw_w = float(_arg_or_default(args, "utility_keyword_weight", 0.35))
+    rec_w = float(_arg_or_default(args, "utility_recency_weight", 0.25))
+    rate_w = float(_arg_or_default(args, "utility_rate_weight", 0.35))
+    sent_w = max(0.0, sent_w_raw)
+    w_sum = kw_w + rec_w + rate_w + sent_w
+    if w_sum <= 1e-12:
+        kw_w, rec_w, rate_w, sent_w, w_sum = 1.0, 0.0, 0.0, 0.0, 1.0
+    kw_w, rec_w, rate_w, sent_w = kw_w / w_sum, rec_w / w_sum, rate_w / w_sum, sent_w / w_sum
+
+    base_score = (kw_w * kw + rec_w * recency + rate_w * rate + sent_w * sent).astype(np.float32)
+
+    # Optional MMR-style diversification at rerank stage.
+    use_mmr = int(_arg_or_default(args, "utility_mmr_enable", 1)) == 1 and n > 1
+    if use_mmr:
+        try:
+            vec = TfidfVectorizer(lowercase=True, stop_words="english", max_features=5000)
+            mat = vec.fit_transform(texts.tolist())
+            sim = cosine_similarity(mat).astype(np.float32)
+            lam = float(_arg_or_default(args, "utility_mmr_lambda", 0.8))
+            lam = max(0.0, min(1.0, lam))
+            dedup_th = float(_arg_or_default(args, "utility_dedup_threshold", 0.95))
+            dedup_th = max(0.0, min(1.0, dedup_th))
+
+            order = []
+            pool = list(range(n))
+            while pool:
+                best_i, best_v = None, -1e18
+                for i in pool:
+                    redundancy = float(np.max(sim[i, order])) if order else 0.0
+                    mmr = lam * float(base_score[i]) - (1.0 - lam) * redundancy
+                    if mmr > best_v:
+                        best_i, best_v = i, mmr
+                if best_i is None:
+                    break
+                pool.remove(best_i)
+                if order and float(np.max(sim[best_i, order])) >= dedup_th:
+                    continue
+                order.append(best_i)
+
+            if len(order) < n:
+                remaining = [i for i in np.argsort(-base_score).tolist() if i not in order]
+                order.extend(remaining)
+        except Exception:
+            order = np.argsort(-base_score).tolist()
+    else:
+        order = np.argsort(-base_score).tolist()
+
+    out["utility_score"] = base_score
+    out = out.iloc[order].copy()
+
+    keep_k = int(_arg_or_default(args, "utility_keep_topk", -1))
+    if keep_k > 0:
+        out = out.head(keep_k)
+
+    min_s = float(_arg_or_default(args, "utility_min_score", -1.0))
+    if min_s > -0.999999:
+        out = out[out["utility_score"] >= min_s]
+        if len(out) == 0:
+            # Never return empty when caller already had selected news.
+            out = selected.head(1).copy()
+            out["utility_score"] = float(base_score[np.argsort(-base_score)[0]])
+
+    return out.reset_index(drop=True)
+
 def select_by_sentiment_polarity_high(cand: pd.DataFrame, text_col: str, K: int) -> pd.DataFrame:
     if len(cand) == 0:
         return cand
@@ -178,18 +428,23 @@ def keyword_polarity_low_hybrid(cand: pd.DataFrame, text_col: str, keywords, K: 
     return cand.loc[chosen]
 
 def select_sum_v0(cand, text_col,K):
-    m = cand[text_col].fillna('').astype(str).str.lower()
+    m = cand[text_col].fillna("").astype(str).str.strip().ne("")
     filtered = cand[m]
     return filtered.head(K)
 
 def select_no_sum(cand, text_col, K):
-    m = cand[text_col].fillna('').astype(str).str.lower()
-
+    m = cand[text_col].fillna("").astype(str).str.strip().ne("")
     filtered = cand[m]
     return filtered.head(K)
 
-def select_news(cand: pd.DataFrame, policy: str, text_col: str,
-                policy_kw: List[str], K: int) -> pd.DataFrame:
+def select_news(
+    cand: pd.DataFrame,
+    policy: str,
+    text_col: str,
+    policy_kw: List[str],
+    K: int,
+    args=None,
+) -> tuple[pd.DataFrame, float]:
     # print(cand)
     selected = cand
     if policy == 'keywords':
@@ -208,10 +463,12 @@ def select_news(cand: pd.DataFrame, policy: str, text_col: str,
         selected = cand
     elif policy == "no_sum":
         selected = cand
+    elif policy in {"smart", "auto"}:
+        selected = _smart_select_news(cand, text_col, policy_kw, K, args=args)
     else:
         raise ValueError("Unknown news select policy")
     # Return both selected news and average rating for use in base model training.
-    avg_rate = selected['rate'].mean() if not selected.empty else 0.0
+    avg_rate = selected["rate"].mean() if (not selected.empty and "rate" in selected.columns) else 0.0
     return selected, avg_rate
 
 def lead3(text: str, max_sentences: int = 3) -> str:
