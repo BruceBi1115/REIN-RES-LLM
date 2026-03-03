@@ -25,7 +25,6 @@ from .news_rules import (
     get_candidates,
     select_news,
     rerank_selected_news_by_utility,
-    _load_keywords,
 )
 from .data_construction.prompt import format_news, load_templates, build_prompt
 from .RL.rl_bandit import LinTS, LinUCB, RewardNormalizer
@@ -905,7 +904,7 @@ def main(args):
     if args.news_path:
         news_df = load_news(args.news_path, args.news_time_col, args.news_tz)
 
-    policy_kw = _load_keywords(args.keyword_path)
+    policy_kw = []
     templates = load_templates(args.template_pool)
 
     patch_len = int(getattr(args, "patch_len", 4))

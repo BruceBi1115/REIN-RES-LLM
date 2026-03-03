@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 set -euo pipefail
 
 # =======================
@@ -73,14 +73,14 @@ TEST_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_testset.csv"
 NEWS_TEXT_COL="summary"
 NEWS_TIME_COL="publication_time"
 
-DELTA_EPOCHS="20"
+DELTA_EPOCHS="2"
 BASE_EPOCHS="20"
 # NEWS_WINDOW_DAYS="7"
 NEWS_TOPM="999"
 NEWS_TOPK="999"
 BATCH_SIZE="1"
 GPU_ID="${GPU_ID:-0}"
-DEFAULT_POLICY="all"
+DEFAULT_POLICY="base"
 
 TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 
@@ -92,13 +92,13 @@ HORIZON="48"
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
 STAGE="all"
-DELTA_VAL_MODE="${DELTA_VAL_MODE:-each_epoch}"  # each_epoch | end_only | none
+DELTA_VAL_MODE="${DELTA_VAL_MODE:-none}"  # each_epoch | end_only | none
 DELTA_MODE="${DELTA_MODE:-kernel_tokens}"  # kernel-only experiment
 DELTA_FUSION_MODE="${DELTA_FUSION_MODE:-mul_z}"  # add | mul_z | mul_raw
 # Stability-first defaults for multiplicative fusion.
-DELTA_MUL_SCALE="${DELTA_MUL_SCALE:-0.5}"
-DELTA_MUL_COEFF_MIN="${DELTA_MUL_COEFF_MIN:-0.90}"
-DELTA_MUL_COEFF_MAX="${DELTA_MUL_COEFF_MAX:-1.10}"
+DELTA_MUL_SCALE="${DELTA_MUL_SCALE:-0.1}"
+DELTA_MUL_COEFF_MIN="${DELTA_MUL_COEFF_MIN:-0.80}"
+DELTA_MUL_COEFF_MAX="${DELTA_MUL_COEFF_MAX:-1.20}"
 DELTA_CLIP="${DELTA_CLIP:-0.5}"
 # Memory-safe defaults for 8B + SFT on limited VRAM.
 LOAD_IN_4BIT="${LOAD_IN_4BIT:-1}"
@@ -142,7 +142,7 @@ BASE_MOVING_AVG="25"
 BASE_DROPOUT="0.0"
 BASE_LOSS="smooth_l1"
 BASE_LR="1e-3"
-BASE_WEIGHT_DECAY="1e-4"
+BASE_WEIGHT_DECAY="1e-5"
 
 # News utility-rerank settings (used by kernel sample construction/inference prompt building)
 UTILITY_RERANK_ENABLE="1"
@@ -162,7 +162,7 @@ UTILITY_SHOW_IN_PROMPT="1"
 # 2) Sweep spaces (same style as your original)
 # =======================
 TASK_NAMES=(
-  "[Model2.2fix]NSW_19_20_LOAD_gateCF"
+  "[3]NSW_19_20_LOAD_gateCF"
 )
 
 NEWS_CHOICES=(

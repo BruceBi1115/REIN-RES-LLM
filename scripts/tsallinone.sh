@@ -40,22 +40,22 @@ CONFIGS=(
 
 ############################################
 # Datasets
-# key | base_task | train | val | test | keyword_path | description
+# key | base_task | train | val | test | description
 ############################################
 DATASETS=(
-  "60|electricity|TestElectricityDemandwithElecpriceNewsfrom2015To2020|dataset/electricity/electricity_trainset.csv|dataset/electricity/electricity_valset.csv|dataset/electricity/electricity_testset.csv|keywords/kws_electricity.txt|This dataset records the electricity demand."
-  "60|ETTh1|TestEtth1withElecpriceNewsfrom2015To2020|dataset/ETTh1/ETTh1_trainset.csv|dataset/ETTh1/ETTh1_valset.csv|dataset/ETTh1/ETTh1_testset.csv|keywords/kws_etth1.txt|This dataset records the electricity transformer temperature."
-  "60|ETTh2|TestEtth2withElecpriceNewsfrom2015To2020|dataset/ETTh2/ETTh2_trainset.csv|dataset/ETTh2/ETTh2_valset.csv|dataset/ETTh2/ETTh2_testset.csv|keywords/kws_etth2.txt|This dataset records the electricity transformer temperature."
-  "15|ETTm1|TestEttm1withElecpriceNewsfrom2015To2020|dataset/ETTm1/ETTm1_trainset.csv|dataset/ETTm1/ETTm1_valset.csv|dataset/ETTm1/ETTm1_testset.csv|keywords/kws_ettm1.txt|This dataset records the electricity transformer temperature."
-  "15|ETTm2|TestEttm2withElecpriceNewsfrom2015To2020|dataset/ETTm2/ETTm2_trainset.csv|dataset/ETTm2/ETTm2_valset.csv|dataset/ETTm2/ETTm2_testset.csv|keywords/kws_ettm2.txt|This dataset records the electricity transformer temperature."
-  "10|weather|TestWeatherwithElecpriceNewsfrom2015To2020|dataset/weather/weather_trainset.csv|dataset/weather/weather_valset.csv|dataset/weather/weather_testset.csv|keywords/kws_weather.txt|This dataset records the weather parameters."
+  "60|electricity|TestElectricityDemandwithElecpriceNewsfrom2015To2020|dataset/electricity/electricity_trainset.csv|dataset/electricity/electricity_valset.csv|dataset/electricity/electricity_testset.csv|This dataset records the electricity demand."
+  "60|ETTh1|TestEtth1withElecpriceNewsfrom2015To2020|dataset/ETTh1/ETTh1_trainset.csv|dataset/ETTh1/ETTh1_valset.csv|dataset/ETTh1/ETTh1_testset.csv|This dataset records the electricity transformer temperature."
+  "60|ETTh2|TestEtth2withElecpriceNewsfrom2015To2020|dataset/ETTh2/ETTh2_trainset.csv|dataset/ETTh2/ETTh2_valset.csv|dataset/ETTh2/ETTh2_testset.csv|This dataset records the electricity transformer temperature."
+  "15|ETTm1|TestEttm1withElecpriceNewsfrom2015To2020|dataset/ETTm1/ETTm1_trainset.csv|dataset/ETTm1/ETTm1_valset.csv|dataset/ETTm1/ETTm1_testset.csv|This dataset records the electricity transformer temperature."
+  "15|ETTm2|TestEttm2withElecpriceNewsfrom2015To2020|dataset/ETTm2/ETTm2_trainset.csv|dataset/ETTm2/ETTm2_valset.csv|dataset/ETTm2/ETTm2_testset.csv|This dataset records the electricity transformer temperature."
+  "10|weather|TestWeatherwithElecpriceNewsfrom2015To2020|dataset/weather/weather_trainset.csv|dataset/weather/weather_valset.csv|dataset/weather/weather_testset.csv|This dataset records the weather parameters."
 )
 
 ############################################
 # Main loop: dataset x ablation
 ############################################
 for D in "${DATASETS[@]}"; do
-  IFS="|" read -r FREQ_MIN DATA_KEY BASE_TASK TRAIN_FILE VAL_FILE TEST_FILE KEYWORD_PATH DESC <<< "$D"
+  IFS="|" read -r FREQ_MIN DATA_KEY BASE_TASK TRAIN_FILE VAL_FILE TEST_FILE DESC <<< "$D"
 
   for CFG in "${CONFIGS[@]}"; do
     IFS="|" read -r TAG RL_USE USE_NEWS <<< "$CFG"
@@ -83,7 +83,6 @@ for D in "${DATASETS[@]}"; do
       --val_file "${VAL_FILE}"
       --test_file "${TEST_FILE}"
       --epochs "${EPOCHS}"
-      --keyword_number "${KEYWORD_NUM}"
       --news_window_days "${NEWS_WINDOW}"
       --news_topM "${NEWS_TOPM}"
       --news_topK "${NEWS_TOPK}"
@@ -91,7 +90,6 @@ for D in "${DATASETS[@]}"; do
       --rl_use "${RL_USE}"
       --rl_algo "${RL_ALGO}"
       --reward_metric "${REWARD_METRIC}"
-      --rl_cycle_steps "${RL_CYCLE_STEPS}"
       --select_policy_by "${SELECT_POLICY}"
     )
 
@@ -99,7 +97,7 @@ for D in "${DATASETS[@]}"; do
       CMD+=(--news_path "${NEWS_PATH}"
            --news_text_col "${NEWS_TEXT_COL}"
            --news_time_col "${NEWS_TIME_COL}"
-           --keyword_path "${KEYWORD_PATH}")
+      )
     fi
 
     echo "============================================================"

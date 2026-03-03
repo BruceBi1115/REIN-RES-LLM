@@ -17,7 +17,6 @@ TEST_FILE="dataset/ETTh2/ETTh2_testset.csv"
 NEWS_PATH="dataset/Summarized_news_2015_2020.json"
 NEWS_TEXT_COL="summary_response"
 NEWS_TIME_COL="date"
-KEYWORD_PATH="keywords/kws_etth2.txt"
 
 EPOCHS=30
 KEYWORD_NUM=20
@@ -68,7 +67,6 @@ for CFG in "${CONFIGS[@]}"; do
     --val_file ${VAL_FILE} \
     --test_file ${TEST_FILE} \
     --epochs ${EPOCHS} \
-    --keyword_number ${KEYWORD_NUM} \
     --news_window_days ${NEWS_WINDOW} \
     --news_topM ${NEWS_TOPM} \
     --news_topK ${NEWS_TOPK} \
@@ -76,7 +74,6 @@ for CFG in "${CONFIGS[@]}"; do
     --rl_use ${RL_USE} \
     --rl_algo ${RL_ALGO} \
     --reward_metric ${REWARD_METRIC} \
-    --rl_cycle_steps ${RL_CYCLE_STEPS} \
     --select_policy_by ${SELECT_POLICY}
   "
 
@@ -85,7 +82,6 @@ for CFG in "${CONFIGS[@]}"; do
       --news_path ${NEWS_PATH} \
       --news_text_col ${NEWS_TEXT_COL} \
       --news_time_col ${NEWS_TIME_COL} \
-      --keyword_path ${KEYWORD_PATH}
     "
   fi
 

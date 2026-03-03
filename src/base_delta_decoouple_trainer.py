@@ -17,6 +17,7 @@ import gc
 import os
 import json
 import math
+import re
 from collections import deque
 from contextlib import nullcontext
 import shutil
@@ -38,7 +39,6 @@ from .news_rules import (
     get_candidates,
     select_news,
     rerank_selected_news_by_utility,
-    _load_keywords,
 )
 from .data_construction.prompt import format_news, load_templates, build_prompt
 from .RL.rl_bandit import LinTS, LinUCB, RewardNormalizer
@@ -47,6 +47,19 @@ from .utils.logger import setup_live_logger
 from .RL.features import bandit_select, get_context_features, encode_instruction
 
 from .model2 import load_checkpoint, load_llama_lora, save_checkpoint
+from .sft.impact_kernel import (
+    default_kernel_params,
+    format_param_tokens,
+    load_amp_table,
+    parse_param_tokens,
+    params_to_delta,
+    save_amp_table,
+)
+from .sft.sft_kernel_dataset import (
+    build_kernel_prompts_from_batch,
+    build_kernel_sft_samples,
+    to_kernel_sft_format,
+)
 from .base_backbone import (
     build_base_backbone,
     save_base_backbone_checkpoint,
@@ -108,6 +121,67 @@ def _inv_zscore(z, mu, sigma):
     return (z * sigma + mu).tolist()
 
 
+def _fuse_base_delta_z(
+    base_pred_z: np.ndarray,
+    delta_like: np.ndarray,
+    args,
+    mu_global: float | None = None,
+    sigma_global: float | None = None,
+) -> np.ndarray:
+    base = np.asarray(base_pred_z, dtype=np.float32).reshape(-1)
+    delta = np.asarray(delta_like, dtype=np.float32).reshape(-1)
+    mode = str(getattr(args, "delta_fusion_mode", "add")).lower().strip()
+    if mode not in {"mul_z", "mul_raw"}:
+        return (base + delta).astype(np.float32)
+
+    scale = float(getattr(args, "delta_mul_scale", 1.0))
+    coeff = 1.0 + scale * delta
+    coeff_min = float(getattr(args, "delta_mul_coeff_min", 0.05))
+    coeff_max = float(getattr(args, "delta_mul_coeff_max", 3.0))
+    if coeff_max < coeff_min:
+        coeff_min, coeff_max = coeff_max, coeff_min
+    coeff = np.clip(coeff, coeff_min, coeff_max)
+    if mode == "mul_z":
+        return (base * coeff).astype(np.float32)
+
+    # mul_raw: apply multiplicative coefficient in raw space,
+    # then map back to z-space for unified loss/eval pipeline.
+    mu = float(0.0 if mu_global is None else mu_global)
+    sigma = float(1.0 if sigma_global is None else sigma_global)
+    sigma = max(sigma, float(getattr(args, "zscore_eps", 1e-6)))
+    base_raw = base * sigma + mu
+    pred_raw = base_raw * coeff
+    pred_z = (pred_raw - mu) / sigma
+    return pred_z.astype(np.float32)
+
+
+def _eval_iter(data_loader, args, desc: str):
+    use_pbar = int(getattr(args, "eval_progress_bar", 1)) == 1
+    leave = int(getattr(args, "eval_progress_leave", 0)) == 1
+    if use_pbar:
+        return tqdm(data_loader, desc=desc, dynamic_ncols=True, leave=leave), True
+    return data_loader, False
+
+
+def _normalize_delta_val_mode(raw_mode) -> str:
+    mode = str(raw_mode or "each_epoch").lower().strip()
+    alias = {
+        "epoch": "each_epoch",
+        "per_epoch": "each_epoch",
+        "end": "end_only",
+        "final": "end_only",
+        "last": "end_only",
+        "off": "none",
+        "disable": "none",
+        "disabled": "none",
+        "no": "none",
+    }
+    mode = alias.get(mode, mode)
+    if mode not in {"each_epoch", "end_only", "none"}:
+        mode = "each_epoch"
+    return mode
+
+
 def _coerce_global_zstats(global_zstats, args, required: bool = True):
     if isinstance(global_zstats, dict):
         mu = global_zstats.get("mu_global", global_zstats.get("mu", None))
@@ -163,6 +237,357 @@ def _residual_elementwise(pred: torch.Tensor, target: torch.Tensor, mode: str) -
     return torch.abs(pred - target)  # "mae"
 
 
+def _adaptive_delta_targets(
+    targets_z: torch.Tensor,
+    base_pred: torch.Tensor,
+    has_news: torch.Tensor,
+    sigma_clip: float = 2.0,
+) -> torch.Tensor:
+    """
+    Adaptive residual target:
+    - no-news samples => zero target
+    - news samples => clip outlier spikes beyond +/- sigma_clip * std (sample-wise)
+    """
+    raw = (targets_z.to(torch.float32) - base_pred.to(torch.float32)).detach()
+    out = torch.zeros_like(raw)
+    if raw.numel() == 0:
+        return out
+
+    mask = has_news.to(device=raw.device, dtype=torch.float32) > 0.5
+    if bool(mask.any()):
+        r = raw[mask]
+        mu = r.mean(dim=1, keepdim=True)
+        sigma = r.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-6)
+        lo = mu - float(sigma_clip) * sigma
+        hi = mu + float(sigma_clip) * sigma
+        out[mask] = torch.max(torch.min(r, hi), lo)
+    return out
+
+
+def _set_lora_trainable_only(model):
+    named_params = list(model.named_parameters())
+    old_flags = {n: bool(p.requires_grad) for n, p in named_params}
+    lora_params = []
+    for n, p in named_params:
+        if "lora_" in n:
+            p.requires_grad = True
+            lora_params.append(p)
+        else:
+            p.requires_grad = False
+    return named_params, old_flags, lora_params
+
+
+def _restore_requires_grad(named_params, old_flags):
+    for n, p in named_params:
+        p.requires_grad = old_flags.get(n, bool(p.requires_grad))
+
+
+def _train_kernel_token_lora(
+    delta_model,
+    sft_data,
+    args,
+    device,
+    live_logger,
+    num_epochs: int,
+    on_epoch_end=None,
+):
+    if sft_data is None or len(sft_data) == 0:
+        if live_logger is not None:
+            live_logger.info("[KERNEL_SFT] skip training: empty dataset.")
+        return
+
+    input_ids = torch.tensor([x["input_ids"] for x in sft_data], dtype=torch.long)
+    attention_mask = torch.tensor([x["attention_mask"] for x in sft_data], dtype=torch.long)
+    labels = torch.tensor([x["labels"] for x in sft_data], dtype=torch.long)
+
+    ds = torch.utils.data.TensorDataset(input_ids, attention_mask, labels)
+    sft_batch_size = int(getattr(args, "sft_batch_size", 1))
+    sft_batch_size = max(1, sft_batch_size)
+    dl = torch.utils.data.DataLoader(ds, batch_size=sft_batch_size, shuffle=True, drop_last=False)
+
+    named_params, old_flags, lora_params = _set_lora_trainable_only(delta_model)
+    if len(lora_params) == 0:
+        if live_logger is not None:
+            live_logger.info("[KERNEL_SFT] skip training: no LoRA params.")
+        _restore_requires_grad(named_params, old_flags)
+        return
+
+    lr = float(getattr(args, "kernel_sft_lr", 1e-4))
+    lr = max(1e-8, lr)
+    opt = AdamW(lora_params, lr=lr)
+    prev_train = bool(delta_model.training)
+
+    total_epochs = max(1, int(num_epochs))
+    try:
+        delta_model.train()
+        delta_model.lm.train()
+        if hasattr(delta_model.lm, "enable_input_require_grads"):
+            delta_model.lm.enable_input_require_grads()
+
+        for ep in range(total_epochs):
+            ep_loss = 0.0
+            ep_n = 0
+            running_loss = 0.0
+            running_n = 0
+            pbar = tqdm(
+                dl,
+                desc=f"[DELTA][KERNEL_SFT] Epoch {ep+1}/{total_epochs}",
+                dynamic_ncols=True,
+                leave=True,
+            )
+            for ids_b, attn_b, lab_b in pbar:
+                ids_b = ids_b.to(device)
+                attn_b = attn_b.to(device)
+                lab_b = lab_b.to(device)
+
+                out = delta_model.lm(
+                    input_ids=ids_b,
+                    attention_mask=attn_b,
+                    labels=lab_b,
+                    return_dict=True,
+                )
+                loss = out.loss.to(torch.float32)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+                bs = int(ids_b.size(0))
+                ep_loss += float(loss.detach().cpu()) * bs
+                ep_n += bs
+                running_loss += float(loss.detach().cpu()) * bs
+                running_n += bs
+                pbar.set_postfix(loss=f"{running_loss / max(1, running_n):.6f}", lr=f"{lr:.2e}")
+
+            avg_ep_loss = ep_loss / max(1, ep_n)
+            if live_logger is not None:
+                live_logger.info(
+                    f"[KERNEL_SFT] epoch {ep+1}/{total_epochs} "
+                    f"loss={avg_ep_loss:.6f} (batch_size={sft_batch_size}, lr={lr:.2e})"
+                )
+            if on_epoch_end is not None:
+                should_stop = bool(on_epoch_end(ep, float(avg_ep_loss)))
+                if should_stop:
+                    if live_logger is not None:
+                        live_logger.info(f"[KERNEL_SFT] early stopping at epoch {ep+1}/{total_epochs}.")
+                    break
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "out of memory" in msg:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if live_logger is not None:
+                live_logger.info(
+                    "[KERNEL_SFT] CUDA OOM during training; continue with current model. "
+                    "Try smaller --sft_max_seq_len or --sft_batch_size."
+                )
+        else:
+            raise
+    finally:
+        _restore_requires_grad(named_params, old_flags)
+        if not prev_train:
+            delta_model.eval()
+
+
+@torch.no_grad()
+def evaluate_metrics_kernel_tokens(
+    base_model,
+    delta_model,
+    tokenizer,
+    data_loader,
+    args,
+    global_zstats,
+    news_df,
+    policy_name,
+    policy_kw,
+    device,
+    volatility_bin,
+    amp_table,
+    testing: bool = False,
+    true_pred_csv_path: str | None = None,
+    filename: str | None = None,
+    live_logger=None,
+    log_prefix: str = "[KERNEL][GEN]",
+):
+    _ = volatility_bin
+    stats = _coerce_global_zstats(global_zstats, args, required=True)
+    mu_global = float(stats["mu_global"])
+    sigma_global = float(stats["sigma_global"])
+    H = int(args.horizon)
+    fusion_mode = str(getattr(args, "delta_fusion_mode", "add")).lower().strip()
+    if fusion_mode not in {"add", "mul_z", "mul_raw"}:
+        fusion_mode = "add"
+
+    base_model.eval()
+    delta_model.eval()
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    ans_json_path = None
+    if testing and filename is not None:
+        ckpt_dir = os.path.join("./checkpoints", args.taskName)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
+
+    loss_sum, n_samples = 0.0, 0
+    se_sum, ae_sum, n_elems = 0.0, 0.0, 0
+    rel1_count = 0
+    amp_nonzero_count = 0
+    token_hit_count = 0
+    empty_gen_count = 0
+    abs_delta_sum = 0.0
+    abs_delta_cnt = 0
+
+    eval_desc = "[EVAL][KERNEL][TEST]" if testing else "[EVAL][KERNEL][VAL]"
+    eval_loader, use_pbar = _eval_iter(data_loader, args, desc=eval_desc)
+    for _, batch in enumerate(eval_loader):
+        history_z, targets_z, _ = _z_batch_tensors(batch, args, global_zstats=stats)
+        history_z = history_z.to(device)
+        targets_z = targets_z.to(device)
+
+        base_pred = base_model(history_z).to(torch.float32)  # (B,H)
+        prompts, _news_counts = build_kernel_prompts_from_batch(
+            batch=batch,
+            base_pred_z=base_pred,
+            args=args,
+            global_zstats=stats,
+            news_df=news_df,
+            policy_name=policy_name,
+        )
+
+        prompts_for_gen = [str(p) + "\n\n[Output Tokens]\n" for p in prompts]
+        enc = tokenizer(
+            prompts_for_gen,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=int(args.max_seq_len),
+        )
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+        prompt_lens = attention_mask.sum(dim=1).to(torch.long)
+
+        gen_ids = delta_model.lm.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=int(max(8, getattr(args, "kernel_gen_max_new_tokens", 32))),
+            do_sample=False,
+            num_beams=1,
+            pad_token_id=int(tokenizer.pad_token_id),
+            eos_token_id=int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None,
+        )
+
+        base_np = base_pred.detach().cpu().numpy()
+        pred_z_np = np.zeros_like(base_np, dtype=np.float32)
+        parsed_list = []
+        gen_text_list = []
+        for i in range(base_np.shape[0]):
+            p_len = int(prompt_lens[i].item())
+            if int(gen_ids.size(1)) > p_len:
+                suffix = gen_ids[i, p_len:]
+            else:
+                suffix = gen_ids[i, 0:0]
+            gen_text = tokenizer.decode(suffix, skip_special_tokens=True).strip()
+            gen_upper = str(gen_text).upper()
+            if gen_upper == "":
+                empty_gen_count += 1
+            if re.search(r"(?:<)?(?:REL_|SIGN_|SHAPE_|LAG_|HL_|DUR_|AMP_)", gen_upper) is not None:
+                token_hit_count += 1
+            params = parse_param_tokens(gen_text)
+            if params == default_kernel_params() and gen_text.strip() == "":
+                # Explicitly keep REL=0 fallback on empty decode.
+                params = default_kernel_params()
+            if int(params.get("rel", 0)) == 1:
+                rel1_count += 1
+            if int(params.get("rel", 0)) == 1 and int(params.get("amp_bin", 0)) > 0:
+                amp_nonzero_count += 1
+            delta_clip = float(getattr(args, "delta_clip", 1.0))
+            if not np.isfinite(delta_clip):
+                delta_clip = 1.0
+            if delta_clip <= 0.0:
+                clip_low, clip_high = -1e9, 1e9
+            else:
+                delta_clip = abs(delta_clip)
+                clip_low, clip_high = -delta_clip, delta_clip
+            delta = params_to_delta(
+                params,
+                horizon=H,
+                amp_table=amp_table,
+                clip_low=clip_low,
+                clip_high=clip_high,
+            )
+            abs_delta_sum += float(np.abs(delta).sum())
+            abs_delta_cnt += int(len(delta))
+            pred_z_np[i] = _fuse_base_delta_z(
+                base_np[i][:H],
+                delta[:H],
+                args,
+                mu_global=mu_global,
+                sigma_global=sigma_global,
+            )
+            parsed_list.append(params)
+            gen_text_list.append(gen_text)
+
+        pred_z = torch.tensor(pred_z_np, device=device, dtype=torch.float32)
+        loss = F.l1_loss(pred_z, targets_z.to(torch.float32), reduction="mean")
+
+        bs = int(pred_z.size(0))
+        loss_sum += float(loss.detach().cpu()) * bs
+        n_samples += bs
+        if use_pbar:
+            eval_loader.set_postfix(zMAE=f"{loss_sum / max(1, n_samples):.6f}")
+
+        targets_cpu = batch["target_value"].detach().cpu().numpy()
+        for i in range(bs):
+            pred_denorm = _inv_zscore(pred_z_np[i].tolist(), mu_global, sigma_global)
+            true_vals = targets_cpu[i].reshape(-1).tolist()
+            true_vals = [float(x) for x in true_vals[:H]]
+
+            pred = np.asarray(pred_denorm, dtype=np.float32)
+            true = np.asarray(true_vals, dtype=np.float32)
+            se_sum += float(((pred - true) ** 2).sum())
+            ae_sum += float(np.abs(pred - true).sum())
+            n_elems += H
+
+            if true_pred_csv_path is not None:
+                with open(true_pred_csv_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(zip(pred_denorm, true_vals))
+
+            if ans_json_path is not None:
+                rec = {
+                    "test_prompt": prompts[i],
+                    "generated_tokens": gen_text_list[i],
+                    "parsed_tokens": format_param_tokens(parsed_list[i]),
+                    "parsed_params": parsed_list[i],
+                    "pred_z": [float(x) for x in pred_z_np[i].tolist()],
+                    "pred": [float(x) for x in pred_denorm],
+                    "true": [float(x) for x in true_vals],
+                    "mu_global": mu_global,
+                    "sigma_global": sigma_global,
+                    "mu": mu_global,
+                    "sigma": sigma_global,
+                }
+                with open(ans_json_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    loss_avg = loss_sum / max(1, n_samples)
+    mse_avg = se_sum / max(1, n_elems) if n_elems > 0 else float("inf")
+    mae_avg = ae_sum / max(1, n_elems) if n_elems > 0 else float("inf")
+    if live_logger is not None and n_samples > 0:
+        token_hit_rate = float(token_hit_count) / float(max(1, n_samples))
+        rel1_rate = float(rel1_count) / float(max(1, n_samples))
+        amp_nonzero_rate = float(amp_nonzero_count) / float(max(1, n_samples))
+        empty_rate = float(empty_gen_count) / float(max(1, n_samples))
+        mean_abs_delta = float(abs_delta_sum) / float(max(1, abs_delta_cnt))
+        live_logger.info(
+            f"{log_prefix} fusion_mode={fusion_mode} samples={n_samples} token_hit_rate={token_hit_rate:.3f} "
+            f"rel1_rate={rel1_rate:.3f} amp_nonzero_rate={amp_nonzero_rate:.3f} "
+            f"empty_gen_rate={empty_rate:.3f} mean_abs_delta={mean_abs_delta:.4f}"
+        )
+    return loss_avg, mse_avg, mae_avg
+
+
 def _select_metric(loss_v: float, mse_v: float, mae_v: float, reward_metric: str) -> float:
     rm = str(reward_metric).lower()
     if rm == "loss":
@@ -170,12 +595,6 @@ def _select_metric(loss_v: float, mse_v: float, mae_v: float, reward_metric: str
     if rm == "mse":
         return float(mse_v)
     return float(mae_v)
-
-
-def _parse_delta_alpha_candidates(args) -> list[float]:
-    # Deprecated: alpha fusion is disabled and always fixed to 1.0.
-    _ = args
-    return [1.0]
 
 
 def _parse_int_choices_csv(raw: str, default: list[int]) -> list[int]:
@@ -200,6 +619,47 @@ def _parse_int_choices_csv(raw: str, default: list[int]) -> list[int]:
         seen.add(v)
         uniq.append(int(v))
     return uniq
+
+
+def _mask_sensitive_arg(key: str, value):
+    k = str(key).lower()
+    is_secret = any(tok in k for tok in ["api_key", "token", "secret", "password"])
+    if not is_secret:
+        return value
+    s = str(value or "")
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return "***"
+    return f"{s[:4]}***{s[-4:]}"
+
+
+def _log_run_args(args, live_logger):
+    """
+    Print full run args at the beginning of logging.
+    Sensitive fields are masked.
+    """
+    if live_logger is None:
+        return
+    try:
+        arg_dict = dict(vars(args))
+    except Exception:
+        live_logger.info("[CONFIG] failed to read args via vars(args).")
+        return
+
+    live_logger.info("-----------------------------------------------------")
+    live_logger.info("[CONFIG] Run Arguments")
+    for k in sorted(arg_dict.keys()):
+        v = _mask_sensitive_arg(k, arg_dict[k])
+        if isinstance(v, (list, tuple, dict)):
+            try:
+                v_str = json.dumps(v, ensure_ascii=False)
+            except Exception:
+                v_str = str(v)
+        else:
+            v_str = str(v)
+        live_logger.info(f"[CONFIG] {k} = {v_str}")
+    live_logger.info("-----------------------------------------------------")
 
 
 class NewsRLBanditSelector:
@@ -926,7 +1386,9 @@ def evaluate_metrics_single(
         os.makedirs(ckpt_dir, exist_ok=True)
         ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
 
-    for _, batch in enumerate(data_loader):
+    eval_desc = "[EVAL][SINGLE][TEST]" if testing else "[EVAL][SINGLE][VAL]"
+    eval_loader, use_pbar = _eval_iter(data_loader, args, desc=eval_desc)
+    for _, batch in enumerate(eval_loader):
         input_ids, attn, ts_patches, ts_patch_mask, targets_z, metas, prompt_texts, rel_labels, n_selected = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
@@ -966,6 +1428,8 @@ def evaluate_metrics_single(
         bs = input_ids.size(0)
         loss_sum += float(loss.detach().cpu()) * bs
         n_samples += bs
+        if use_pbar:
+            eval_loader.set_postfix(zLoss=f"{loss_sum / max(1, n_samples):.6f}")
 
         pred_z_cpu = pred_z.detach().to(torch.float32).cpu().numpy()
         targets_cpu = batch["target_value"].detach().cpu().numpy()  # raw
@@ -1035,7 +1499,9 @@ def evaluate_metrics_backbone(
         os.makedirs(ckpt_dir, exist_ok=True)
         ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
 
-    for _, batch in enumerate(data_loader):
+    eval_desc = "[EVAL][BACKBONE][TEST]" if testing else "[EVAL][BACKBONE][VAL]"
+    eval_loader, use_pbar = _eval_iter(data_loader, args, desc=eval_desc)
+    for _, batch in enumerate(eval_loader):
         history_z, targets_z, metas = _z_batch_tensors(batch, args, global_zstats=stats)
         history_z = history_z.to(device)
         targets_z = targets_z.to(device)
@@ -1046,6 +1512,8 @@ def evaluate_metrics_backbone(
         bs = pred_z.size(0)
         loss_sum += float(loss.detach().cpu()) * bs
         n_samples += bs
+        if use_pbar:
+            eval_loader.set_postfix(zLoss=f"{loss_sum / max(1, n_samples):.6f}")
 
         pred_z_cpu = pred_z.detach().cpu().numpy()
         targets_cpu = batch["target_value"].detach().cpu().numpy()
@@ -1133,7 +1601,9 @@ def evaluate_metrics_residual(
         os.makedirs(ckpt_dir, exist_ok=True)
         ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
 
-    for _, batch in enumerate(data_loader):
+    eval_desc = "[EVAL][RESIDUAL][TEST]" if testing else "[EVAL][RESIDUAL][VAL]"
+    eval_loader, use_pbar = _eval_iter(data_loader, args, desc=eval_desc)
+    for _, batch in enumerate(eval_loader):
         # build delta (with news)
         ids_d, attn_d, ts_p, ts_pm, targets_z, metas, prompt_texts, rel_labels_d, news_counts = build_batch_inputs(
             batch=batch,
@@ -1190,6 +1660,8 @@ def evaluate_metrics_residual(
         pred_z_cpu = pred_z.detach().cpu().numpy()
         loss_sum += float(loss.detach().cpu()) * bs
         n_samples += bs
+        if use_pbar:
+            eval_loader.set_postfix(zMAE=f"{loss_sum / max(1, n_samples):.6f}")
 
         for i in range(bs):
             pred_denorm = _inv_zscore(pred_z_cpu[i].tolist(), mu_global, sigma_global)
@@ -1409,14 +1881,48 @@ def bandit_round_update_residual(
 # ----------------------------
 def setup_env_and_data(args):
     stage = str(getattr(args, "stage", "all")).lower()
-    news_path_clean = (args.news_path or "").replace("dataset/", "")
-    filename = f"{args.taskName}_{args.stage}_s{args.stride}_h{args.horizon}_news_{news_path_clean}_RL_{args.rl_use}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}_{args.delta_null_lambda}_{args.delta_margin_lambda}_{args.delta_adv_margin}_base_{args.base_epochs}_delta_{args.delta_epochs}_lr_{args.lr}_gradacc_{args.grad_accum}_sche_{args.scheduler}_lookback_{args.news_window_days}_topK_{args.news_topK}"
+    delta_mode = str(getattr(args, "delta_mode", "regression")).lower().strip()
+    base_backbone_name = str(getattr(args, "base_backbone", "dlinear"))
+
+    def _safe_name(s: str) -> str:
+        s = str(s).strip()
+        s = s.replace("/", "-").replace("\\", "-")
+        s = re.sub(r"\s+", "_", s)
+        return s if s else "na"
+
+    def _fmt(v) -> str:
+        if isinstance(v, float):
+            return f"{v:g}"
+        return str(v)
+
+    # Base part stays concise: taskName + base backbone.
+    filename = f"{_safe_name(args.taskName)}_{_safe_name(base_backbone_name)}"
+    if delta_mode == "kernel_tokens":
+        kernel_tag = "_".join(
+            [
+                "kernel",
+                f"fm{_fmt(getattr(args, 'delta_fusion_mode', 'add'))}",
+                f"ms{_fmt(getattr(args, 'delta_mul_scale', 1.0))}",
+                f"cmin{_fmt(getattr(args, 'delta_mul_coeff_min', 0.05))}",
+                f"cmax{_fmt(getattr(args, 'delta_mul_coeff_max', 3.0))}",
+                f"dclip{_fmt(getattr(args, 'delta_clip', 3.0))}",
+                f"rn{_fmt(getattr(args, 'kernel_rel_norm_thresh', 0.05))}",
+                f"rr{_fmt(getattr(args, 'kernel_rel_improve_ratio', 0.0))}",
+                f"ra{_fmt(getattr(args, 'kernel_rel_improve_abs', 0.0))}",
+                f"amax{_fmt(getattr(args, 'kernel_a_max', 2.0))}",
+                f"bins{_fmt(getattr(args, 'kernel_amp_bins', 21))}",
+                f"sftlr{_fmt(getattr(args, 'kernel_sft_lr', 1e-4))}",
+                f"api{_fmt(getattr(args, 'kernel_api_enable', 0))}",
+            ]
+        )
+        filename = f"{filename}_{_safe_name(kernel_tag)}"
     log_filename = filename + ".log"
 
     live_logger, live_path, log_jsonl = setup_live_logger(
         save_dir=args.save_dir + "/" + args.taskName, filename=log_filename
     )
     print(f"[live log] {live_path}  (实时查看: tail -f '{live_path}')")
+    _log_run_args(args, live_logger)
 
     ckpt_dir = os.path.join("./checkpoints", args.taskName)
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -1500,7 +2006,6 @@ def setup_env_and_data(args):
         ].reset_index(drop=True)
         print(len(news_df))
 
-    policy_kw = _load_keywords(args.keyword_path)
     templates = load_templates(args.template_pool)
 
     patch_len = int(getattr(args, "patch_len", 4))
@@ -1547,7 +2052,6 @@ def setup_env_and_data(args):
         "val_loader": val_loader,
         "test_loader": test_loader,
         "news_df": news_df,
-        "policy_kw": policy_kw,
         "templates": templates,
         "patch_len": patch_len,
         "volatility_bin": volatility_bin,
@@ -1743,11 +2247,12 @@ def train_base_stage(args, bundle):
 def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     live_logger = bundle["live_logger"]
     device = bundle["device"]
+    train_df = bundle["train_df"]
     train_loader = bundle["train_loader"]
     val_loader = bundle["val_loader"]
     test_loader = bundle["test_loader"]
     news_df = bundle["news_df"]
-    policy_kw = bundle["policy_kw"]
+    policy_kw = []
     templates = bundle["templates"]
     patch_len = bundle["patch_len"]
     volatility_bin = bundle["volatility_bin"]
@@ -1808,7 +2313,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             f"sigma_global={global_zstats['sigma_global']:.6f}"
         )
 
-    # delta model init from pretrained LLM + LoRA (base comes from pure TS backbone)
     tokenizer, delta_model = load_llama_lora(
         base_model=args.base_model,
         tokenizer_id=args.tokenizer,
@@ -1833,6 +2337,311 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         delta_rel_floor=float(getattr(args, "delta_rel_floor", 0.05)),
     )
     delta_model.to(device)
+    delta_mode = str(getattr(args, "delta_mode", "regression")).lower().strip()
+    delta_val_mode = _normalize_delta_val_mode(getattr(args, "delta_val_mode", "each_epoch"))
+    live_logger.info(f"[DELTA] validation mode: {delta_val_mode}")
+
+    if delta_mode == "kernel_tokens":
+        live_logger.info("[DELTA][KERNEL] mode=kernel_tokens: disable delta regression-head training path.")
+        live_logger.info(
+            "[DELTA][KERNEL] ignored in this mode: delta regression-head regularizers/losses."
+        )
+        fusion_mode = str(getattr(args, "delta_fusion_mode", "add")).lower().strip()
+        mul_scale = float(getattr(args, "delta_mul_scale", 1.0))
+        mul_min = float(getattr(args, "delta_mul_coeff_min", 0.05))
+        mul_max = float(getattr(args, "delta_mul_coeff_max", 3.0))
+        live_logger.info(
+            f"[DELTA][KERNEL] fusion_mode={fusion_mode} "
+            f"(mul_scale={mul_scale:.4f}, coeff_clip=[{mul_min:.4f},{mul_max:.4f}])"
+        )
+
+        ckpt_dir = os.path.join("./checkpoints", args.taskName)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        kernel_cache_name = str(getattr(args, "kernel_cache_file", "sft_kernel_cache.json") or "sft_kernel_cache.json")
+        kernel_amp_name = str(
+            getattr(args, "kernel_amp_table_file", "kernel_amp_table.json") or "kernel_amp_table.json"
+        )
+        kernel_cache_path = os.path.join(ckpt_dir, kernel_cache_name)
+        kernel_amp_path = os.path.join(ckpt_dir, kernel_amp_name)
+
+        kernel_samples = None
+        amp_table = None
+        if os.path.isfile(kernel_cache_path) and os.path.isfile(kernel_amp_path):
+            try:
+                with open(kernel_cache_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    kernel_samples = loaded
+                    amp_table = load_amp_table(kernel_amp_path, expected_bins=int(getattr(args, "kernel_amp_bins", 21)))
+                    live_logger.info(
+                        f"[KERNEL_SFT] loaded cache: {kernel_cache_path} (n={len(kernel_samples)}), "
+                        f"amp_table={kernel_amp_path}"
+                    )
+            except Exception as e:
+                live_logger.info(f"[KERNEL_SFT] failed to load cache; rebuild from scratch: {e}")
+                kernel_samples = None
+                amp_table = None
+
+        if kernel_samples is None or amp_table is None:
+            kernel_samples, amp_table = build_kernel_sft_samples(
+                train_df=train_df,
+                news_df=news_df,
+                base_backbone=base_backbone,
+                args=args,
+                global_zstats=global_zstats,
+                device=device,
+                live_logger=live_logger,
+            )
+            try:
+                with open(kernel_cache_path, "w", encoding="utf-8") as f:
+                    json.dump(kernel_samples, f, ensure_ascii=False, indent=2)
+                save_amp_table(kernel_amp_path, amp_table)
+                live_logger.info(
+                    f"[KERNEL_SFT] cache saved: {kernel_cache_path} (n={len(kernel_samples)}), "
+                    f"amp_table={kernel_amp_path}"
+                )
+            except Exception as e:
+                live_logger.info(f"[KERNEL_SFT] failed to save cache or amp table: {e}")
+
+        sft_data_kernel = to_kernel_sft_format(kernel_samples, tokenizer, args)
+        live_logger.info(
+            f"[KERNEL_SFT] formatted samples={len(sft_data_kernel)}, "
+            f"epochs={max(1, int(delta_epochs))}, batch_size={int(max(1, getattr(args, 'sft_batch_size', 1)))}"
+        )
+        policy_name = str(getattr(args, "default_policy", "smart"))
+        best_tpl_id = 0
+        best_policy_name = policy_name
+        best_delta_alpha = 1.0
+        best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
+        total_kernel_epochs = max(1, int(delta_epochs))
+        patience = max(0, int(getattr(args, "early_stop_patience", 0))) if delta_val_mode == "each_epoch" else 0
+        stale_rounds = 0
+        has_saved_delta = False
+        best_metric = float("inf")
+        best_epoch = -1
+
+        def _save_kernel_best(epoch_idx: int, metric_now: float | None):
+            metric_value = None if metric_now is None else float(metric_now)
+            shutil.rmtree(best_delta_path, ignore_errors=True)
+            save_checkpoint(
+                best_delta_path,
+                tokenizer,
+                delta_model,
+                base_model_id=args.base_model,
+                tokenizer_id=args.tokenizer or args.base_model,
+                lora_cfg=lora_cfg,
+                optimizer=None,
+                scheduler=None,
+                epoch=int(epoch_idx),
+                global_step=0,
+                extra_meta={
+                    "mu_global": float(global_zstats["mu_global"]),
+                    "sigma_global": float(global_zstats["sigma_global"]),
+                    "delta_mode": "kernel_tokens",
+                    "kernel_amp_table_file": os.path.basename(kernel_amp_path),
+                },
+            )
+            with open(os.path.join(f"./checkpoints/{args.taskName}", "residual_pair.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "best_base": os.path.basename(best_base_path),
+                        "best_delta": f"best_delta_{args.taskName}",
+                        "best_tpl_id": int(best_tpl_id),
+                        "best_policy_name": str(best_policy_name),
+                        "best_delta_alpha": float(best_delta_alpha),
+                        "reward_metric": str(args.reward_metric),
+                        "best_metric": metric_value,
+                        "delta_mode": "kernel_tokens",
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+        def _kernel_epoch_end(epoch_idx: int, train_loss: float) -> bool:
+            nonlocal stale_rounds, has_saved_delta, best_metric, best_epoch
+            val_loss, val_mse, val_mae = evaluate_metrics_kernel_tokens(
+                base_model=base_backbone,
+                delta_model=delta_model,
+                tokenizer=tokenizer,
+                data_loader=val_loader,
+                args=args,
+                global_zstats=global_zstats,
+                news_df=news_df,
+                policy_name=policy_name,
+                policy_kw=policy_kw,
+                device=device,
+                volatility_bin=volatility_bin_val,
+                amp_table=amp_table,
+                testing=False,
+                true_pred_csv_path=None,
+                filename=None,
+                live_logger=live_logger,
+                log_prefix=f"[DELTA][KERNEL][GEN][VAL][E{epoch_idx+1}]",
+            )
+            metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
+            live_logger.info(
+                f"[DELTA][KERNEL][EVAL] epoch={epoch_idx+1}/{total_kernel_epochs} "
+                f"policy={policy_name} train_loss={train_loss:.6f} "
+                f"val_loss(zMAE)={val_loss:.6f} val_mse(raw)={val_mse:.6f} val_mae(raw)={val_mae:.6f}"
+            )
+            live_logger.info(
+                f"[DELTA][KERNEL][VAL] epoch={epoch_idx+1}/{total_kernel_epochs} policy={policy_name} "
+                f"val_loss(zMAE)={val_loss:.6f} val_mse(raw)={val_mse:.6f} val_mae(raw)={val_mae:.6f}"
+            )
+
+            if (not has_saved_delta) or (metric_now < best_metric - 1e-6):
+                best_metric = float(metric_now)
+                best_epoch = int(epoch_idx)
+                stale_rounds = 0
+                has_saved_delta = True
+                _save_kernel_best(epoch_idx=epoch_idx, metric_now=float(metric_now))
+                live_logger.info(
+                    f"[DELTA][KERNEL] New best delta saved: {best_delta_path} "
+                    f"(epoch={epoch_idx+1}, {args.reward_metric}={best_metric:.6f})"
+                )
+            else:
+                stale_rounds += 1
+                if patience > 0:
+                    live_logger.info(
+                        f"[DELTA][KERNEL] stale_rounds={stale_rounds}/{patience} best={best_metric:.6f}"
+                    )
+
+            if patience > 0 and stale_rounds >= patience:
+                live_logger.info(f"[DELTA][KERNEL] Early stopping triggered at epoch {epoch_idx+1}.")
+                return True
+            return False
+
+        _train_kernel_token_lora(
+            delta_model=delta_model,
+            sft_data=sft_data_kernel,
+            args=args,
+            device=device,
+            live_logger=live_logger,
+            num_epochs=total_kernel_epochs,
+            on_epoch_end=_kernel_epoch_end if delta_val_mode == "each_epoch" else None,
+        )
+
+        if not has_saved_delta:
+            if delta_val_mode == "none":
+                best_epoch = max(0, total_kernel_epochs - 1)
+                best_metric = float("nan")
+                has_saved_delta = True
+                _save_kernel_best(epoch_idx=best_epoch, metric_now=None)
+                live_logger.info(
+                    f"[DELTA][KERNEL][VAL] skipped (mode={delta_val_mode}); "
+                    f"saved final checkpoint: {best_delta_path} (epoch={best_epoch+1})"
+                )
+            else:
+                end_tag = "[DELTA][KERNEL][GEN][VAL][END]" if delta_val_mode == "end_only" else "[DELTA][KERNEL][GEN][VAL][FALLBACK]"
+                val_loss, val_mse, val_mae = evaluate_metrics_kernel_tokens(
+                    base_model=base_backbone,
+                    delta_model=delta_model,
+                    tokenizer=tokenizer,
+                    data_loader=val_loader,
+                    args=args,
+                    global_zstats=global_zstats,
+                    news_df=news_df,
+                    policy_name=policy_name,
+                    policy_kw=policy_kw,
+                    device=device,
+                    volatility_bin=volatility_bin_val,
+                    amp_table=amp_table,
+                    testing=False,
+                    true_pred_csv_path=None,
+                    filename=None,
+                    live_logger=live_logger,
+                    log_prefix=end_tag,
+                )
+                best_metric = float(_select_metric(val_loss, val_mse, val_mae, args.reward_metric))
+                best_epoch = max(0, total_kernel_epochs - 1)
+                has_saved_delta = True
+                _save_kernel_best(epoch_idx=best_epoch, metric_now=best_metric)
+                live_logger.info(
+                    f"[DELTA][KERNEL] Saved {delta_val_mode} best delta: {best_delta_path} "
+                    f"(epoch={best_epoch+1}, {args.reward_metric}={best_metric:.6f})"
+                )
+        else:
+            if np.isfinite(float(best_metric)):
+                live_logger.info(
+                    f"[DELTA][KERNEL] Best checkpoint summary: epoch={best_epoch+1}, "
+                    f"{args.reward_metric}={best_metric:.6f}"
+                )
+            else:
+                live_logger.info(
+                    f"[DELTA][KERNEL] Best checkpoint summary: epoch={best_epoch+1} (no validation metric)."
+                )
+
+        dataStatistic.clear()
+
+        if test_loader is not None:
+            test_model = delta_model
+            test_tokenizer = tokenizer
+            if os.path.exists(best_delta_path):
+                try:
+                    tok_d, model_best = load_checkpoint(
+                        best_delta_path,
+                        args.load_in_4bit,
+                        args.gradient_checkpointing,
+                        _single_device_map(args),
+                        False,
+                        head_mlp=args.head_mlp,
+                        hd=args.head_dropout,
+                        pd=args.patch_dropout,
+                    )
+                    test_tokenizer = tok_d
+                    model_best.to(device)
+                    model_best.eval()
+                    test_model = model_best
+                    live_logger.info("[DELTA][KERNEL] loaded best delta checkpoint for final test.")
+                except Exception as e:
+                    live_logger.info(
+                        f"[DELTA][KERNEL] failed to reload best checkpoint for test; use in-memory model: {e}"
+                    )
+            test_loss, test_mse, test_mae = evaluate_metrics_kernel_tokens(
+                base_model=base_backbone,
+                delta_model=test_model,
+                tokenizer=test_tokenizer,
+                data_loader=test_loader,
+                args=args,
+                global_zstats=global_zstats,
+                news_df=news_df,
+                policy_name=policy_name,
+                policy_kw=policy_kw,
+                device=device,
+                volatility_bin=volatility_bin_test,
+                amp_table=amp_table,
+                testing=True,
+                true_pred_csv_path=true_pred_csv_path,
+                filename=bundle["test_filename"],
+                live_logger=live_logger,
+                log_prefix="[DELTA][KERNEL][GEN][TEST]",
+            )
+            live_logger.info(
+                f"[TEST][FINAL][KERNEL] loss(zMAE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}"
+            )
+            tqdm.write(
+                f"[TEST][FINAL][KERNEL] loss(zMAE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}"
+            )
+            record_test_results_csv(args, live_logger, test_mse, test_mae)
+            draw_pred_true(live_logger, args, true_pred_csv_path)
+
+        return {
+            "test_loader": test_loader,
+            "device": device,
+            "live_logger": live_logger,
+            "best_tpl_id": best_tpl_id,
+            "best_policy_name": best_policy_name,
+            "tpl_id": best_tpl_id,
+            "policy_name": policy_name,
+            "templates": templates,
+            "news_df": news_df,
+            "policy_kw": policy_kw,
+            "volatility_bin_test": volatility_bin_test,
+            "true_pred_csv_path": true_pred_csv_path,
+            "global_zstats": global_zstats,
+        }
+
     # zero_regressor_head(delta_model)
 
     # freeze base head
@@ -1959,8 +2768,45 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     val_loss_per_epoch, mse_loss_per_epoch, mae_loss_per_epoch = [], [], []
     global_step = 0
     best_delta_alpha = 1.0
-    if int(getattr(args, "delta_auto_alpha", 0)) == 1:
-        live_logger.info("[DELTA] alpha fusion is disabled in current trainer; forcing alpha=1.0.")
+    early_stop_patience = max(0, int(getattr(args, "early_stop_patience", 0))) if delta_val_mode == "each_epoch" else 0
+    best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
+
+    def _save_residual_best(epoch_idx: int, metric_now: float | None, tpl_id_now: int, policy_name_now: str):
+        metric_value = None if metric_now is None else float(metric_now)
+        shutil.rmtree(best_delta_path, ignore_errors=True)
+
+        save_checkpoint(
+            best_delta_path,
+            tokenizer,
+            delta_model,
+            base_model_id=args.base_model,
+            tokenizer_id=args.tokenizer or args.base_model,
+            lora_cfg=lora_cfg,
+            optimizer=optim_delta,
+            scheduler=scheduler_delta,
+            epoch=int(epoch_idx),
+            global_step=global_step,
+            extra_meta={
+                "mu_global": float(global_zstats["mu_global"]),
+                "sigma_global": float(global_zstats["sigma_global"]),
+            },
+        )
+
+        with open(os.path.join(f"./checkpoints/{args.taskName}", "residual_pair.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "best_base": os.path.basename(best_base_path),
+                    "best_delta": f"best_delta_{args.taskName}",
+                    "best_tpl_id": int(tpl_id_now),
+                    "best_policy_name": str(policy_name_now),
+                    "best_delta_alpha": float(best_delta_alpha),
+                    "reward_metric": str(args.reward_metric),
+                    "best_metric": metric_value,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
 
     for epoch in range(delta_epochs):
         pbar = tqdm(train_loader, desc=f"[DELTA] Epoch {epoch+1}/{delta_epochs}")
@@ -2110,8 +2956,15 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 if delta_model.training and noise_scale > 0:
                     base_pred = base_pred + torch.randn_like(base_pred) * noise_scale
 
-            # residual target for delta head
-            delta_targets = (targets_z.to(torch.float32) - base_pred).detach()
+            # residual target for delta head (adaptive denoising):
+            # - no-news samples: force zero target
+            # - news samples: clip >2σ spikes before fitting
+            delta_targets = _adaptive_delta_targets(
+                targets_z=targets_z,
+                base_pred=base_pred,
+                has_news=has_news,
+                sigma_clip=2.0,
+            )
 
             # -----------------------------
             # (2) REAL delta forward (with-news, adapter_on, delta head)
@@ -2344,10 +3197,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                         if "lora_" in n and p.grad is not None
                     )
                     live_logger.info(
-                        f"[GRAD] step={global_step} delta_head_grad={dh_grad:.6f} "
-                        f"lora_grad={lora_grad:.6f} "
-                        f"delta_scale={float(delta_model.delta_log_scale.exp().detach().cpu()):.4f}"
-                    )
+                            f"[GRAD] step={global_step} delta_head_grad={dh_grad:.6f} "
+                            f"lora_grad={lora_grad:.6f} "
+                            f"delta_scale={float(delta_model.delta_log_scale.exp().detach().cpu()):.4f}"
+                        )
 
             if (global_step + 1) % args.grad_accum == 0:
                 grad_clip = float(getattr(args, "delta_grad_clip", 0.0))
@@ -2360,103 +3213,172 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
             global_step += 1
 
-        # end-of-epoch eval (combined)
-        val_loss, val_mse, val_mae = evaluate_metrics_residual(
-            base_model=base_backbone,
-            delta_model=delta_model,
-            tokenizer=tokenizer,
-            data_loader=val_loader,
-            templates=templates,
-            tpl_id=tpl_id,
-            args=args,
-            global_zstats=global_zstats,
-            news_df=news_df,
-            policy_name=policy_name,
-            policy_kw=policy_kw,
-            device=device,
-            volatility_bin=volatility_bin_val,
-            testing=False,
-            true_pred_csv_path=None,
-            news_dropout=False,
-            delta_alpha=1.0,
-            news_rl_selector=news_rl_selector,
-        )
-        val_loss_per_epoch.append(val_loss)
-        mse_loss_per_epoch.append(val_mse)
-        mae_loss_per_epoch.append(val_mae)
-
-        live_logger.info(
-            f"[DELTA][EVAL] epoch={epoch+1} tpl_id={tpl_id} policy={policy_name} "
-            f"val_loss(zMSE)={val_loss:.6f} "
-            f"val_mse(raw)={val_mse:.6f} val_mae(raw)={val_mae:.6f}"
-        )
-        if news_rl_selector is not None and news_rl_selector.enable:
-            live_logger.info(f"[DELTA][NEWS_RL] cumulative_updates={news_rl_selector.total_updates}")
-
-        # update val_state for context
-        metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
-        val_state.update(metric_now)
-
-        should_save = (not has_saved_delta) or (metric_now < best_metric - 1e-6)
-        if should_save:
-            best_metric = min(best_metric, metric_now)
-            stale_rounds = 0
-            has_saved_delta = True
-            best_tpl_id = tpl_id
-            best_policy_name = policy_name
-            best_delta_alpha = 1.0
-
-            best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
-            shutil.rmtree(best_delta_path, ignore_errors=True)
-
-            save_checkpoint(
-                best_delta_path,
-                tokenizer,
-                delta_model,
-                base_model_id=args.base_model,
-                tokenizer_id=args.tokenizer or args.base_model,
-                lora_cfg=lora_cfg,
-                optimizer=optim_delta,
-                scheduler=scheduler_delta,
-                epoch=epoch,
-                global_step=global_step,
-                extra_meta={
-                    "mu_global": float(global_zstats["mu_global"]),
-                    "sigma_global": float(global_zstats["sigma_global"]),
-                },
+        if delta_val_mode == "each_epoch":
+            # end-of-epoch eval (combined)
+            val_loss, val_mse, val_mae = evaluate_metrics_residual(
+                base_model=base_backbone,
+                delta_model=delta_model,
+                tokenizer=tokenizer,
+                data_loader=val_loader,
+                templates=templates,
+                tpl_id=tpl_id,
+                args=args,
+                global_zstats=global_zstats,
+                news_df=news_df,
+                policy_name=policy_name,
+                policy_kw=policy_kw,
+                device=device,
+                volatility_bin=volatility_bin_val,
+                testing=False,
+                true_pred_csv_path=None,
+                news_dropout=False,
+                delta_alpha=1.0,
+                news_rl_selector=news_rl_selector,
             )
+            val_loss_per_epoch.append(val_loss)
+            mse_loss_per_epoch.append(val_mse)
+            mae_loss_per_epoch.append(val_mae)
 
-            with open(os.path.join(f"./checkpoints/{args.taskName}", "residual_pair.json"), "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "best_base": os.path.basename(best_base_path),
-                        "best_delta": f"best_delta_{args.taskName}",
-                        "best_tpl_id": int(best_tpl_id),
-                        "best_policy_name": str(best_policy_name),
-                        "best_delta_alpha": float(best_delta_alpha),
-                        "reward_metric": str(args.reward_metric),
-                        "best_metric": float(best_metric),
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
             live_logger.info(
-                f"[DELTA] New best delta saved: {best_delta_path} "
-                f"({args.reward_metric}={best_metric:.6f})"
+                f"[DELTA][EVAL] epoch={epoch+1} tpl_id={tpl_id} policy={policy_name} "
+                f"val_loss(zMSE)={val_loss:.6f} "
+                f"val_mse(raw)={val_mse:.6f} val_mae(raw)={val_mae:.6f}"
             )
-        else:
-            stale_rounds += 1
-            live_logger.info(f"[DELTA] stale_rounds={stale_rounds}/{args.early_stop_patience} best={best_metric:.6f}")
+            if news_rl_selector is not None and news_rl_selector.enable:
+                live_logger.info(f"[DELTA][NEWS_RL] cumulative_updates={news_rl_selector.total_updates}")
 
-        if stale_rounds >= args.early_stop_patience:
-            live_logger.info(f"[DELTA] Early stopping triggered at epoch {epoch+1}.")
-            break
+            # update val_state for context
+            metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
+            val_state.update(metric_now)
+
+            should_save = (not has_saved_delta) or (metric_now < best_metric - 1e-6)
+            if should_save:
+                best_metric = min(best_metric, metric_now)
+                stale_rounds = 0
+                has_saved_delta = True
+                best_tpl_id = tpl_id
+                best_policy_name = policy_name
+                best_delta_alpha = 1.0
+                _save_residual_best(
+                    epoch_idx=epoch,
+                    metric_now=best_metric,
+                    tpl_id_now=best_tpl_id,
+                    policy_name_now=best_policy_name,
+                )
+                live_logger.info(
+                    f"[DELTA] New best delta saved: {best_delta_path} "
+                    f"({args.reward_metric}={best_metric:.6f})"
+                )
+            else:
+                stale_rounds += 1
+                if early_stop_patience > 0:
+                    live_logger.info(
+                        f"[DELTA] stale_rounds={stale_rounds}/{early_stop_patience} best={best_metric:.6f}"
+                    )
+
+            if early_stop_patience > 0 and stale_rounds >= early_stop_patience:
+                live_logger.info(f"[DELTA] Early stopping triggered at epoch {epoch+1}.")
+                break
 
         if epoch == 0:
             live_logger.info("---------------------trainset and valset prompt statistics--------------------------------")
             print_prompt_stats(live_logger, dataStatistic)
             live_logger.info("-----------------------------------------------------")
+
+    if not has_saved_delta:
+        final_epoch = max(0, int(delta_epochs) - 1)
+        if delta_val_mode == "end_only":
+            val_loss, val_mse, val_mae = evaluate_metrics_residual(
+                base_model=base_backbone,
+                delta_model=delta_model,
+                tokenizer=tokenizer,
+                data_loader=val_loader,
+                templates=templates,
+                tpl_id=tpl_id,
+                args=args,
+                global_zstats=global_zstats,
+                news_df=news_df,
+                policy_name=policy_name,
+                policy_kw=policy_kw,
+                device=device,
+                volatility_bin=volatility_bin_val,
+                testing=False,
+                true_pred_csv_path=None,
+                news_dropout=False,
+                delta_alpha=1.0,
+                news_rl_selector=news_rl_selector,
+            )
+            metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
+            best_metric = float(metric_now)
+            has_saved_delta = True
+            best_tpl_id = tpl_id
+            best_policy_name = policy_name
+            _save_residual_best(
+                epoch_idx=final_epoch,
+                metric_now=best_metric,
+                tpl_id_now=best_tpl_id,
+                policy_name_now=best_policy_name,
+            )
+            live_logger.info(
+                f"[DELTA][VAL] end_only: val_loss(zMSE)={val_loss:.6f} "
+                f"val_mse(raw)={val_mse:.6f} val_mae(raw)={val_mae:.6f}"
+            )
+            live_logger.info(
+                f"[DELTA] Saved end_only best delta: {best_delta_path} "
+                f"({args.reward_metric}={best_metric:.6f})"
+            )
+        elif delta_val_mode == "none":
+            has_saved_delta = True
+            best_tpl_id = tpl_id
+            best_policy_name = policy_name
+            best_metric = float("nan")
+            _save_residual_best(
+                epoch_idx=final_epoch,
+                metric_now=None,
+                tpl_id_now=best_tpl_id,
+                policy_name_now=best_policy_name,
+            )
+            live_logger.info(
+                f"[DELTA][VAL] skipped (mode={delta_val_mode}); "
+                f"saved final checkpoint: {best_delta_path} (epoch={final_epoch+1})"
+            )
+        else:
+            # safety fallback for unexpected state in each_epoch mode
+            val_loss, val_mse, val_mae = evaluate_metrics_residual(
+                base_model=base_backbone,
+                delta_model=delta_model,
+                tokenizer=tokenizer,
+                data_loader=val_loader,
+                templates=templates,
+                tpl_id=tpl_id,
+                args=args,
+                global_zstats=global_zstats,
+                news_df=news_df,
+                policy_name=policy_name,
+                policy_kw=policy_kw,
+                device=device,
+                volatility_bin=volatility_bin_val,
+                testing=False,
+                true_pred_csv_path=None,
+                news_dropout=False,
+                delta_alpha=1.0,
+                news_rl_selector=news_rl_selector,
+            )
+            metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
+            best_metric = float(metric_now)
+            has_saved_delta = True
+            best_tpl_id = tpl_id
+            best_policy_name = policy_name
+            _save_residual_best(
+                epoch_idx=final_epoch,
+                metric_now=best_metric,
+                tpl_id_now=best_tpl_id,
+                policy_name_now=best_policy_name,
+            )
+            live_logger.info(
+                f"[DELTA][VAL] fallback eval: val_loss(zMSE)={val_loss:.6f} "
+                f"val_mse(raw)={val_mse:.6f} val_mae(raw)={val_mae:.6f}"
+            )
 
     # draw_metric_trend(args, live_logger, val_loss_per_epoch, mse_loss_per_epoch, mae_loss_per_epoch)
     dataStatistic.clear()
@@ -2712,24 +3634,55 @@ def testing_delta(
         tpl_for_test = best_tpl_id if use_bandit else tpl_id
         pol_for_test = best_policy_name if use_bandit else policy_name
 
-        test_loss, test_mse, test_mae = evaluate_metrics_residual(
-            base_model=base_backbone,
-            delta_model=model_best,
-            tokenizer=tokenizer,
-            data_loader=test_loader,
-            templates=templates,
-            tpl_id=tpl_for_test,
-            args=args,
-            global_zstats=stats,
-            news_df=news_df,
-            policy_name=pol_for_test,
-            policy_kw=policy_kw,
-            device=device,
-            volatility_bin=volatility_bin_test,
-            testing=True,
-            true_pred_csv_path=true_pred_csv_path,
-            news_dropout=False,
-        )
+        delta_mode = str(getattr(args, "delta_mode", "regression")).lower().strip()
+        if delta_mode == "kernel_tokens":
+            amp_file = str(delta_meta.get("kernel_amp_table_file", getattr(args, "kernel_amp_table_file", "kernel_amp_table.json")))
+            amp_path = os.path.join(f"./checkpoints/{args.taskName}", amp_file)
+            try:
+                amp_table = load_amp_table(amp_path, expected_bins=int(getattr(args, "kernel_amp_bins", 21)))
+            except Exception:
+                amp_table = [float(i) / 20.0 for i in range(21)]
+                live_logger.info(
+                    f"[DELTA][KERNEL] amp table not found or invalid at {amp_path}; fallback to default linear table."
+                )
+            test_loss, test_mse, test_mae = evaluate_metrics_kernel_tokens(
+                base_model=base_backbone,
+                delta_model=model_best,
+                tokenizer=tokenizer,
+                data_loader=test_loader,
+                args=args,
+                global_zstats=stats,
+                news_df=news_df,
+                policy_name=pol_for_test,
+                policy_kw=policy_kw,
+                device=device,
+                volatility_bin=volatility_bin_test,
+                amp_table=amp_table,
+                testing=True,
+                true_pred_csv_path=true_pred_csv_path,
+                filename=getattr(args, "taskName", "kernel_tokens"),
+                live_logger=live_logger,
+                log_prefix="[DELTA][KERNEL][GEN][TEST]",
+            )
+        else:
+            test_loss, test_mse, test_mae = evaluate_metrics_residual(
+                base_model=base_backbone,
+                delta_model=model_best,
+                tokenizer=tokenizer,
+                data_loader=test_loader,
+                templates=templates,
+                tpl_id=tpl_for_test,
+                args=args,
+                global_zstats=stats,
+                news_df=news_df,
+                policy_name=pol_for_test,
+                policy_kw=policy_kw,
+                device=device,
+                volatility_bin=volatility_bin_test,
+                testing=True,
+                true_pred_csv_path=true_pred_csv_path,
+                news_dropout=False,
+            )
 
         live_logger.info("---------------------testset prompt statistics--------------------------------")
         print_prompt_stats(live_logger, dataStatistic)

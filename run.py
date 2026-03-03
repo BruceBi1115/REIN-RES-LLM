@@ -1,13 +1,8 @@
 # run.py
 import argparse
-import pandas as pd
 # from src.trainer import main as main_train
 from src.base_delta_decoouple_trainer import main as main_train
 # from src.original_residual_trainer import main as main_train
-from src.chatgpt_4o_mini_keyword_generate.gpt_client import run_from_config, stream_from_config
-from pathlib import Path
-from openai import OpenAI
-from textblob import TextBlob
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Cross-domain LLaMA Forecasting with RL')
@@ -16,7 +11,6 @@ if __name__ == '__main__':
     parser.add_argument('--rel_lambda', type=float, default=0.3, help='weight for relative loss')
     parser.add_argument('--rel_supervise_lambda', type=float, default=0.5,
                         help='weight for supervised rel_head BCE in delta stage')
-    parser.add_argument("--rel_on", action="store_true", help="whether to use relative loss")
 
     parser.add_argument('--delta_null_lambda', type=float, default=0.0001, help='weight for ||delta_pred(no-news)|| shrink')
     parser.add_argument('--delta_margin_lambda', type=float, default=1.0, help='weight for counterfactual margin loss')
@@ -56,10 +50,147 @@ if __name__ == '__main__':
     parser.add_argument('--delta_other_lr_scale', type=float, default=0.5, help='lr scale for other trainable params in delta stage')
     parser.add_argument('--delta_freeze_feature_modules', type=int, default=0, choices=[0, 1],
                         help='freeze patch/pooling feature modules in delta stage (legacy behavior)')
-    parser.add_argument('--delta_auto_alpha', type=int, default=0, choices=[0, 1],
-                        help='deprecated: alpha fusion is disabled; kept for backward compatibility')
-    parser.add_argument('--delta_alpha_candidates', type=str, default='1.0',
-                        help='deprecated: alpha fusion is disabled; kept for backward compatibility')
+    parser.add_argument(
+        '--delta_mode',
+        type=str,
+        default='regression',
+        choices=['regression', 'kernel_tokens'],
+        help='delta prediction mode: regression head (legacy) or kernel parameter tokens',
+    )
+    parser.add_argument(
+        '--delta_fusion_mode',
+        type=str,
+        default='add',
+        choices=['add', 'mul_z', 'mul_raw'],
+        help='how to fuse base and delta in kernel eval/inference: add, multiplicative on z-space, or multiplicative on raw-space',
+    )
+    parser.add_argument(
+        '--delta_mul_scale',
+        type=float,
+        default=1.0,
+        help='scale on token-derived delta before multiplicative fusion (coeff = 1 + scale*delta)',
+    )
+    parser.add_argument(
+        '--delta_mul_coeff_min',
+        type=float,
+        default=0.05,
+        help='lower bound for multiplicative coefficient to avoid sign/zero collapse',
+    )
+    parser.add_argument(
+        '--delta_mul_coeff_max',
+        type=float,
+        default=3.0,
+        help='upper bound for multiplicative coefficient in mul_z fusion',
+    )
+    parser.add_argument(
+        '--kernel_amp_bins',
+        type=int,
+        default=21,
+        help='number of amplitude bins for kernel token mode; default supports AMP_0..AMP_20',
+    )
+    parser.add_argument(
+        '--kernel_rel_norm_thresh',
+        type=float,
+        default=0.05,
+        help='residual norm threshold for REL=0 in kernel fitter',
+    )
+    parser.add_argument(
+        '--kernel_rel_improve_ratio',
+        type=float,
+        default=0.0,
+        help='minimum relative SSE improvement (vs zero-kernel) required to keep REL=1',
+    )
+    parser.add_argument(
+        '--kernel_rel_improve_abs',
+        type=float,
+        default=0.0,
+        help='minimum absolute SSE improvement (vs zero-kernel) required to keep REL=1',
+    )
+    parser.add_argument(
+        '--kernel_a_max',
+        type=float,
+        default=2.0,
+        help='max projected amplitude in kernel fitter',
+    )
+    parser.add_argument(
+        '--kernel_sft_lr',
+        type=float,
+        default=1e-4,
+        help='learning rate for kernel token SFT training',
+    )
+    parser.add_argument(
+        '--kernel_gen_max_new_tokens',
+        type=int,
+        default=32,
+        help='max generated tokens for kernel parameter sequence at inference',
+    )
+    parser.add_argument(
+        '--kernel_api_enable',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help='enable API-assisted relabeling for uncertain kernel SFT samples',
+    )
+    parser.add_argument(
+        '--kernel_api_key',
+        type=str,
+        default='',
+        help='API key for kernel relabeling; falls back to OPENAI_API_KEY when empty',
+    )
+    parser.add_argument(
+        '--kernel_api_model',
+        type=str,
+        default='gpt-4o',
+        help='OpenAI model for kernel relabeling',
+    )
+    parser.add_argument(
+        '--kernel_api_temperature',
+        type=float,
+        default=0.1,
+        help='temperature for API relabeling calls',
+    )
+    parser.add_argument(
+        '--kernel_api_max_calls',
+        type=int,
+        default=200,
+        help='max API calls during one kernel sample build; <0 means unlimited',
+    )
+    parser.add_argument(
+        '--kernel_api_uncertain_band',
+        type=float,
+        default=0.02,
+        help='query API when rel_norm is within this band around kernel_rel_norm_thresh',
+    )
+    parser.add_argument(
+        '--kernel_api_low_amp_bin',
+        type=int,
+        default=2,
+        help='query API when auto label is REL=1 but AMP bin is <= this threshold',
+    )
+    parser.add_argument(
+        '--kernel_api_log_every',
+        type=int,
+        default=10,
+        help='log API relabeling progress every N calls',
+    )
+    parser.add_argument(
+        '--kernel_cache_file',
+        type=str,
+        default='sft_kernel_cache.json',
+        help='cache file name for kernel-token SFT samples under checkpoints/<taskName>/',
+    )
+    parser.add_argument(
+        '--kernel_amp_table_file',
+        type=str,
+        default='kernel_amp_table.json',
+        help='amp table file name under checkpoints/<taskName>/ for kernel-token mode',
+    )
+    parser.add_argument(
+        '--kernel_api_cache_file',
+        type=str,
+        default='sft_kernel_api_cache.json',
+        help='API relabel cache file name under checkpoints/<taskName>/',
+    )
     parser.add_argument('--utility_rank_lambda', type=float, default=0.2,
                         help='weight for real-vs-null utility ranking loss on rel logits')
     parser.add_argument('--utility_rank_margin', type=float, default=0.10,
@@ -131,11 +262,8 @@ if __name__ == '__main__':
     parser.add_argument('--taskName', type=str, default='task1', help='The name of this running task')
     parser.add_argument('--gpu', type=int, default=0, help='gpu id')
     parser.add_argument('--seed', type=int, default=42, help='random seed')
-    parser.add_argument('--precision', type=str, default='bf16', choices=['fp32', 'fp16', 'bf16'],
-                        help='training precision/mixed precision mode')
 
     # ===== Data & Instruction =====
-    parser.add_argument('--data_root', type=str, default='./dataset', help='root folder for datasets')
     parser.add_argument('--dayFirst', action="store_true", default=False, help='Are your datasets in "day-first" format?')
     parser.add_argument('--train_file', type=str, default='', help='train set path (CSV/Parquet)')
     parser.add_argument('--val_file', type=str, default='', help='validation set path')
@@ -143,15 +271,9 @@ if __name__ == '__main__':
     parser.add_argument('--time_col', type=str, default='timestamp', help='time column name')
     parser.add_argument('--value_col', type=str, default='value', help='target/series column name')
     parser.add_argument('--id_col', type=str, default=None, help='optional series ID column for multi-series')
-    parser.add_argument('--scaler', type=str, default='standard', choices=['none', 'standard', 'minmax'],
-                        help='scaling method for target')
-
-    parser.add_argument('--instruction_json', type=str, default='',
-                        help='path to JSON with instruction fields per run/domain')
     parser.add_argument('--freq_min', type=int, default=30, help='sampling frequency in minutes (e.g., 30 for half-hour)')
     parser.add_argument('--region', type=str, default='', help='region/state/country code')
     parser.add_argument('--unit', type=str, default='', help='unit string')
-    parser.add_argument('--season', type=str, default='', help='DJF/MAM/JJA/SON or empty')
     parser.add_argument('--volatility_bin_tiers', type=int, default=100, help='the tiers to bin volatility')
     parser.add_argument('--token_budget', type=int, default=700, help='max tokens for composed prompt')
     parser.add_argument('--val_ema_alpha', type=float, default=0.9, help='EMA alpha for validation loss smoothing')
@@ -164,22 +286,14 @@ if __name__ == '__main__':
     parser.add_argument('--history_len', type=int, default=48, help='steps for history window L')
     parser.add_argument('--horizon', type=int, default=48, help='steps to predict H')
     parser.add_argument('--stride', type=int, default=48, help='sliding stride for training')
-    parser.add_argument('--target_precision', type=int, default=3, help='decimal places for target values')
     # ===== News retrieval (rule-based) =====
     parser.add_argument('--news_path', type=str, default='', help='path to news store (should be a JSON file)')
     parser.add_argument('--news_time_col', type=str, default='date', help='news timestamp column name')
     parser.add_argument('--news_text_col', type=str, default='content', help='news text/summary column name')
-    parser.add_argument('--news_source_col', type=str, default='source', help='news source column (optional)')
     parser.add_argument('--news_tz', type=str, default='', help='timezone for news timestamps')
     parser.add_argument('--news_window_days', type=int, default=1, help='look-back window (days) before target time')
     parser.add_argument('--news_topM', type=int, default=20, help='candidate news cap per sample')
     parser.add_argument('--news_topK', type=int, default=5, help='news K after policy/RL')
-    # parser.add_argument('--news_policy', type=str, default='',
-    #                     help='rule-based extraction strategy or combinational bandit')
-    
-    # Keyword files for policy-based news selection
-    parser.add_argument('--keyword_path', type=str, default='keywords/kws.txt',
-                        help='keyword list for filtering news (one per line)')
     
     # ===== News summarization =====
     # WE ALREADY USED CHATGPT4O TO SUMMARIZE NEWS, SO THIS IS NOT USED
@@ -192,13 +306,9 @@ if __name__ == '__main__':
     # ===== Prompt templates =====
     parser.add_argument('--template_pool', type=str, default='configs/templates3.yaml',
                         help='YAML/JSON templates with placeholders')
-    # Use template_ids to restrict to a subset of templates
-    parser.add_argument('--template_ids', type=str, default='', help='comma-separated template ids to allow (empty=all)')
 
     #===== Token budget fractions =====
-    parser.add_argument('--token_budget_history_frac', type=float, default=0.05, help='budget frac for history')
     parser.add_argument('--token_budget_news_frac', type=float, default=0.9, help='budget frac for news')
-    parser.add_argument('--token_budget_instr_frac', type=float, default=0.05, help='budget frac for instruction')
 
     # ===== LLaMA =====
     parser.add_argument('--base_model', type=str, default='meta-llama/Meta-Llama-3-8B', help='HF model id or local path')
@@ -220,23 +330,13 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=2, help='micro batch size per device')
     parser.add_argument('--grad_accum', type=int, default=16, help='gradient accumulation steps')
     parser.add_argument('--epochs', type=int, default=3, help='outer epochs over the dataset')
-    parser.add_argument('--max_steps', type=int, default=-1, help='override total steps if >0')
-    # parser.add_argument('--eval_interval', type=int, default=200, help='validate every N steps')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='checkpoint dir')
-    parser.add_argument('--save_interval', type=int, default=1000, help='save every N steps')
 
     # ===== RL / Bandit =====
     parser.add_argument('--rl_use', type=int, default=0, help='use RL/bandit for news selection? (0/1)')
     parser.add_argument('--rl_algo', type=str, default='lints', choices=['lints','linucb'], help='bandit algorithm')
-    parser.add_argument('--rl_cycle_steps', type=int, default=100, help='short SFT steps per decision cycle (0=no-train)')
-    parser.add_argument('--rl_update_times', type=int, default=1, help='update bandits every N cycles')
-    parser.add_argument('--rl_val_probe_size', type=int, default=256, help='fixed validation probe size')
-    parser.add_argument('--rl_val_probe_frac', type=float, default=0.5, help='fixed validation probe fraction')
 
     parser.add_argument('--reward_metric', type=str, default='mae', choices=['mse','mae','loss'], help='reward metric')
-    parser.add_argument('--reward_mode', type=str, default='delta', choices=['delta','negative'], help='delta or negative')
-    parser.add_argument('--reward_len_penalty', type=float, default=0.0, help='penalty for prompt tokens')
-    parser.add_argument('--reward_k_penalty', type=float, default=0.0, help='penalty for K news')
     parser.add_argument('--reward_ema', type=float, default=0.3, help='EMA smoothing of reward')
     parser.add_argument('--domain_reward_norm', action='store_true', help='z-score reward per (domain,horizon) group')
     parser.add_argument('--ucb_alpha', type=float, default=1.0, help='LinUCB alpha')
@@ -262,13 +362,21 @@ if __name__ == '__main__':
                         help='recency decay tau (hours) in news item features for RL')
 
     # ===== Eval & Logging =====
-    parser.add_argument('--early_stop_patience', type=int, default=5, help='patience in eval rounds')
-    # parser.add_argument('--log_dir', type=str, default='./logs', help='log directory')
-    # parser.add_argument('--run_name', type=str, default='xl-rl-forecast', help='run name')
+    parser.add_argument('--early_stop_patience', type=int, default=4, help='patience in eval rounds')
+    parser.add_argument(
+        '--delta_val_mode',
+        type=str,
+        default='each_epoch',
+        choices=['each_epoch', 'end_only', 'none'],
+        help='delta-stage validation schedule: each epoch, end only, or disabled',
+    )
+    parser.add_argument('--eval_progress_bar', type=int, default=1, choices=[0, 1],
+                        help='show tqdm progress bar during validation/testing evaluation loops')
+    parser.add_argument('--eval_progress_leave', type=int, default=0, choices=[0, 1],
+                        help='keep evaluation progress bars after completion')
 
-    # ===== Keyword Generation =====
+    # ===== Metadata =====
     parser.add_argument("--description",type=str,default="",help="描述这个 dataset 的用途，例如 '新州电价数据'")
-    parser.add_argument("--keyword_number",type=int,default=10,help="how many keywords to generate")
     parser.add_argument("--select_policy_by",type = str,default = "epoch",choices=["epoch", "batch"], 
                         help = "Select policy/template by epoch-level or batch-level"
     )
@@ -278,59 +386,6 @@ if __name__ == '__main__':
     if not args.tokenizer:
         args.tokenizer = args.base_model
     args.target_modules = [s.strip() for s in args.target_modules.split(',') if s.strip()]
-    if args.template_ids:
-        args.template_ids = [int(x) for x in args.template_ids.split(',') if x.strip()]
-    else:
-        args.template_ids = None
-    s = args.token_budget_history_frac + args.token_budget_news_frac + args.token_budget_instr_frac
-    if s > 1.0:
-        args.token_budget_history_frac /= s
-        args.token_budget_news_frac    /= s
-        args.token_budget_instr_frac   /= s
-
-    # 生成关键词
-    
-    # description = args.description.strip()
-    # text = run_from_config(
-    #     config_path="src/chatgpt_4o_mini_keyword_generate/config.json",
-    #     kind="generate_keywords",  # 选择 A/B/C
-    #     variables={
-    #         "description": description if description else "null",
-    #         "number": args.keyword_number
-    #     },
-    #     system="Be concise in your output.",
-    #     temperature=0.2,
-    # )
-
-    #   # 获取输出文本
-    # text = text.strip()
-
-    # # 确保目录存在
-    # out_path = Path(f"{args.keyword_path}")
-    # out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # # 写入文件
-    # with open(out_path, "w", encoding="utf-8") as f:
-    #     f.write(text)
-
-    # print(f"[Keywords] Have been recorded in {out_path}")
-
-    # 计算波动率分箱 (temp)
-    # def _read(path):
-    #     if path.endswith('.parquet'): return pd.read_parquet(path)
-    #     return pd.read_csv(path)
-
-    # train_df = _read(args.train_file)
-    # val_df = _read(args.val_file)
-    # test_df = _read(args.test_file)
-    # volatility_bin  = compute_volatility_bin(train_df, time_col=args.time_col, value_col=args.value_col, window=args.history_len, bins=args.volatility_bin_tiers, dayfirst=args.dayFirst)
-    # print(f"Computed volatility_bin for training set = {volatility_bin}")
-    # volatility_bin_val  = compute_volatility_bin(val_df, time_col=args.time_col, value_col=args.value_col, window=args.history_len, bins=args.volatility_bin_tiers, dayfirst=args.dayFirst)
-    # print(f"Computed volatility_bin for validation set = {volatility_bin_val}")
-    # volatility_bin_test = compute_volatility_bin(test_df, time_col=args.time_col, value_col=args.value_col,window=args.history_len, bins=args.volatility_bin_tiers, dayfirst=args.dayFirst)
-    # print(f"Computed volatility_bin for testing set = {volatility_bin_test}")
-
-
-    
+    args.token_budget_news_frac = float(max(0.0, min(1.0, args.token_budget_news_frac)))
 
     main_train(args)

@@ -6,10 +6,6 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from textblob import TextBlob
-
-def _load_keywords(path: str):
-    with open(path, 'r', encoding='utf-8') as f:
-        return [w.strip().lower() for w in f if w.strip()]
     
 def load_news(path: str, time_col: str, tz: str) -> pd.DataFrame:
     """

@@ -2,3 +2,4 @@
 checkpoints/
 dataset/
 src/chatgpt_4o_mini_keyword_generate/config.json
+.secrets/gpt4o_api_key.txt
