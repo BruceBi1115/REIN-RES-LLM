@@ -140,8 +140,8 @@ if __name__ == '__main__':
     parser.add_argument(
         '--kernel_api_model',
         type=str,
-        default='gpt-4o',
-        help='OpenAI model for kernel relabeling',
+        default='gpt-5.1',
+        help='OpenAI model for kernel relabeling (dataset stage uses fixed chatgpt-5.1)',
     )
     parser.add_argument(
         '--kernel_api_temperature',
@@ -174,6 +174,30 @@ if __name__ == '__main__':
         help='log API relabeling progress every N calls',
     )
     parser.add_argument(
+        '--kernel_api_log_examples',
+        type=int,
+        default=3,
+        help='log up to N API response examples for success/failure at dataset build end',
+    )
+    parser.add_argument(
+        '--kernel_api_live_fail_log_max',
+        type=int,
+        default=3,
+        help='log up to N live API failure samples during dataset build',
+    )
+    parser.add_argument(
+        '--kernel_api_price_in_per_1m',
+        type=float,
+        default=5.0,
+        help='estimated USD price per 1M input tokens for API cost logging',
+    )
+    parser.add_argument(
+        '--kernel_api_price_out_per_1m',
+        type=float,
+        default=15.0,
+        help='estimated USD price per 1M output tokens for API cost logging',
+    )
+    parser.add_argument(
         '--kernel_cache_file',
         type=str,
         default='sft_kernel_cache.json',
@@ -190,6 +214,19 @@ if __name__ == '__main__':
         type=str,
         default='sft_kernel_api_cache.json',
         help='API relabel cache file name under checkpoints/<taskName>/',
+    )
+    parser.add_argument(
+        '--kernel_api_type',
+        type=str,
+        default='both',
+        choices=['priors', 'relsign', 'both'],
+        help='dataset-stage API mode: priors-only, relsign-only, or both',
+    )
+    parser.add_argument(
+        '--kernel_api_prior_rel_norm_thresh',
+        type=float,
+        default=-1.0,
+        help='trigger priors API when rel_norm >= this value; <=0 uses kernel_rel_norm_thresh',
     )
     parser.add_argument('--utility_rank_lambda', type=float, default=0.2,
                         help='weight for real-vs-null utility ranking loss on rel logits')
@@ -296,7 +333,7 @@ if __name__ == '__main__':
     parser.add_argument('--news_topK', type=int, default=5, help='news K after policy/RL')
     
     # ===== News summarization =====
-    # WE ALREADY USED CHATGPT4O TO SUMMARIZE NEWS, SO THIS IS NOT USED
+    # News is pre-summarized offline in this workflow, so this option is usually unused.
     parser.add_argument('--news_summary_method', type=str, default='none', choices=['none', 'lead3', 'rule'],
                         help='shorten news before inserting to prompt')
     parser.add_argument('--news_max_sentences', type=int, default=3, help='max sentences per selected news')

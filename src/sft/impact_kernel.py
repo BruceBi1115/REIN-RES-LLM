@@ -10,11 +10,15 @@ import numpy as np
 
 REL_VALUES = (0, 1)
 SIGN_VALUES = ("UP", "DOWN")
-SHAPE_VALUES = ("SPIKE", "STEP_DECAY", "RAMP_DECAY")
+SHAPE_VALUES = ("STEP_DECAY", "RAMP_DECAY")
+# Legacy default grids kept for backward compatibility.
 LAG_VALUES = tuple(range(7))
 HALF_LIFE_VALUES = (1, 2, 4, 8, 16, 32)
 DUR_VALUES = tuple(range(7))
 AMP_VALUES = tuple(range(21))
+
+DEFAULT_LAG_DUR_CAP = 96
+DEFAULT_MAX_HALF_LIFE = 256
 
 TOKEN_ORDER = (
     "REL",
@@ -31,7 +35,7 @@ def default_kernel_params() -> dict:
     return {
         "rel": 0,
         "sign": "UP",
-        "shape": "SPIKE",
+        "shape": "STEP_DECAY",
         "lag": 0,
         "half_life": 1,
         "dur": 0,
@@ -43,7 +47,49 @@ def _clamp_int(v, lo: int, hi: int) -> int:
     return int(max(lo, min(hi, int(v))))
 
 
-def sanitize_kernel_params(params: dict | None) -> dict:
+def _resolve_lag_dur_cap(
+    horizon: int | None = None,
+    max_value: int | None = None,
+    default_cap: int = DEFAULT_LAG_DUR_CAP,
+) -> int:
+    if max_value is not None:
+        return int(max(0, int(max_value)))
+    if horizon is None:
+        return int(max(0, int(default_cap)))
+    h = int(max(1, int(horizon)))
+    return int(max(0, min(h - 1, int(default_cap))))
+
+
+def _resolve_half_life_cap(max_hl: int | None = None) -> int:
+    if max_hl is None:
+        return int(DEFAULT_MAX_HALF_LIFE)
+    return int(max(1, int(max_hl)))
+
+
+def _resolve_amp_upper(
+    p: dict,
+    amp_table: list[float] | None = None,
+    max_amp_bin: int | None = None,
+) -> int:
+    if isinstance(amp_table, list):
+        if len(amp_table) == 0:
+            return 0
+        return int(len(amp_table) - 1)
+    if max_amp_bin is not None:
+        return int(max(0, int(max_amp_bin)))
+    return int(max(0, int(p.get("amp_bin", 0))))
+
+
+def sanitize_kernel_params(
+    params: dict | None,
+    *,
+    horizon: int | None = None,
+    max_lag: int | None = None,
+    max_dur: int | None = None,
+    max_hl: int | None = None,
+    amp_table: list[float] | None = None,
+    max_amp_bin: int | None = None,
+) -> dict:
     p = dict(default_kernel_params())
     if isinstance(params, dict):
         p.update(params)
@@ -57,11 +103,15 @@ def sanitize_kernel_params(params: dict | None) -> dict:
     shape = str(p.get("shape", "SPIKE")).upper().strip()
     p["shape"] = shape if shape in SHAPE_VALUES else "SPIKE"
 
-    p["lag"] = _clamp_int(p.get("lag", 0), 0, 6)
-    hl = int(p.get("half_life", 1))
-    p["half_life"] = hl if hl in HALF_LIFE_VALUES else 1
-    p["dur"] = _clamp_int(p.get("dur", 0), 0, 6)
-    p["amp_bin"] = _clamp_int(p.get("amp_bin", 0), 0, 20)
+    lag_cap = _resolve_lag_dur_cap(horizon=horizon, max_value=max_lag)
+    dur_cap = _resolve_lag_dur_cap(horizon=horizon, max_value=max_dur)
+    hl_cap = _resolve_half_life_cap(max_hl=max_hl)
+    amp_cap = _resolve_amp_upper(p, amp_table=amp_table, max_amp_bin=max_amp_bin)
+
+    p["lag"] = _clamp_int(p.get("lag", 0), 0, lag_cap)
+    p["half_life"] = _clamp_int(p.get("half_life", 1), 1, hl_cap)
+    p["dur"] = _clamp_int(p.get("dur", 0), 0, dur_cap)
+    p["amp_bin"] = _clamp_int(p.get("amp_bin", 0), 0, amp_cap)
     return p
 
 
@@ -83,12 +133,19 @@ def build_unit_kernel(
     lag: int,
     half_life: int,
     dur: int,
+    max_lag: int | None = None,
+    max_dur: int | None = None,
+    max_hl: int | None = None,
 ) -> np.ndarray:
     H = int(max(1, horizon))
     shape_u = str(shape).upper().strip()
-    lag_i = _clamp_int(lag, 0, 6)
-    hl_i = int(half_life) if int(half_life) in HALF_LIFE_VALUES else 1
-    dur_i = _clamp_int(dur, 0, 6)
+    lag_cap = _resolve_lag_dur_cap(horizon=H, max_value=max_lag)
+    dur_cap = _resolve_lag_dur_cap(horizon=H, max_value=max_dur)
+    hl_cap = _resolve_half_life_cap(max_hl=max_hl)
+
+    lag_i = _clamp_int(lag, 0, lag_cap)
+    hl_i = _clamp_int(half_life, 1, hl_cap)
+    dur_i = _clamp_int(dur, 0, dur_cap)
     lam = float(max(1e-6, half_life_to_lambda(hl_i)))
 
     tau = np.arange(H, dtype=np.float32)
@@ -182,7 +239,7 @@ def quantize_amp_to_bin(amp: float, amp_table: list[float]) -> int:
     a = float(max(0.0, amp))
     arr = np.asarray(amp_table, dtype=np.float32)
     idx = int(np.argmin(np.abs(arr - a)))
-    return _clamp_int(idx, 0, min(len(amp_table) - 1, 20))
+    return _clamp_int(idx, 0, len(amp_table) - 1)
 
 
 def params_to_delta(
@@ -191,8 +248,18 @@ def params_to_delta(
     amp_table: list[float],
     clip_low: float = -1.0,
     clip_high: float = 1.0,
+    max_lag: int | None = None,
+    max_dur: int | None = None,
+    max_hl: int | None = None,
 ) -> np.ndarray:
-    p = sanitize_kernel_params(params)
+    p = sanitize_kernel_params(
+        params,
+        horizon=horizon,
+        max_lag=max_lag,
+        max_dur=max_dur,
+        max_hl=max_hl,
+        amp_table=amp_table,
+    )
     H = int(max(1, horizon))
     if int(p["rel"]) == 0:
         return np.zeros((H,), dtype=np.float32)
@@ -205,14 +272,34 @@ def params_to_delta(
         lag=int(p["lag"]),
         half_life=int(p["half_life"]),
         dur=int(p["dur"]),
+        max_lag=max_lag,
+        max_dur=max_dur,
+        max_hl=max_hl,
     )
     delta = sign * float(amp) * k
     delta = np.clip(delta, float(clip_low), float(clip_high))
     return delta.astype(np.float32)
 
 
-def format_param_tokens(params: dict | None) -> str:
-    p = sanitize_kernel_params(params)
+def format_param_tokens(
+    params: dict | None,
+    *,
+    horizon: int | None = None,
+    max_lag: int | None = None,
+    max_dur: int | None = None,
+    max_hl: int | None = None,
+    amp_table: list[float] | None = None,
+    max_amp_bin: int | None = None,
+) -> str:
+    p = sanitize_kernel_params(
+        params,
+        horizon=horizon,
+        max_lag=max_lag,
+        max_dur=max_dur,
+        max_hl=max_hl,
+        amp_table=amp_table,
+        max_amp_bin=max_amp_bin,
+    )
     return (
         f"<REL_{int(p['rel'])}> "
         f"<SIGN_{str(p['sign']).upper()}> "
@@ -224,7 +311,16 @@ def format_param_tokens(params: dict | None) -> str:
     )
 
 
-def parse_param_tokens(text: str | None) -> dict:
+def parse_param_tokens(
+    text: str | None,
+    *,
+    horizon: int | None = None,
+    max_lag: int | None = None,
+    max_dur: int | None = None,
+    max_hl: int | None = None,
+    amp_table: list[float] | None = None,
+    max_amp_bin: int | None = None,
+) -> dict:
     s = str(text or "").upper()
     p = default_kernel_params()
     has_rel = False
@@ -246,25 +342,32 @@ def parse_param_tokens(text: str | None) -> dict:
 
     m_lag = re.search(r"(?:<)?LAG_(\d+)(?:>)?", s)
     if m_lag:
-        p["lag"] = _clamp_int(int(m_lag.group(1)), 0, 6)
+        p["lag"] = int(m_lag.group(1))
 
     m_hl = re.search(r"(?:<)?HL_(\d+)(?:>)?", s)
     if m_hl:
-        hl = int(m_hl.group(1))
-        p["half_life"] = hl if hl in HALF_LIFE_VALUES else 1
+        p["half_life"] = int(m_hl.group(1))
 
     m_dur = re.search(r"(?:<)?DUR_(\d+)(?:>)?", s)
     if m_dur:
-        p["dur"] = _clamp_int(int(m_dur.group(1)), 0, 6)
+        p["dur"] = int(m_dur.group(1))
 
     m_amp = re.search(r"(?:<)?AMP_(\d+)(?:>)?", s)
     if m_amp:
         has_amp = True
-        p["amp_bin"] = _clamp_int(int(m_amp.group(1)), 0, 20)
+        p["amp_bin"] = int(m_amp.group(1))
 
     # Robust fallback: when generation contains AMP but misses REL token,
     # treat non-zero amplitude as relevant.
     if (not has_rel) and has_amp and int(p.get("amp_bin", 0)) > 0:
         p["rel"] = 1
 
-    return sanitize_kernel_params(p)
+    return sanitize_kernel_params(
+        p,
+        horizon=horizon,
+        max_lag=max_lag,
+        max_dur=max_dur,
+        max_hl=max_hl,
+        amp_table=amp_table,
+        max_amp_bin=max_amp_bin,
+    )

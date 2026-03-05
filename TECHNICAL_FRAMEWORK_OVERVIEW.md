@@ -117,11 +117,18 @@ checkpoint:
 
 - `REL ∈ {0,1}`
 - `SIGN ∈ {UP,DOWN}`
-- `SHAPE ∈ {SPIKE, STEP_DECAY, RAMP_DECAY}`
-- `LAG ∈ [0..6]`
-- `HALF_LIFE ∈ {1,2,4,8,16,32}`
-- `DUR ∈ [0..6]`
-- `AMP_BIN ∈ [0..20]`
+- `SHAPE` token 语法: `{SPIKE, STEP_DECAY, RAMP_DECAY}`
+- `kernel_fitter` 自动拟合搜索空间: `{STEP_DECAY, RAMP_DECAY}`（当前实现不在自动拟合中搜索 `SPIKE`）
+- `LAG ∈ [0..max_lag]`（默认 `max_lag=min(H-1, 96)`）
+- `HALF_LIFE ∈ [1..max_hl]`（默认 `max_hl=256`）
+- `DUR ∈ [0..max_dur]`（默认 `max_dur=min(H-1, 96)`）
+- `AMP_BIN ∈ [0..B-1]`（`B=len(amp_table)`，通常由 `kernel_amp_bins` 决定）
+
+兼容性说明:
+
+- token 顺序与格式保持不变: `<REL_?> <SIGN_?> <SHAPE_?> <LAG_?> <HL_?> <DUR_?> <AMP_?>`
+- `parse/format/sanitize` 仍兼容旧 checkpoint/旧日志，只是参数可用范围扩大
+- 解析器容错不完整尖括号（如 `REL_1>`）；当缺失 `REL` 但出现 `AMP_x(x>0)` 时会按 `REL=1` 兜底
 
 核函数定义（`tau=0..H-1`, `t=max(0, tau-lag)`）:
 
@@ -137,6 +144,7 @@ checkpoint:
 
 - 训练集 residual 统计生成 `AMP table`（分位数）。
 - 推理时通过 `AMP_BIN` 查表取幅度。
+- `quantize_amp_to_bin` 与参数清洗按 `len(amp_table)` 动态裁剪，不再硬限制 `<=20`。
 - `delta` 最终 clip 区间由 `--delta_clip` 控制（对称 `[-delta_clip, +delta_clip]`；`<=0` 视为不裁剪）。
 
 ### 3.2.4 Kernel 自动标注（不依赖 teacher）
@@ -146,18 +154,26 @@ checkpoint:
 1. `raw_residual = target_z - base_pred`
 2. 若残差范数低于阈值，置 `REL=0`（其余参数默认，`delta=0`）
 3. 否则先定 `SIGN`（由残差均值符号）
-4. 对 `SHAPE/LAG/HALF_LIFE/DUR` 网格搜索
-5. 每组参数用闭式投影求幅度:
+4. 粗搜索（coarse）:
+   `(STEP_DECAY|RAMP_DECAY) × LAG_coarse × HALF_LIFE_coarse × DUR_coarse`
+   - `LAG/DUR` 在 `0..max_lag/max_dur` 上按 `coarse_stride`（默认 4）采样
+   - `HALF_LIFE` 使用对数尺度候选（如 `1,2,4,8,...`，并裁到 `max_hl`）
+5. 在 coarse 最优点附近做细化（refine）:
+   - `lag/dur` 在邻域 `[best-r, best+r]`（默认 `r=4`）逐点搜索
+   - `half_life` 在 coarse 相邻档与局部邻域内搜索
+6. 每组候选用闭式投影求幅度:
    `a* = clip((y·k)/(k·k), 0, a_max)`
-6. 计算改进量门槛:
+7. 计算改进量门槛:
    - `baseline_err = ||y||^2`
    - `improve = baseline_err - best_err`
    - 若 `improve < max(rel_improve_abs, rel_improve_ratio * baseline_err)`，回退为 `REL=0`
-7. 取通过门槛的最优组合并量化成 `AMP_BIN`
+8. 取通过门槛的最优组合并量化成 `AMP_BIN`
 
 补充约束:
 
 - 对 `has_news=0` 样本，构建阶段强制 `REL=0`（`force_rel0=True`），避免“无新闻却有修正”的伪标签。
+- 返回参数键保持不变: `rel/sign/shape/lag/half_life/dur/amp_bin`。
+- 若 API priors 给出 `shape_candidates` 含 `SPIKE`，在当前拟合实现中会被搜索空间约束过滤（仅保留 `STEP_DECAY/RAMP_DECAY`）。
 
 标签 token 形式:
 
@@ -165,23 +181,39 @@ checkpoint:
 
 ### 3.2.5 API 边界样本复标（可选）
 
-当前实现支持在自动标注后接入外部 API（默认关闭），仅对不确定样本做 `REL/SIGN` 复标，以提升标签质量并控制成本。
+当前实现支持在自动标注后接入外部 API，分为两条路径，并通过 `kernel_api_type={priors,relsign,both}` 控制（默认 `both`）。
 
 触发样本（任一满足）:
 
-- `abs(rel_norm - kernel_rel_norm_thresh) <= kernel_api_uncertain_band`
-- 自动标注为 `REL=1` 且 `AMP_BIN <= kernel_api_low_amp_bin`
+- `priors` 路径（高价值样本）:
+  - `has_news=1`
+  - 且满足 `rel_norm >= kernel_api_prior_rel_norm_thresh`（当该阈值 `<=0` 时回退到 `kernel_rel_norm_thresh`）或 `peak_abs >= kernel_api_prior_peak_thresh`（内部动态参数，默认 `max(1.0, 2*rel_thresh)`）
+- `relsign` 路径（不确定样本）:
+  - `abs(rel_norm - kernel_rel_norm_thresh) <= kernel_api_uncertain_band`
+  - 或自动标注为 `REL=1` 且 `AMP_BIN <= kernel_api_low_amp_bin`
 
 API 使用策略:
 
-- 目标: 仅做“是否相关（REL）/方向（SIGN）”校验，保留自动拟合的 `SHAPE/LAG/HL/DUR/AMP`。
+- `priors` 目标: 生成 `causal/sign/shape_candidates/delay/duration/half_life/strength` 先验，并在 kernel 参数拟合中使用（当前 `shape_candidates` 实际参与搜索的形状仍受 `SHAPE_VALUES` 约束）。
+- `relsign` 目标: 做“是否相关（REL）/方向（SIGN）”校验，保留自动拟合的 `SHAPE/LAG/HL/DUR/AMP`。
 - 合并策略（保守）:
   - 允许将 `REL` 从 1 下调到 0。
   - 当 `REL` 仍为 1 时可修正 `SIGN`。
   - 不自动把 `REL=0` 上调为 `REL=1`，避免过修正。
-- 预算控制: `kernel_api_max_calls`
-- 进度日志: 每 `kernel_api_log_every` 次调用输出一次
+- 模型策略: dataset 构建阶段固定使用 `gpt-5.1`；若 `kernel_api_model` 传入其他值，会在日志提示“ignored”。
+- token 限制参数兼容: priors API 调用会优先用 `max_completion_tokens`（`gpt-5.*`），并在不支持时自动回退 `max_tokens`。
+- 预算控制: `kernel_api_max_calls`（`priors` 与 `relsign` 共享同一预算池）
+- 进度日志: 每 `kernel_api_log_every` 次调用输出一次，包含 `ok_calls/fail_calls/last_error/fail_top/prompt_tokens/completion_tokens/cost_usd_est`
+- 实时失败样本日志: `[KERNEL_API][FAIL_SAMPLE][i] ...`（上限由 `kernel_api_live_fail_log_max` 控制）
 - 结果缓存: `checkpoints/<task>/sft_kernel_api_cache.json`
+- 计数字段含义:
+  - `calls`: API 尝试调用次数（不等于有效返回次数）
+  - `cache_hits`: 从缓存读取到可用对象的次数（含 `priors` 与 `relsign`）
+  - `priors_applied`: API 返回并通过先验清洗校验后成功应用的次数
+  - `priors_force_rel0`: 先验判定 `causal=0` 并强制 `REL=0` 的次数
+  - `relsign_applied`: `REL/SIGN` 合并后确实改动自动参数的次数
+  - `ok_calls/fail_calls`: API 元信息层面的成功/失败次数（用于快速诊断）
+  - `prompt_tokens/completion_tokens/cost_usd_est`: 运行期 token 与美元估算累计值（按配置单价估算）
 
 ### 3.2.6 Kernel 训练与推理路径
 
@@ -193,6 +225,12 @@ API 使用策略:
 - 每个 epoch 结束后立即在验证集评估（`evaluate_metrics_kernel_tokens`）
 - 按 `reward_metric` 维护 best checkpoint，并支持 `early_stop_patience` 提前停止
 - 最终测试前优先重载 `best_delta_<task>`，避免“最后一轮覆盖最优轮”
+
+缓存与样本数说明:
+
+- 日志 `formatted samples` 直接等于 `len(sft_data_kernel)`，而 `sft_data_kernel` 与 `kernel_samples` 是 1:1 转换。
+- 若命中 `sft_kernel_cache.json`，样本数来自缓存文件，不会因本次 `--stride` 变化而自动变化。
+- 要让新 `stride/history_len/horizon` 生效，需要删除或更换 `kernel_cache_file`（建议同步更换 `kernel_amp_table_file`）。
 
 推理:
 
@@ -214,7 +252,7 @@ API 使用策略:
 排障经验:
 
 - 若出现 `amp_nonzero_rate=0` 且 `mean_abs_delta=0`，通常表示 AMP token 未成功生成/解析，模型退化为 `delta=0`（预测退回 base）。
-- 首先检查 `--kernel_gen_max_new_tokens` 是否过小（当前 NSW 脚本默认已提升到 `96`）。
+- 首先检查 `--kernel_gen_max_new_tokens` 是否过小（当前 NSW 脚本默认已提升到 `128`）。
 - 解析器已增加兜底: 若生成文本含 `AMP_x (x>0)` 但缺失 `REL`，会按 `REL=1` 处理，减少“有幅度却被当作无效修正”的解析偏差。
 
 实现文件:
@@ -257,7 +295,20 @@ API 使用策略:
     - `--kernel_api_uncertain_band`
     - `--kernel_api_low_amp_bin`
     - `--kernel_api_log_every`
+    - `--kernel_api_log_examples`
+    - `--kernel_api_live_fail_log_max`
+    - `--kernel_api_price_in_per_1m`
+    - `--kernel_api_price_out_per_1m`
     - `--kernel_api_cache_file`
+    - `--kernel_api_type`
+    - `--kernel_api_prior_rel_norm_thresh`
+  - 内部动态范围参数（当前通过 `getattr(args, ...)` 读取；`run.py` 尚未显式暴露同名 CLI 参数）:
+    - `kernel_max_lag`（默认 96）
+    - `kernel_max_dur`（默认 96）
+    - `kernel_max_hl`（默认 256）
+    - `kernel_coarse_stride`（默认 4）
+    - `kernel_refine_radius`（默认 4）
+    - `kernel_api_prior_peak_thresh`（默认 `max(1.0, 2*kernel_api_prior_rel_norm_thresh)` 的回退逻辑）
   - 关键词说明:
     - 已移除 `--keyword_path`；主流程不再读取关键词文件。
     - `utility_keyword_weight` 参数仍保留兼容定义，但在当前 NSW kernel 主流程里 `policy_kw=[]`，关键词覆盖分量默认不产生贡献。
@@ -267,29 +318,34 @@ API 使用策略:
   - 说明:
     - 当前 `run.py` 未单独暴露 `--sft_batch_size/--sft_max_seq_len`。
     - kernel SFT 的 batch size 默认由 trainer 内部 `getattr(args, "sft_batch_size", 1)` 读取，脚本默认等效为 `1`。
+    - API key 读取顺序（dataset 构建阶段）: `.secrets/api_key.txt` -> `--kernel_api_key` -> `OPENAI_API_KEY`。
 
-- [`scripts/nswelecload_new.sh`](/home/brucebi/Projects/REIN-LLM-Forecast/scripts/nswelecload_new.sh)
+- [`scripts/nswelecload_new_2.sh`](/home/brucebi/Projects/REIN-LLM-Forecast/scripts/nswelecload_new_2.sh)
   - NSW 任务实验脚本
   - 组合超参并批量调用 `python run.py`
-  - 当前默认固定单卡: `export CUDA_VISIBLE_DEVICES=1`（可按机器修改）
+  - 默认单卡: `CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"`（可通过环境变量覆盖）
   - 当前默认（kernel-only）:
     - `STAGE=all`
     - `DELTA_MODE=kernel_tokens`
     - `DELTA_FUSION_MODE=mul_z`
-    - `DELTA_MUL_SCALE=0.5`
-    - `DELTA_MUL_COEFF_MIN=0.90`
-    - `DELTA_MUL_COEFF_MAX=1.10`
+    - `DELTA_MUL_SCALE=0.1`
+    - `DELTA_MUL_COEFF_MIN=0.80`
+    - `DELTA_MUL_COEFF_MAX=1.20`
     - `DELTA_CLIP=0.5`
-    - `STRIDE=1`
+    - `STRIDE=192`
     - `NEWS_TOPK=999`
     - `DEFAULT_POLICY=all`
     - `RL_USE=0`（脚本固定关闭 RL/bandit 训练分支）
+    - `BASE_EPOCHS=20`
     - `DELTA_EPOCHS=20`（kernel LoRA 最大训练轮数；可能因 early stop 提前结束）
     - `LOAD_IN_4BIT=1` + `GRADIENT_CHECKPOINTING=1`（显存保守配置）
     - `KERNEL_REL_IMPROVE_RATIO=0.10`（自动标注改进门槛）
     - `KERNEL_REL_IMPROVE_ABS=0.0`
     - `KERNEL_GEN_MAX_NEW_TOKENS=128`（避免 token 截断导致 AMP 缺失）
-    - `KERNEL_API_ENABLE=0`（默认不调用外部 API）
+    - `KERNEL_API_ENABLE=1`（默认启用 API 复标）
+    - `KERNEL_API_MODEL=gpt-5.1`（dataset 阶段固定模型同为 `gpt-5.1`）
+    - `KERNEL_API_MAX_CALLS=400`
+    - `KERNEL_API_KEY_FILE=.secrets/openai_api_key.txt`
     - `taskName` 自动追加 `_kernelTok`，避免与旧日志混写
     - 当 `KERNEL_API_ENABLE=1` 且未手动改 cache 名时，脚本会自动切到 `sft_kernel_cache_api.json`，避免误命中旧缓存
 
@@ -354,7 +410,7 @@ API 使用策略:
   - 参数 token 解析与校验、冲击核计算、AMP table 管理
 
 - [`src/sft/kernel_fitter.py`](/home/brucebi/Projects/REIN-LLM-Forecast/src/sft/kernel_fitter.py)
-  - residual -> 离散参数自动拟合（网格搜索 + 幅度投影）
+  - residual -> 离散参数自动拟合（coarse-to-fine + 幅度投影）
 
 - [`src/sft/sft_kernel_dataset.py`](/home/brucebi/Projects/REIN-LLM-Forecast/src/sft/sft_kernel_dataset.py)
   - kernel prompt 构建、参数 token 标签构建、kernel SFT 数据格式化
@@ -407,16 +463,20 @@ API 使用策略:
 
 ## 7. 当前默认运行拓扑（NSW 脚本）
 
-以 [`scripts/nswelecload_new.sh`](/home/brucebi/Projects/REIN-LLM-Forecast/scripts/nswelecload_new.sh) 当前默认配置为例:
+以 [`scripts/nswelecload_new_2.sh`](/home/brucebi/Projects/REIN-LLM-Forecast/scripts/nswelecload_new_2.sh) 当前默认配置为例:
 
 1. `stage=all`：默认先训练/验证 base，再进入 delta 阶段。
 2. `delta_mode=kernel_tokens`：默认走参数 token + impact-kernel 推理链路。
 3. `delta_fusion_mode=mul_z`：默认在 z-space 使用乘法融合（可切换到 `add` 或 `mul_raw`）。
-4. 默认单卡运行（`CUDA_VISIBLE_DEVICES=1`），并启用 `4bit + gradient checkpointing`。
+4. 默认单卡运行（`CUDA_VISIBLE_DEVICES` 未显式设置时默认 `0`），并启用 `4bit + gradient checkpointing`。
 5. `rl_use=0`：默认不启用 RL/bandit 训练分支。
 6. `delta_epochs=20`：kernel LoRA 训练上限为 20 轮；每轮验证并支持 early stop。
 7. `taskName` 默认追加 `_kernelTok`，避免与旧 regression 日志/目录冲突。
 8. `kernel_gen_max_new_tokens=128`：减少参数 token 截断风险（尤其是 `AMP_*`）。
-9. 默认不启用 API 复标（`kernel_api_enable=0`）；开启后只对边界样本调用并走缓存复用。
+9. 默认启用 API 复标（`kernel_api_enable=1`），走 `priors/relsign` 双路径并使用缓存复用。
 10. 评估阶段默认开启终端进度条（`eval_progress_bar=1`，`eval_progress_leave=0`）。
 11. 日志文件名按 `taskName + base_backbone + kernel关键参数` 生成，便于直接从文件名识别实验配置。
+
+补充:
+
+- 默认 `STRIDE=192`，若需要刷新样本密度，请删除/更换 `sft_kernel_cache*.json` 后重建。

@@ -58,6 +58,7 @@ from .sft.impact_kernel import (
 from .sft.sft_kernel_dataset import (
     build_kernel_prompts_from_batch,
     build_kernel_sft_samples,
+    save_kernel_prompt_news_density,
     to_kernel_sft_format,
 )
 from .base_backbone import (
@@ -136,6 +137,8 @@ def _fuse_base_delta_z(
 
     scale = float(getattr(args, "delta_mul_scale", 1.0))
     coeff = 1.0 + scale * delta
+    # coeff = np.exp(scale * delta)
+
     coeff_min = float(getattr(args, "delta_mul_coeff_min", 0.05))
     coeff_max = float(getattr(args, "delta_mul_coeff_max", 3.0))
     if coeff_max < coeff_min:
@@ -481,6 +484,9 @@ def evaluate_metrics_kernel_tokens(
         pred_z_np = np.zeros_like(base_np, dtype=np.float32)
         parsed_list = []
         gen_text_list = []
+        max_lag = int(getattr(args, "kernel_max_lag", 96))
+        max_dur = int(getattr(args, "kernel_max_dur", 96))
+        max_hl = int(getattr(args, "kernel_max_hl", 256))
         for i in range(base_np.shape[0]):
             p_len = int(prompt_lens[i].item())
             if int(gen_ids.size(1)) > p_len:
@@ -493,7 +499,14 @@ def evaluate_metrics_kernel_tokens(
                 empty_gen_count += 1
             if re.search(r"(?:<)?(?:REL_|SIGN_|SHAPE_|LAG_|HL_|DUR_|AMP_)", gen_upper) is not None:
                 token_hit_count += 1
-            params = parse_param_tokens(gen_text)
+            params = parse_param_tokens(
+                gen_text,
+                horizon=H,
+                max_lag=max_lag,
+                max_dur=max_dur,
+                max_hl=max_hl,
+                amp_table=amp_table,
+            )
             if params == default_kernel_params() and gen_text.strip() == "":
                 # Explicitly keep REL=0 fallback on empty decode.
                 params = default_kernel_params()
@@ -515,6 +528,9 @@ def evaluate_metrics_kernel_tokens(
                 amp_table=amp_table,
                 clip_low=clip_low,
                 clip_high=clip_high,
+                max_lag=max_lag,
+                max_dur=max_dur,
+                max_hl=max_hl,
             )
             abs_delta_sum += float(np.abs(delta).sum())
             abs_delta_cnt += int(len(delta))
@@ -558,7 +574,14 @@ def evaluate_metrics_kernel_tokens(
                 rec = {
                     "test_prompt": prompts[i],
                     "generated_tokens": gen_text_list[i],
-                    "parsed_tokens": format_param_tokens(parsed_list[i]),
+                    "parsed_tokens": format_param_tokens(
+                        parsed_list[i],
+                        horizon=H,
+                        max_lag=max_lag,
+                        max_dur=max_dur,
+                        max_hl=max_hl,
+                        amp_table=amp_table,
+                    ),
                     "parsed_params": parsed_list[i],
                     "pred_z": [float(x) for x in pred_z_np[i].tolist()],
                     "pred": [float(x) for x in pred_denorm],
@@ -2402,6 +2425,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 )
             except Exception as e:
                 live_logger.info(f"[KERNEL_SFT] failed to save cache or amp table: {e}")
+
+        save_kernel_prompt_news_density(
+            samples=kernel_samples,
+            task_name=str(getattr(args, "taskName", "task")),
+            live_logger=live_logger,
+        )
 
         sft_data_kernel = to_kernel_sft_format(kernel_samples, tokenizer, args)
         live_logger.info(

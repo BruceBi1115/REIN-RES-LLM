@@ -73,32 +73,32 @@ TEST_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_testset.csv"
 NEWS_TEXT_COL="summary"
 NEWS_TIME_COL="publication_time"
 
-DELTA_EPOCHS="2"
+DELTA_EPOCHS="20"
 BASE_EPOCHS="20"
 # NEWS_WINDOW_DAYS="7"
 NEWS_TOPM="999"
 NEWS_TOPK="999"
 BATCH_SIZE="1"
 GPU_ID="${GPU_ID:-0}"
-DEFAULT_POLICY="base"
+DEFAULT_POLICY="all"
 
 TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 
 # Keep task settings aligned with your existing NSW scripts.
 RESIDUAL_LOSS="smooth_l1"
 REWARD_METRIC="mae"
-STRIDE="1"
+STRIDE="192"
 HORIZON="48"
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
 STAGE="all"
-DELTA_VAL_MODE="${DELTA_VAL_MODE:-none}"  # each_epoch | end_only | none
+DELTA_VAL_MODE="${DELTA_VAL_MODE:-each_epoch}"  # each_epoch | end_only | none
 DELTA_MODE="${DELTA_MODE:-kernel_tokens}"  # kernel-only experiment
 DELTA_FUSION_MODE="${DELTA_FUSION_MODE:-mul_z}"  # add | mul_z | mul_raw
 # Stability-first defaults for multiplicative fusion.
-DELTA_MUL_SCALE="${DELTA_MUL_SCALE:-0.1}"
-DELTA_MUL_COEFF_MIN="${DELTA_MUL_COEFF_MIN:-0.80}"
-DELTA_MUL_COEFF_MAX="${DELTA_MUL_COEFF_MAX:-1.20}"
+DELTA_MUL_SCALE="${DELTA_MUL_SCALE:-1.0}"
+DELTA_MUL_COEFF_MIN="${DELTA_MUL_COEFF_MIN:-0.00}"
+DELTA_MUL_COEFF_MAX="${DELTA_MUL_COEFF_MAX:-3.0}"
 DELTA_CLIP="${DELTA_CLIP:-0.5}"
 # Memory-safe defaults for 8B + SFT on limited VRAM.
 LOAD_IN_4BIT="${LOAD_IN_4BIT:-1}"
@@ -115,16 +115,16 @@ KERNEL_AMP_TABLE_FILE="${KERNEL_AMP_TABLE_FILE:-kernel_amp_table.json}"
 KERNEL_SFT_LR="${KERNEL_SFT_LR:-1e-5}"
 
 KERNEL_GEN_MAX_NEW_TOKENS="${KERNEL_GEN_MAX_NEW_TOKENS:-128}"
-KERNEL_API_ENABLE="${KERNEL_API_ENABLE:-0}"
-KERNEL_API_MODEL="${KERNEL_API_MODEL:-gpt-4o}"
+KERNEL_API_ENABLE="${KERNEL_API_ENABLE:-1}"
+KERNEL_API_MODEL="${KERNEL_API_MODEL:-gpt-5.1}"
 KERNEL_API_TEMPERATURE="${KERNEL_API_TEMPERATURE:-0.1}"
-KERNEL_API_MAX_CALLS="${KERNEL_API_MAX_CALLS:-200}"
+KERNEL_API_MAX_CALLS="${KERNEL_API_MAX_CALLS:-400}"
 KERNEL_API_UNCERTAIN_BAND="${KERNEL_API_UNCERTAIN_BAND:-0.02}"
 KERNEL_API_LOW_AMP_BIN="${KERNEL_API_LOW_AMP_BIN:-2}"
 KERNEL_API_LOG_EVERY="${KERNEL_API_LOG_EVERY:-10}"
 KERNEL_API_CACHE_FILE="${KERNEL_API_CACHE_FILE:-sft_kernel_api_cache.json}"
 KERNEL_API_KEY="${KERNEL_API_KEY:-${OPENAI_API_KEY:-}}"
-KERNEL_API_KEY_FILE="${KERNEL_API_KEY_FILE:-.secrets/gpt4o_api_key.txt}"
+KERNEL_API_KEY_FILE="${KERNEL_API_KEY_FILE:-.secrets/openai_api_key.txt}"
 if [[ -z "$KERNEL_API_KEY" && -f "$KERNEL_API_KEY_FILE" ]]; then
   KERNEL_API_KEY="$(tr -d ' \t\r\n' < "$KERNEL_API_KEY_FILE")"
 fi
@@ -162,12 +162,12 @@ UTILITY_SHOW_IN_PROMPT="1"
 # 2) Sweep spaces (same style as your original)
 # =======================
 TASK_NAMES=(
-  "[3]NSW_19_20_LOAD_gateCF"
+  "[192stride]NSW_19_20_LOAD"
 )
 
 NEWS_CHOICES=(
-  "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
-  # "dataset/FNT_2019_2020_combined.json"
+  # "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
+  "dataset/FNT_2019_2020_combined.json"
 )
 
 RUN_OR_NOT=(
