@@ -69,7 +69,7 @@ def record_test_results_csv(args, live_logger, mse, mae):
         p = f"./results"
         os.makedirs(p, exist_ok=True)
         csv_path = os.path.join(p, f"test_results.csv")
-        task = f"{args.taskName}_{args.stage}_s{args.stride}_h{args.horizon}_news_{args.news_path}_RL{args.rl_use}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}_{args.delta_null_lambda}_{args.delta_margin_lambda}_{args.delta_adv_margin}_base_{args.base_epochs}_delta_{args.delta_epochs}_lr_{args.lr}_gradacc_{args.grad_accum}_sche_{args.scheduler}_lookback_{args.news_window_days}_topK_{args.news_topK}"
+        task = f"{args.taskName}_{args.stage}_s{args.stride}_h{args.horizon}_news_{args.news_path}_RL{args.rl_use}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}_{args.delta_null_lambda}_{args.delta_cf_lambda}_{args.delta_cf_margin}_base_{args.base_epochs}_delta_{args.delta_epochs}_lr_{args.lr}_gradacc_{args.grad_accum}_sche_{args.scheduler}_lookback_{args.news_window_days}_topK_{args.news_topK}"
         if not os.path.exists(csv_path):
             with open(csv_path, "w", newline="") as csvfile:
                 writer = csv.writer(csvfile)

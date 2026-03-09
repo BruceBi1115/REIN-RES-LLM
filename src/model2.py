@@ -46,6 +46,7 @@ class TSForecastRegressor(nn.Module):
         delta_clip: float = 3.0,
         delta_news_tail_tokens: int = 160,
         delta_rel_floor: float = 0.05,
+        retrieval_feat_dim: int = 12,
     ):
         super().__init__()
         self.lm = lm
@@ -142,6 +143,21 @@ class TSForecastRegressor(nn.Module):
             nn.Dropout(float(head_dropout)),
             nn.LayerNorm(self.hidden_size),
         )
+        self.retrieval_feat_dim = int(max(0, retrieval_feat_dim))
+        if self.retrieval_feat_dim > 0:
+            self.retrieval_proj = nn.Linear(self.retrieval_feat_dim, self.hidden_size)
+            self.retrieval_gate_bias = nn.Linear(self.retrieval_feat_dim, self.horizon)
+            self.retrieval_rel_bias = nn.Linear(self.retrieval_feat_dim, 1)
+            nn.init.zeros_(self.retrieval_proj.weight)
+            nn.init.zeros_(self.retrieval_proj.bias)
+            nn.init.zeros_(self.retrieval_gate_bias.weight)
+            nn.init.zeros_(self.retrieval_gate_bias.bias)
+            nn.init.zeros_(self.retrieval_rel_bias.weight)
+            nn.init.zeros_(self.retrieval_rel_bias.bias)
+        else:
+            self.retrieval_proj = None
+            self.retrieval_gate_bias = None
+            self.retrieval_rel_bias = None
 
         # ---- loss knobs ----
         self.huber_beta = float(huber_beta)
@@ -255,6 +271,8 @@ class TSForecastRegressor(nn.Module):
         head_mode: str = "base",
         rel_targets: torch.Tensor | None = None,
         rel_lambda: float = 0.0,
+        retrieval_feats: torch.Tensor | None = None,
+        retrieval_gate_only: bool = False,
     ):
         # --- text token embeddings ---
         tok_emb = self.lm.get_input_embeddings()(input_ids)  # (B, T, H)
@@ -320,13 +338,41 @@ class TSForecastRegressor(nn.Module):
             delta_feat = torch.cat([pooled, text_tail, pooled * text_tail, pooled - text_tail], dim=-1)
             delta_feat = self.delta_fuse(delta_feat)
             rel_input = delta_feat
+            retrieval_weight = None
+            retrieval_gate_bias = None
+            retrieval_rel_bias = None
+
+            if self.retrieval_feat_dim > 0 and retrieval_feats is not None:
+                rf = retrieval_feats.to(device=delta_feat.device, dtype=delta_feat.dtype)
+                if rf.dim() == 1:
+                    rf = rf.unsqueeze(0)
+                if rf.size(-1) < self.retrieval_feat_dim:
+                    pad = rf.new_zeros(rf.size(0), self.retrieval_feat_dim - rf.size(-1))
+                    rf = torch.cat([rf, pad], dim=-1)
+                elif rf.size(-1) > self.retrieval_feat_dim:
+                    rf = rf[:, : self.retrieval_feat_dim]
+
+                if rf.size(-1) >= 2:
+                    retrieval_weight = (rf[:, :1] * rf[:, 1:2]).clamp(0.0, 1.0)
+                elif rf.size(-1) == 1:
+                    retrieval_weight = rf[:, :1].clamp(0.0, 1.0)
+                else:
+                    retrieval_weight = rf.new_zeros((rf.size(0), 1))
+
+                retrieval_gate_bias = self.retrieval_gate_bias(rf) * retrieval_weight
+                retrieval_rel_bias = self.retrieval_rel_bias(rf).squeeze(-1) * retrieval_weight.squeeze(-1)
+                if not retrieval_gate_only:
+                    delta_feat = delta_feat + self.retrieval_proj(rf) * retrieval_weight
 
             if isinstance(self.delta_head, nn.Linear):
                 raw_delta = self.delta_head(self.delta_head_drop(delta_feat))
             else:
                 raw_delta = self.delta_head(delta_feat)
 
-            delta_gate = torch.sigmoid(self.delta_gate(delta_feat))
+            delta_gate_logits = self.delta_gate(delta_feat)
+            if retrieval_gate_bias is not None:
+                delta_gate_logits = delta_gate_logits + retrieval_gate_bias
+            delta_gate = torch.sigmoid(delta_gate_logits)
             delta_scale = torch.exp(self.delta_log_scale).to(device=raw_delta.device, dtype=raw_delta.dtype).clamp(max=5.0)
             if self.delta_internal_gate:
                 pred = raw_delta * delta_gate * delta_scale
@@ -342,6 +388,8 @@ class TSForecastRegressor(nn.Module):
         # relevance
         pred = pred.to(torch.float32)
         rel_logit = self.rel_head(rel_input).squeeze(-1)  # (B,)
+        if head_mode == "delta" and retrieval_rel_bias is not None:
+            rel_logit = rel_logit + retrieval_rel_bias
         pred = pred.to(torch.float32)
         rel_logit = rel_logit.to(torch.float32)
 
@@ -352,6 +400,8 @@ class TSForecastRegressor(nn.Module):
             out["delta_scale"] = delta_scale.detach()
             out["delta_rel_gate_mean"] = rel_gate.mean().detach()
             out["delta_internal_gate"] = int(self.delta_internal_gate)
+            if retrieval_weight is not None:
+                out["retrieval_weight_mean"] = retrieval_weight.mean().detach()
 
         # losses
         loss = None
@@ -417,6 +467,7 @@ def load_llama_lora(
     delta_clip: float = 3.0,
     delta_news_tail_tokens: int = 160,
     delta_rel_floor: float = 0.05,
+    retrieval_feat_dim: int = 12,
 ):
     tok = AutoTokenizer.from_pretrained(tokenizer_id or base_model, use_fast=True)
 
@@ -474,6 +525,7 @@ def load_llama_lora(
         delta_clip=float(delta_clip),
         delta_news_tail_tokens=int(delta_news_tail_tokens),
         delta_rel_floor=float(delta_rel_floor),
+        retrieval_feat_dim=int(retrieval_feat_dim),
     )
 
     return tok, model
@@ -526,6 +578,10 @@ def save_checkpoint(
             "delta_fuse": model.delta_fuse.state_dict(),
             "delta_text_ln": model.delta_text_ln.state_dict(),
             "rel_head": model.rel_head.state_dict(),
+            "retrieval_feat_dim": int(getattr(model, "retrieval_feat_dim", 0)),
+            "retrieval_proj": model.retrieval_proj.state_dict() if model.retrieval_proj is not None else None,
+            "retrieval_gate_bias": model.retrieval_gate_bias.state_dict() if model.retrieval_gate_bias is not None else None,
+            "retrieval_rel_bias": model.retrieval_rel_bias.state_dict() if model.retrieval_rel_bias is not None else None,
             # meta
             "horizon": model.horizon,
             "patch_dim": model.patch_dim,
@@ -559,6 +615,7 @@ def save_checkpoint(
         "delta_clip": float(getattr(model, "delta_clip", 3.0)),
         "delta_news_tail_tokens": int(getattr(model, "delta_news_tail_tokens", 160)),
         "delta_rel_floor": float(getattr(model, "delta_rel_floor", 0.05)),
+        "retrieval_feat_dim": int(getattr(model, "retrieval_feat_dim", 0)),
     }
     if isinstance(extra_meta, dict):
         for k, v in extra_meta.items():
@@ -608,6 +665,7 @@ def load_checkpoint(
     delta_clip = float(meta.get("delta_clip", 3.0))
     delta_news_tail_tokens = int(meta.get("delta_news_tail_tokens", 160))
     delta_rel_floor = float(meta.get("delta_rel_floor", 0.05))
+    retrieval_feat_dim = int(meta.get("retrieval_feat_dim", 12))
 
     tok = AutoTokenizer.from_pretrained(os.path.join(ckpt_dir, "tokenizer"), use_fast=True)
     if tok.pad_token is None:
@@ -648,6 +706,7 @@ def load_checkpoint(
         delta_clip=delta_clip,
         delta_news_tail_tokens=delta_news_tail_tokens,
         delta_rel_floor=delta_rel_floor,
+        retrieval_feat_dim=retrieval_feat_dim,
     )
 
     reg = torch.load(os.path.join(ckpt_dir, "regressor.pt"), map_location="cpu")
@@ -704,6 +763,13 @@ def load_checkpoint(
 
     if "rel_head" in reg:
         model.rel_head.load_state_dict(reg["rel_head"], strict=True)
+    if model.retrieval_proj is not None:
+        if reg.get("retrieval_proj", None) is not None:
+            model.retrieval_proj.load_state_dict(reg["retrieval_proj"], strict=True)
+        if reg.get("retrieval_gate_bias", None) is not None:
+            model.retrieval_gate_bias.load_state_dict(reg["retrieval_gate_bias"], strict=True)
+        if reg.get("retrieval_rel_bias", None) is not None:
+            model.retrieval_rel_bias.load_state_dict(reg["retrieval_rel_bias"], strict=True)
 
     # move custom parts to LM embed device/dtype
     emb = model.lm.get_input_embeddings().weight

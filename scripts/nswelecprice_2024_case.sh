@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 set -euo pipefail
 
 # =======================
@@ -61,20 +61,20 @@ fi
 echo "[env] Using PYTHON_BIN=$PYTHON_BIN"
 
 TIME_COL="SETTLEMENTDATE"
-VALUE_COL="TOTALDEMAND"
-UNIT="megawatts"
-DESCRIPTION="This dataset records the electricity load demand data in Australia NSW from 2019 to 2020, collected from National electricity market."
+VALUE_COL="RRP"
+UNIT="$/MWh"
+DESCRIPTION="This dataset records the electricity price data in Australia NSW from 2024, collected from National electricity market."
 REGION="Australia, NSW"
 
-TRAIN_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_trainset.csv"
-VAL_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_valset.csv"
-TEST_FILE="dataset/2019-2020NSWelecload/elecload_2019-2020_testset.csv"
+TRAIN_FILE="dataset/2024NSWelecprice/2024NSWelecprice_trainset.csv"
+VAL_FILE="dataset/2024NSWelecprice/2024NSWelecprice_valset.csv"
+TEST_FILE="dataset/2024NSWelecprice/2024NSWelecprice_testset.csv"
 
-NEWS_TEXT_COL="summary"
-NEWS_TIME_COL="publication_time"
+NEWS_TEXT_COL="content"
+NEWS_TIME_COL="date"
 
-DELTA_EPOCHS="20"
-BASE_EPOCHS="20"
+DELTA_EPOCHS="40"
+BASE_EPOCHS="40"
 # NEWS_WINDOW_DAYS="7"
 NEWS_TOPM="999"
 NEWS_TOPK="999"
@@ -87,55 +87,21 @@ TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 # Keep task settings aligned with your existing NSW scripts.
 RESIDUAL_LOSS="smooth_l1"
 REWARD_METRIC="mae"
-STRIDE="192"
-HORIZON="48"
+STRIDE="1"
+HORIZON="720"
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
-STAGE="all"
+STAGE="base"
 DELTA_VAL_MODE="${DELTA_VAL_MODE:-each_epoch}"  # each_epoch | end_only | none
-DELTA_MODE="${DELTA_MODE:-kernel_tokens}"  # kernel-only experiment
-DELTA_FUSION_MODE="${DELTA_FUSION_MODE:-mul_z}"  # add | mul_z | mul_raw
-# Stability-first defaults for multiplicative fusion.
-DELTA_MUL_SCALE="${DELTA_MUL_SCALE:-1.0}"
-DELTA_MUL_COEFF_MIN="${DELTA_MUL_COEFF_MIN:-0.00}"
-DELTA_MUL_COEFF_MAX="${DELTA_MUL_COEFF_MAX:-3.0}"
 DELTA_CLIP="${DELTA_CLIP:-0.5}"
 # Memory-safe defaults for 8B + SFT on limited VRAM.
 LOAD_IN_4BIT="${LOAD_IN_4BIT:-1}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
-KERNEL_REL_NORM_THRESH="${KERNEL_REL_NORM_THRESH:-0.05}"
-KERNEL_REL_IMPROVE_RATIO="${KERNEL_REL_IMPROVE_RATIO:-0.10}"
-KERNEL_REL_IMPROVE_ABS="${KERNEL_REL_IMPROVE_ABS:-0.0}"
-KERNEL_A_MAX="${KERNEL_A_MAX:-2.0}"
-KERNEL_AMP_BINS="${KERNEL_AMP_BINS:-21}"
-KERNEL_CACHE_FILE="${KERNEL_CACHE_FILE:-sft_kernel_cache.json}"
-KERNEL_AMP_TABLE_FILE="${KERNEL_AMP_TABLE_FILE:-kernel_amp_table.json}"
-
-# kernel lr
-KERNEL_SFT_LR="${KERNEL_SFT_LR:-1e-5}"
-
-KERNEL_GEN_MAX_NEW_TOKENS="${KERNEL_GEN_MAX_NEW_TOKENS:-128}"
-KERNEL_API_ENABLE="${KERNEL_API_ENABLE:-1}"
-KERNEL_API_MODEL="${KERNEL_API_MODEL:-gpt-5.1}"
-KERNEL_API_TEMPERATURE="${KERNEL_API_TEMPERATURE:-0.1}"
-KERNEL_API_MAX_CALLS="${KERNEL_API_MAX_CALLS:-400}"
-KERNEL_API_UNCERTAIN_BAND="${KERNEL_API_UNCERTAIN_BAND:-0.02}"
-KERNEL_API_LOW_AMP_BIN="${KERNEL_API_LOW_AMP_BIN:-2}"
-KERNEL_API_LOG_EVERY="${KERNEL_API_LOG_EVERY:-10}"
-KERNEL_API_CACHE_FILE="${KERNEL_API_CACHE_FILE:-sft_kernel_api_cache.json}"
-KERNEL_API_KEY="${KERNEL_API_KEY:-${OPENAI_API_KEY:-}}"
-KERNEL_API_KEY_FILE="${KERNEL_API_KEY_FILE:-.secrets/openai_api_key.txt}"
-if [[ -z "$KERNEL_API_KEY" && -f "$KERNEL_API_KEY_FILE" ]]; then
-  KERNEL_API_KEY="$(tr -d ' \t\r\n' < "$KERNEL_API_KEY_FILE")"
-fi
-if [[ "$KERNEL_API_ENABLE" == "1" && "$KERNEL_CACHE_FILE" == "sft_kernel_cache.json" ]]; then
-  KERNEL_CACHE_FILE="sft_kernel_cache_api.json"
-fi
 
 # pure TS base backbone (scheme2)
 BASE_BACKBONES=(
-  "dlinear"
-  # "mlp"
+  # "dlinear"
+  "mlp"
 )
 BASE_HIDDEN_DIM="256"
 BASE_MOVING_AVG="25"
@@ -144,7 +110,7 @@ BASE_LOSS="smooth_l1"
 BASE_LR="1e-3"
 BASE_WEIGHT_DECAY="1e-5"
 
-# News utility-rerank settings (used by kernel sample construction/inference prompt building)
+# News utility-rerank settings
 UTILITY_RERANK_ENABLE="1"
 UTILITY_KEYWORD_WEIGHT="0.35"
 UTILITY_RECENCY_WEIGHT="0.25"
@@ -158,16 +124,39 @@ UTILITY_KEEP_TOPK="-1"
 UTILITY_MIN_SCORE="-1.0"
 UTILITY_SHOW_IN_PROMPT="1"
 
+# Delta news extension hooks
+NEWS_REFINE_MODE="${NEWS_REFINE_MODE:-local}"                 # local | api
+DELTA_INCLUDE_STRUCTURED_NEWS="${DELTA_INCLUDE_STRUCTURED_NEWS:-1}"  # 1 to append structured fields
+NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-heuristic}"     # off | heuristic | api
+CASE_RETRIEVAL_ENABLE="${CASE_RETRIEVAL_ENABLE:-1}"           # 1 to enable retrieval hook
+CASE_RETRIEVAL_TOPK="${CASE_RETRIEVAL_TOPK:-3}"
+CASE_RETRIEVAL_MODE="${CASE_RETRIEVAL_MODE:-price_event}"      # off | price | price_event
+CASE_RETRIEVAL_ALPHA_PRICE="${CASE_RETRIEVAL_ALPHA_PRICE:-0.85}"
+CASE_RETRIEVAL_ALPHA_EVENT="${CASE_RETRIEVAL_ALPHA_EVENT:-0.15}"
+CASE_RETRIEVAL_MIN_TOP_SCORE="${CASE_RETRIEVAL_MIN_TOP_SCORE:-0.12}"
+CASE_RETRIEVAL_MIN_CANDIDATES="${CASE_RETRIEVAL_MIN_CANDIDATES:-2}"
+CASE_RETRIEVAL_MIN_DIR_AGREE="${CASE_RETRIEVAL_MIN_DIR_AGREE:-0.45}"
+CASE_RETRIEVAL_MAX_EVENT_MISMATCH="${CASE_RETRIEVAL_MAX_EVENT_MISMATCH:-0.80}"
+CASE_RETRIEVAL_FEATURE_DIM="${CASE_RETRIEVAL_FEATURE_DIM:-12}"
+CASE_RETRIEVAL_GATE_ONLY="${CASE_RETRIEVAL_GATE_ONLY:-0}"      # 1 => retrieval only assists gate/confidence
+CASE_RETRIEVAL_RUN_ABLATIONS="${CASE_RETRIEVAL_RUN_ABLATIONS:-1}"
+CASE_RETRIEVAL_ABLATION_SPLIT="${CASE_RETRIEVAL_ABLATION_SPLIT:-val}"  # val | test | both
+CASE_RETRIEVAL_STRONG_NEWS_THRESH="${CASE_RETRIEVAL_STRONG_NEWS_THRESH:-0.6}"
+
+DELTA_CF_LAMBDA="0.05"
+DELTA_CF_MARGIN="0.05"
+DELTA_GATE_REG_LAMBDA="0.05"
 # =======================
 # 2) Sweep spaces (same style as your original)
 # =======================
 TASK_NAMES=(
-  "[192stride]NSW_19_20_LOAD"
+  "[2024-nswelecPrice-case]"
 )
 
 NEWS_CHOICES=(
   # "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
-  "dataset/FNT_2019_2020_combined.json"
+  # "dataset/FNT_2019_2020_combined.json"
+  "dataset/news_2024_2025.json"
 )
 
 RUN_OR_NOT=(
@@ -201,12 +190,14 @@ GRAD_ACCS=(
 # 3) Shared args
 # =======================
 COMMON_ARGS=(
+  --delta_cf_lambda "$DELTA_CF_LAMBDA"
+  --delta_cf_margin "$DELTA_CF_MARGIN"
+  --delta_gate_reg_lambda "$DELTA_GATE_REG_LAMBDA"
   --time_col "$TIME_COL"
   --value_col "$VALUE_COL"
   --unit "$UNIT"
   --description "$DESCRIPTION"
   --region "$REGION"
-  --dayFirst
   --train_file "$TRAIN_FILE"
   --val_file "$VAL_FILE"
   --test_file "$TEST_FILE"
@@ -231,33 +222,27 @@ COMMON_ARGS=(
   --utility_keep_topk "$UTILITY_KEEP_TOPK"
   --utility_min_score "$UTILITY_MIN_SCORE"
   --utility_show_in_prompt "$UTILITY_SHOW_IN_PROMPT"
+  --news_refine_mode "$NEWS_REFINE_MODE"
+  --delta_include_structured_news "$DELTA_INCLUDE_STRUCTURED_NEWS"
+  --news_structured_mode "$NEWS_STRUCTURED_MODE"
+  --case_retrieval_enable "$CASE_RETRIEVAL_ENABLE"
+  --case_retrieval_topk "$CASE_RETRIEVAL_TOPK"
+  --case_retrieval_mode "$CASE_RETRIEVAL_MODE"
+  --case_retrieval_alpha_price "$CASE_RETRIEVAL_ALPHA_PRICE"
+  --case_retrieval_alpha_event "$CASE_RETRIEVAL_ALPHA_EVENT"
+  --case_retrieval_min_top_score "$CASE_RETRIEVAL_MIN_TOP_SCORE"
+  --case_retrieval_min_candidates "$CASE_RETRIEVAL_MIN_CANDIDATES"
+  --case_retrieval_min_dir_agree "$CASE_RETRIEVAL_MIN_DIR_AGREE"
+  --case_retrieval_max_event_mismatch "$CASE_RETRIEVAL_MAX_EVENT_MISMATCH"
+  --case_retrieval_feature_dim "$CASE_RETRIEVAL_FEATURE_DIM"
+  --case_retrieval_gate_only "$CASE_RETRIEVAL_GATE_ONLY"
+  --case_retrieval_run_ablations "$CASE_RETRIEVAL_RUN_ABLATIONS"
+  --case_retrieval_ablation_split "$CASE_RETRIEVAL_ABLATION_SPLIT"
+  --case_retrieval_strong_news_thresh "$CASE_RETRIEVAL_STRONG_NEWS_THRESH"
   --residual_loss "$RESIDUAL_LOSS"
   --stage "$STAGE"
   --delta_val_mode "$DELTA_VAL_MODE"
-  --delta_mode "$DELTA_MODE"
-  --delta_fusion_mode "$DELTA_FUSION_MODE"
-  --delta_mul_scale "$DELTA_MUL_SCALE"
-  --delta_mul_coeff_min "$DELTA_MUL_COEFF_MIN"
-  --delta_mul_coeff_max "$DELTA_MUL_COEFF_MAX"
   --delta_clip "$DELTA_CLIP"
-  --kernel_rel_norm_thresh "$KERNEL_REL_NORM_THRESH"
-  --kernel_rel_improve_ratio "$KERNEL_REL_IMPROVE_RATIO"
-  --kernel_rel_improve_abs "$KERNEL_REL_IMPROVE_ABS"
-  --kernel_a_max "$KERNEL_A_MAX"
-  --kernel_amp_bins "$KERNEL_AMP_BINS"
-  --kernel_cache_file "$KERNEL_CACHE_FILE"
-  --kernel_amp_table_file "$KERNEL_AMP_TABLE_FILE"
-  --kernel_sft_lr "$KERNEL_SFT_LR"
-  --kernel_gen_max_new_tokens "$KERNEL_GEN_MAX_NEW_TOKENS"
-  --kernel_api_enable "$KERNEL_API_ENABLE"
-  --kernel_api_key "$KERNEL_API_KEY"
-  --kernel_api_model "$KERNEL_API_MODEL"
-  --kernel_api_temperature "$KERNEL_API_TEMPERATURE"
-  --kernel_api_max_calls "$KERNEL_API_MAX_CALLS"
-  --kernel_api_uncertain_band "$KERNEL_API_UNCERTAIN_BAND"
-  --kernel_api_low_amp_bin "$KERNEL_API_LOW_AMP_BIN"
-  --kernel_api_log_every "$KERNEL_API_LOG_EVERY"
-  --kernel_api_cache_file "$KERNEL_API_CACHE_FILE"
 )
 
 # =======================
@@ -275,9 +260,6 @@ for i in "${!TASK_NAMES[@]}"; do
           for sch in "${SCHEDULERS[@]}"; do
             for grad_acc in "${GRAD_ACCS[@]}"; do
               run_task="${task}_${base_backbone}"
-              if [[ "$DELTA_MODE" == "kernel_tokens" ]]; then
-                run_task="${run_task}_kernelTok"
-              fi
               args=( --taskName "$run_task" --rl_use "0" "${COMMON_ARGS[@]}" )
 
               args+=( --news_path "${NEWS_CHOICES[$j]}" )

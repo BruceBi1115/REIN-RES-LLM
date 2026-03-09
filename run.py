@@ -11,9 +11,8 @@ if __name__ == '__main__':
     parser.add_argument('--rel_lambda', type=float, default=0.3, help='weight for relative loss')
     parser.add_argument('--rel_supervise_lambda', type=float, default=0.5,
                         help='weight for supervised rel_head BCE in delta stage')
-
-    parser.add_argument('--delta_null_lambda', type=float, default=0.0001, help='weight for ||delta_pred(no-news)|| shrink')
-    parser.add_argument('--delta_margin_lambda', type=float, default=1.0, help='weight for counterfactual margin loss')
+    
+    parser.add_argument('--delta_null_lambda', type=float, default=0.05)
     parser.add_argument('--delta_adv_margin', type=float, default=0.02, help='margin in z-space: err_null >= err_real + margin')
     parser.add_argument('--delta_non_degrade_lambda', type=float, default=1.0, help='weight for non-degradation guard vs base')
     parser.add_argument('--delta_non_degrade_margin', type=float, default=0.0, help='margin in z-space: err_real <= err_base - margin')
@@ -50,184 +49,61 @@ if __name__ == '__main__':
     parser.add_argument('--delta_other_lr_scale', type=float, default=0.5, help='lr scale for other trainable params in delta stage')
     parser.add_argument('--delta_freeze_feature_modules', type=int, default=0, choices=[0, 1],
                         help='freeze patch/pooling feature modules in delta stage (legacy behavior)')
-    parser.add_argument(
-        '--delta_mode',
-        type=str,
-        default='regression',
-        choices=['regression', 'kernel_tokens'],
-        help='delta prediction mode: regression head (legacy) or kernel parameter tokens',
-    )
-    parser.add_argument(
-        '--delta_fusion_mode',
-        type=str,
-        default='add',
-        choices=['add', 'mul_z', 'mul_raw'],
-        help='how to fuse base and delta in kernel eval/inference: add, multiplicative on z-space, or multiplicative on raw-space',
-    )
-    parser.add_argument(
-        '--delta_mul_scale',
-        type=float,
-        default=1.0,
-        help='scale on token-derived delta before multiplicative fusion (coeff = 1 + scale*delta)',
-    )
-    parser.add_argument(
-        '--delta_mul_coeff_min',
-        type=float,
-        default=0.05,
-        help='lower bound for multiplicative coefficient to avoid sign/zero collapse',
-    )
-    parser.add_argument(
-        '--delta_mul_coeff_max',
-        type=float,
-        default=3.0,
-        help='upper bound for multiplicative coefficient in mul_z fusion',
-    )
-    parser.add_argument(
-        '--kernel_amp_bins',
-        type=int,
-        default=21,
-        help='number of amplitude bins for kernel token mode; default supports AMP_0..AMP_20',
-    )
-    parser.add_argument(
-        '--kernel_rel_norm_thresh',
-        type=float,
-        default=0.05,
-        help='residual norm threshold for REL=0 in kernel fitter',
-    )
-    parser.add_argument(
-        '--kernel_rel_improve_ratio',
-        type=float,
-        default=0.0,
-        help='minimum relative SSE improvement (vs zero-kernel) required to keep REL=1',
-    )
-    parser.add_argument(
-        '--kernel_rel_improve_abs',
-        type=float,
-        default=0.0,
-        help='minimum absolute SSE improvement (vs zero-kernel) required to keep REL=1',
-    )
-    parser.add_argument(
-        '--kernel_a_max',
-        type=float,
-        default=2.0,
-        help='max projected amplitude in kernel fitter',
-    )
-    parser.add_argument(
-        '--kernel_sft_lr',
-        type=float,
-        default=1e-4,
-        help='learning rate for kernel token SFT training',
-    )
-    parser.add_argument(
-        '--kernel_gen_max_new_tokens',
-        type=int,
-        default=32,
-        help='max generated tokens for kernel parameter sequence at inference',
-    )
-    parser.add_argument(
-        '--kernel_api_enable',
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help='enable API-assisted relabeling for uncertain kernel SFT samples',
-    )
-    parser.add_argument(
-        '--kernel_api_key',
-        type=str,
-        default='',
-        help='API key for kernel relabeling; falls back to OPENAI_API_KEY when empty',
-    )
-    parser.add_argument(
-        '--kernel_api_model',
-        type=str,
-        default='gpt-5.1',
-        help='OpenAI model for kernel relabeling (dataset stage uses fixed chatgpt-5.1)',
-    )
-    parser.add_argument(
-        '--kernel_api_temperature',
-        type=float,
-        default=0.1,
-        help='temperature for API relabeling calls',
-    )
-    parser.add_argument(
-        '--kernel_api_max_calls',
-        type=int,
-        default=200,
-        help='max API calls during one kernel sample build; <0 means unlimited',
-    )
-    parser.add_argument(
-        '--kernel_api_uncertain_band',
-        type=float,
-        default=0.02,
-        help='query API when rel_norm is within this band around kernel_rel_norm_thresh',
-    )
-    parser.add_argument(
-        '--kernel_api_low_amp_bin',
-        type=int,
-        default=2,
-        help='query API when auto label is REL=1 but AMP bin is <= this threshold',
-    )
-    parser.add_argument(
-        '--kernel_api_log_every',
-        type=int,
-        default=10,
-        help='log API relabeling progress every N calls',
-    )
-    parser.add_argument(
-        '--kernel_api_log_examples',
-        type=int,
-        default=3,
-        help='log up to N API response examples for success/failure at dataset build end',
-    )
-    parser.add_argument(
-        '--kernel_api_live_fail_log_max',
-        type=int,
-        default=3,
-        help='log up to N live API failure samples during dataset build',
-    )
-    parser.add_argument(
-        '--kernel_api_price_in_per_1m',
-        type=float,
-        default=5.0,
-        help='estimated USD price per 1M input tokens for API cost logging',
-    )
-    parser.add_argument(
-        '--kernel_api_price_out_per_1m',
-        type=float,
-        default=15.0,
-        help='estimated USD price per 1M output tokens for API cost logging',
-    )
-    parser.add_argument(
-        '--kernel_cache_file',
-        type=str,
-        default='sft_kernel_cache.json',
-        help='cache file name for kernel-token SFT samples under checkpoints/<taskName>/',
-    )
-    parser.add_argument(
-        '--kernel_amp_table_file',
-        type=str,
-        default='kernel_amp_table.json',
-        help='amp table file name under checkpoints/<taskName>/ for kernel-token mode',
-    )
-    parser.add_argument(
-        '--kernel_api_cache_file',
-        type=str,
-        default='sft_kernel_api_cache.json',
-        help='API relabel cache file name under checkpoints/<taskName>/',
-    )
-    parser.add_argument(
-        '--kernel_api_type',
-        type=str,
-        default='both',
-        choices=['priors', 'relsign', 'both'],
-        help='dataset-stage API mode: priors-only, relsign-only, or both',
-    )
-    parser.add_argument(
-        '--kernel_api_prior_rel_norm_thresh',
-        type=float,
-        default=-1.0,
-        help='trigger priors API when rel_norm >= this value; <=0 uses kernel_rel_norm_thresh',
-    )
+    parser.add_argument('--delta_target_clip', type=float, default=0.0,
+                        help='optional clip for delta_target = target-base_pred in z-space; <=0 disables')
+    parser.add_argument('--delta_aux_lambda', type=float, default=0.0,
+                        help='weight for auxiliary delta regression loss on delta_pred vs delta_target')
+    parser.add_argument('--delta_aux_loss', type=str, default='mae', choices=['mse', 'mae', 'smooth_l1'],
+                        help='loss type for auxiliary delta regression')
+    parser.add_argument('--delta_gate_reg_lambda', type=float, default=0.0,
+                        help='weight for gate regularization to avoid overusing news')
+    parser.add_argument('--delta_cf_lambda', type=float, default=0.0,
+                        help='weight for counterfactual consistency loss (real-news vs null-news)')
+    parser.add_argument('--delta_cf_margin', type=float, default=0.0,
+                        help='counterfactual hinge margin in z-space')
+    parser.add_argument('--news_refine_mode', type=str, default='local', choices=['local', 'api'],
+                        help='news refinement backend; local is join+truncate fallback')
+    parser.add_argument('--news_structured_mode', type=str, default='off', choices=['off', 'heuristic', 'api'],
+                        help='structured event extraction backend')
+    parser.add_argument('--delta_include_structured_news', type=int, default=0, choices=[0, 1],
+                        help='append structured event fields to delta prompt news context')
+    parser.add_argument('--case_retrieval_enable', type=int, default=0, choices=[0, 1],
+                        help='enable case retrieval hook for delta input')
+    parser.add_argument('--case_retrieval_topk', type=int, default=0,
+                        help='top-k retrieval candidates for auxiliary retrieval features')
+    parser.add_argument('--case_retrieval_mode', type=str, default='price_event',
+                        choices=['off', 'price', 'price_event'],
+                        help='retrieval mode: no retrieval / price-only / price-first+event-rerank')
+    parser.add_argument('--case_retrieval_alpha_price', type=float, default=0.85,
+                        help='price similarity weight in retrieval rerank')
+    parser.add_argument('--case_retrieval_alpha_event', type=float, default=0.15,
+                        help='event similarity weight in retrieval rerank')
+    parser.add_argument('--case_retrieval_min_top_score', type=float, default=0.12,
+                        help='reject retrieval when top final score is below this threshold')
+    parser.add_argument('--case_retrieval_min_candidates', type=int, default=2,
+                        help='minimum reliable candidates required for retrieval validity')
+    parser.add_argument('--case_retrieval_min_dir_agree', type=float, default=0.45,
+                        help='reject retrieval when residual direction agreement is too low')
+    parser.add_argument('--case_retrieval_max_event_mismatch', type=float, default=0.80,
+                        help='reject retrieval when event mismatch rate is too high')
+    parser.add_argument('--case_retrieval_feature_dim', type=int, default=12,
+                        help='dimension of compact retrieval features passed to DELTA model')
+    parser.add_argument('--case_retrieval_gate_only', type=int, default=0, choices=[0, 1],
+                        help='use retrieval features only for gate/confidence branch')
+    parser.add_argument('--case_retrieval_bank_max', type=int, default=0,
+                        help='optional max number of train cases in case bank; <=0 means all')
+    parser.add_argument('--case_retrieval_save_bank', type=int, default=1, choices=[0, 1],
+                        help='save built train-only case bank under checkpoint directory')
+    parser.add_argument('--case_retrieval_run_ablations', type=int, default=1, choices=[0, 1],
+                        help='run retrieval ablations after DELTA training')
+    parser.add_argument('--case_retrieval_ablation_split', type=str, default='val', choices=['val', 'test', 'both'],
+                        help='which split to run retrieval ablations on')
+    parser.add_argument('--case_retrieval_strong_news_thresh', type=float, default=0.6,
+                        help='strong-news-impact threshold on rel pseudo-label for ablation reporting')
+    parser.add_argument('--hard_reflection_mode', type=str, default='off', choices=['off', 'api'],
+                        help='optional hard-sample reflection backend (offline utility hook)')
+    parser.add_argument('--hard_reflection_topk', type=int, default=8,
+                        help='number of hardest samples per epoch sent to reflection hook')
     parser.add_argument('--utility_rank_lambda', type=float, default=0.2,
                         help='weight for real-vs-null utility ranking loss on rel logits')
     parser.add_argument('--utility_rank_margin', type=float, default=0.10,
@@ -379,7 +255,7 @@ if __name__ == '__main__':
     parser.add_argument('--ucb_alpha', type=float, default=1.0, help='LinUCB alpha')
     parser.add_argument('--ts_v', type=float, default=1.0, help='LinTS prior scale v')
     parser.add_argument('--epsilon', type=float, default=0.05, help='epsilon-greedy fallback')
-    parser.add_argument('--news_rl_enable', type=int, default=1, choices=[0, 1],
+    parser.add_argument('--news_rl_enable', type=int, default=0, choices=[0, 1],
                         help='enable contextual bandit for per-prompt news item selection in delta stage')
     parser.add_argument('--news_rl_algo', type=str, default='auto', choices=['auto', 'lints', 'linucb'],
                         help='algo for news bandit; auto follows --rl_algo')
