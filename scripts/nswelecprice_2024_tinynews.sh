@@ -163,6 +163,38 @@ NEWS_CONV_DROPOUT="${NEWS_CONV_DROPOUT:-0.1}"
 NEWS_CONV_GATE_SCALE="${NEWS_CONV_GATE_SCALE:-1.0}"
 NEWS_CONV_RUN_ABLATIONS="${NEWS_CONV_RUN_ABLATIONS:-1}"
 NEWS_CONV_ABLATION_SPLIT="${NEWS_CONV_ABLATION_SPLIT:-val}"  # val | test | both
+DELTA_MODEL_VARIANT="${DELTA_MODEL_VARIANT:-tiny_news_ts}"
+TINY_NEWS_PRESET="${TINY_NEWS_PRESET:-tinyllama}"  # distilbert | gpt2 | tinyllama | custom
+TINY_NEWS_LOADER="${TINY_NEWS_LOADER:-auto}"        # auto | encoder | causal_lm
+TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-}"
+TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-}"
+TINY_NEWS_HIDDEN_SIZE="${TINY_NEWS_HIDDEN_SIZE:-256}"
+TINY_NEWS_TEXT_TRAINABLE="${TINY_NEWS_TEXT_TRAINABLE:-0}"
+
+case "$TINY_NEWS_PRESET" in
+  distilbert)
+    TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-distilbert-base-uncased}"
+    TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-distilbert-base-uncased}"
+    ;;
+  gpt2)
+    TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-gpt2}"
+    TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-gpt2}"
+    ;;
+  tinyllama)
+    TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}"
+    TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}"
+    ;;
+  custom)
+    TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-distilbert-base-uncased}"
+    TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-$TINY_NEWS_MODEL}"
+    ;;
+  *)
+    echo "[WARN] Unknown TINY_NEWS_PRESET=$TINY_NEWS_PRESET; fallback to distilbert" >&2
+    TINY_NEWS_PRESET="distilbert"
+    TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-distilbert-base-uncased}"
+    TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-distilbert-base-uncased}"
+    ;;
+esac
 
 DELTA_CF_LAMBDA="0.01"
 DELTA_CF_MARGIN="0.05"
@@ -175,7 +207,7 @@ DELTA_AUX_LAMBDA="0.05"
 # 2) Sweep spaces (same style as your original)
 # =======================
 TASK_NAMES=(
-  "[2024-nswelecPrice-case]"
+  "[2024-nswelecPrice-tinynews]"
 )
 
 NEWS_CHOICES=(
@@ -270,6 +302,13 @@ COMMON_ARGS=(
   --news_conv_gate_scale "$NEWS_CONV_GATE_SCALE"
   --news_conv_run_ablations "$NEWS_CONV_RUN_ABLATIONS"
   --news_conv_ablation_split "$NEWS_CONV_ABLATION_SPLIT"
+  --delta_model_variant "$DELTA_MODEL_VARIANT"
+  --tiny_news_model_preset "$TINY_NEWS_PRESET"
+  --tiny_news_model "$TINY_NEWS_MODEL"
+  --tiny_news_tokenizer "$TINY_NEWS_TOKENIZER"
+  --tiny_news_hidden_size "$TINY_NEWS_HIDDEN_SIZE"
+  --tiny_news_text_trainable "$TINY_NEWS_TEXT_TRAINABLE"
+  --tiny_news_loader "$TINY_NEWS_LOADER"
   --case_retrieval_enable "$CASE_RETRIEVAL_ENABLE"
   --case_retrieval_topk "$CASE_RETRIEVAL_TOPK"
   --case_retrieval_mode "$CASE_RETRIEVAL_MODE"

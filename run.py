@@ -29,6 +29,38 @@ if __name__ == '__main__':
     parser.add_argument('--delta_clip', type=float, default=3.0, help='tanh clip for delta outputs in z-space (<=0 to disable)')
     parser.add_argument('--delta_news_tail_tokens', type=int, default=160, help='how many tail text tokens to pool as news context')
     parser.add_argument('--delta_rel_floor', type=float, default=0.05, help='minimum multiplicative factor from relevance gate')
+    parser.add_argument('--news_conv_enable', type=int, default=0, choices=[0, 1],
+                        help='enable lightweight auxiliary news TextCNN encoder in DELTA branch')
+    parser.add_argument('--news_conv_max_items', type=int, default=8,
+                        help='max selected news items per sample for auxiliary news CNN')
+    parser.add_argument('--news_conv_text_max_tokens', type=int, default=96,
+                        help='max tokens per selected news item for auxiliary news CNN')
+    parser.add_argument('--news_conv_channels', type=int, default=64,
+                        help='TextCNN channel width for auxiliary news encoder')
+    parser.add_argument('--news_conv_dropout', type=float, default=0.1,
+                        help='dropout for auxiliary news CNN path')
+    parser.add_argument('--news_conv_gate_scale', type=float, default=1.0,
+                        help='scale factor for auxiliary news CNN gate-logit contribution')
+    parser.add_argument('--news_conv_run_ablations', type=int, default=1, choices=[0, 1],
+                        help='run news-conv ablations after DELTA training')
+    parser.add_argument('--news_conv_ablation_split', type=str, default='val', choices=['val', 'test', 'both'],
+                        help='which split to run news-conv ablations on')
+    parser.add_argument('--delta_model_variant', type=str, default='llama', choices=['llama', 'tiny_news_ts'],
+                        help='DELTA model branch: llama (current) or tiny_news_ts (small text model + TS)')
+    parser.add_argument('--tiny_news_model', type=str, default='distilbert-base-uncased',
+                        help='HF model id/local path for small text encoder in tiny_news_ts branch')
+    parser.add_argument('--tiny_news_model_preset', type=str, default='custom',
+                        choices=['custom', 'distilbert', 'gpt2', 'tinyllama'],
+                        help='preset for tiny news encoder model; custom uses tiny_news_model/tiny_news_tokenizer')
+    parser.add_argument('--tiny_news_tokenizer', type=str, default='',
+                        help='HF tokenizer id for tiny_news_ts branch (default: tiny_news_model)')
+    parser.add_argument('--tiny_news_hidden_size', type=int, default=256,
+                        help='fusion hidden size for tiny_news_ts branch')
+    parser.add_argument('--tiny_news_text_trainable', type=int, default=0, choices=[0, 1],
+                        help='whether to finetune tiny news text encoder during DELTA')
+    parser.add_argument('--tiny_news_loader', type=str, default='auto',
+                        choices=['auto', 'encoder', 'causal_lm'],
+                        help='loader type for tiny news encoder')
 
     parser.add_argument('--cf_pseudo_margin', type=float, default=0.01, help='counterfactual gain margin for pseudo labels')
     parser.add_argument('--cf_pseudo_temp', type=float, default=0.2, help='temperature for soft pseudo labels')
@@ -65,6 +97,16 @@ if __name__ == '__main__':
                         help='news refinement backend; local is join+truncate fallback')
     parser.add_argument('--news_structured_mode', type=str, default='off', choices=['off', 'heuristic', 'api'],
                         help='structured event extraction backend')
+    parser.add_argument('--news_api_model', type=str, default='gpt-5.1',
+                        help='OpenAI model name used by API adapter when news_*_mode=api')
+    parser.add_argument('--news_api_key_path', type=str, default='api_key.txt',
+                        help='path to API key file (used if OPENAI_API_KEY is not set)')
+    parser.add_argument('--news_api_base_url', type=str, default='',
+                        help='optional custom OpenAI-compatible base URL')
+    parser.add_argument('--news_api_timeout_sec', type=float, default=30.0,
+                        help='timeout for one API request in seconds')
+    parser.add_argument('--news_api_max_retries', type=int, default=2,
+                        help='max retries for one API request')
     parser.add_argument('--delta_include_structured_news', type=int, default=0, choices=[0, 1],
                         help='append structured event fields to delta prompt news context')
     parser.add_argument('--case_retrieval_enable', type=int, default=0, choices=[0, 1],

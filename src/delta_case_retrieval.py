@@ -609,6 +609,7 @@ def _build_news_context_for_case(
     tokenizer,
     policy_name: str,
     policy_kw: list[str] | None,
+    api_adapter: Any = None,
 ) -> tuple[str, dict]:
     if news_df is None or len(news_df) == 0:
         return "", {}
@@ -641,7 +642,7 @@ def _build_news_context_for_case(
         tokenizer=tokenizer,
         max_tokens=int(getattr(args, "token_budget", 700) * float(getattr(args, "token_budget_news_frac", 0.9))),
         mode=str(getattr(args, "news_refine_mode", "local")),
-        api_adapter=None,
+        api_adapter=api_adapter,
         context={"target_time": str(target_time), "region": str(getattr(args, "region", ""))},
     )
     if not refined_news:
@@ -649,10 +650,10 @@ def _build_news_context_for_case(
     events = extract_structured_events(
         raw_or_refined_news=refined_news,
         mode=str(getattr(args, "news_structured_mode", "off")),
-        api_adapter=None,
+        api_adapter=api_adapter,
         context={"target_time": str(target_time), "region": str(getattr(args, "region", ""))},
     )
-    return refined_news, normalize_structured_events(events)
+    return refined_news, events
 
 
 @torch.no_grad()
@@ -667,6 +668,7 @@ def build_case_bank(
     policy_name: str = "smart",
     policy_kw: list[str] | None = None,
     live_logger=None,
+    api_adapter: Any = None,
 ) -> dict:
     if base_model is None:
         return {"cases": [], "state_matrix": np.zeros((0, 0), dtype=np.float32)}
@@ -703,6 +705,7 @@ def build_case_bank(
                     tokenizer=tokenizer,
                     policy_name=policy_name,
                     policy_kw=policy_kw,
+                    api_adapter=api_adapter,
                 )
 
             case = build_case_record(
@@ -719,6 +722,8 @@ def build_case_bank(
                 },
             )
             cases.append(case)
+            with open("case711.json", "a", encoding="utf-8") as _f:
+                _f.write(json.dumps(case, ensure_ascii=False) + "\n")
             if bank_limit > 0 and len(cases) >= bank_limit:
                 break
         if bank_limit > 0 and len(cases) >= bank_limit:

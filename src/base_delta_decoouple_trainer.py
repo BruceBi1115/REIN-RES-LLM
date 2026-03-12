@@ -57,6 +57,7 @@ from .delta_news_hooks import (
     extract_structured_events,
     format_structured_events_for_prompt,
     reflect_hard_samples,
+    build_news_api_adapter,
 )
 from .delta_case_retrieval import (
     build_case_bank,
@@ -353,6 +354,58 @@ def _log_run_args(args, live_logger):
     live_logger.info("-----------------------------------------------------")
 
 
+def _log_enabled_mechanisms(args, live_logger, stage: str):
+    if live_logger is None:
+        return
+    stage_norm = str(stage or "").lower().strip()
+    delta_active = stage_norm in {"delta", "all"}
+
+    rl_tpl = int(getattr(args, "rl_use", 0)) == 1
+    rl_news = int(getattr(args, "news_rl_enable", 0)) == 1
+    if rl_tpl:
+        live_logger.info(
+            "[MECH][RL_TEMPLATE] configured (--rl_use=1), "
+            "but current Scheme2 keeps fixed template/policy so this bandit is not executed."
+        )
+    if rl_news:
+        if delta_active:
+            live_logger.info(
+                "[MECH][RL_NEWS] enabled: contextual news bandit is used in DELTA stage "
+                "to select news K and item subset for prompt construction."
+            )
+        else:
+            live_logger.info(
+                "[MECH][RL_NEWS] enabled in args, but current stage is BASE-only; "
+                "it will not be executed in this run."
+            )
+
+    retrieval_mode = _resolve_retrieval_mode(args)
+    if retrieval_mode != "off":
+        if delta_active:
+            live_logger.info(
+                "[MECH][CASE_RETRIEVAL] enabled: retrieve similar historical cases and build "
+                "auxiliary retrieval features for DELTA correction/gating/relevance."
+            )
+        else:
+            live_logger.info(
+                "[MECH][CASE_RETRIEVAL] enabled in args, but current stage is BASE-only; "
+                "it will not be executed in this run."
+            )
+
+    news_conv_enable = int(getattr(args, "news_conv_enable", 0)) == 1
+    if news_conv_enable:
+        if delta_active:
+            live_logger.info(
+                "[MECH][NEWS_CONV] enabled: auxiliary TextCNN encodes selected news "
+                "(text + age + rate), then provides extra DELTA feature fusion and rel-logit bias."
+            )
+        else:
+            live_logger.info(
+                "[MECH][NEWS_CONV] enabled in args, but current stage is BASE-only; "
+                "it will not be executed in this run."
+            )
+
+
 class NewsRLBanditSelector:
     """
     Contextual bandit for per-prompt news selection:
@@ -638,6 +691,7 @@ def _build_delta_optimizer(delta_model, args):
             or lname.startswith("delta_log_scale")
             or lname.startswith("rel_head")
             or lname.startswith("retrieval_")
+            or lname.startswith("news_conv")
         ):
             head_params.append(p)
         else:
@@ -800,6 +854,183 @@ def _pad_patches(
     return ts_patches, ts_patch_mask
 
 
+def _news_conv_pad_id(tokenizer) -> int:
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_id is None:
+        pad_id = 0
+    return int(pad_id)
+
+
+def _stable_text_seed(text: str) -> int:
+    s = str(text or "")
+    seed = 0
+    for i, ch in enumerate(s):
+        seed = (seed * 131 + ord(ch) + i) & 0xFFFFFFFF
+    return int(seed)
+
+
+def _clean_news_text_for_conv(text: str) -> str:
+    s = str(text or "")
+    if not s:
+        return ""
+    s = re.sub(r"https?://\S+|www\.\S+", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"[_\-]{3,}", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _split_refined_news_for_conv(refined_news: str, max_items: int) -> list[str]:
+    text = str(refined_news or "").strip()
+    if not text:
+        return []
+    items = []
+    for line in text.splitlines():
+        ln = re.sub(r"^\s*[-*•]+\s*", "", str(line).strip())
+        if not ln:
+            continue
+        if ln.lower().startswith("[structured event]"):
+            continue
+        ln = _clean_news_text_for_conv(ln)
+        if ln:
+            items.append(ln)
+        if len(items) >= int(max_items):
+            break
+    if items:
+        return items
+    chunks = re.split(r"(?<=[\.\!\?;])\s+", text)
+    for ck in chunks:
+        ck2 = _clean_news_text_for_conv(ck)
+        if ck2:
+            items.append(ck2)
+        if len(items) >= int(max_items):
+            break
+    return items
+
+
+def _shuffle_news_words_for_conv(text: str, seed: int) -> str:
+    toks = str(text or "").split()
+    if len(toks) <= 2:
+        return str(text or "")
+    rng = np.random.RandomState(int(seed) & 0xFFFFFFFF)
+    idx = np.arange(len(toks))
+    rng.shuffle(idx)
+    shuffled = [toks[int(i)] for i in idx.tolist()]
+    return " ".join(shuffled)
+
+
+def _prepare_conv_selected_news(
+    *,
+    selected: pd.DataFrame | None,
+    text_col: str,
+    refined_news: str,
+    args,
+    target_time,
+    shuffle_words: bool = False,
+) -> pd.DataFrame:
+    n_items = int(max(1, getattr(args, "news_conv_max_items", 8)))
+    rows = []
+    selected_df = selected if isinstance(selected, pd.DataFrame) else pd.DataFrame()
+    base_texts = []
+    if len(selected_df) > 0 and text_col in selected_df.columns:
+        base_texts = [
+            _clean_news_text_for_conv(x)
+            for x in selected_df[text_col].fillna("").astype(str).tolist()
+            if str(x).strip()
+        ]
+    refined_items = _split_refined_news_for_conv(refined_news, max_items=n_items)
+    use_texts = refined_items if len(refined_items) > 0 else base_texts
+    if len(use_texts) == 0:
+        return pd.DataFrame(columns=[args.news_time_col, text_col, "rate"])
+
+    use_n = min(n_items, len(use_texts))
+    for j in range(use_n):
+        txt = str(use_texts[j]).strip()
+        if not txt:
+            continue
+        if shuffle_words:
+            txt = _shuffle_news_words_for_conv(
+                txt, seed=_stable_text_seed(f"{target_time}::{j}::{txt}")
+            )
+        row = {text_col: txt, args.news_time_col: target_time, "rate": 0.0}
+        if len(selected_df) > 0 and j < len(selected_df):
+            src = selected_df.iloc[j]
+            if args.news_time_col in selected_df.columns:
+                row[args.news_time_col] = src.get(args.news_time_col, target_time)
+            if "rate" in selected_df.columns:
+                try:
+                    row["rate"] = float(src.get("rate", 0.0) or 0.0)
+                except Exception:
+                    row["rate"] = 0.0
+        rows.append(row)
+    return pd.DataFrame(rows, columns=[args.news_time_col, text_col, "rate"])
+
+
+def _build_news_conv_sample_tensors(
+    selected: pd.DataFrame | None,
+    target_time,
+    tokenizer,
+    args,
+    text_col: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n_items = int(max(1, getattr(args, "news_conv_max_items", 8)))
+    n_tokens = int(max(1, getattr(args, "news_conv_text_max_tokens", 96)))
+    pad_id = _news_conv_pad_id(tokenizer)
+
+    ids = np.full((n_items, n_tokens), pad_id, dtype=np.int64)
+    attn = np.zeros((n_items, n_tokens), dtype=np.int64)
+    item_mask = np.zeros((n_items,), dtype=np.float32)
+    age_hours = np.zeros((n_items,), dtype=np.float32)
+    rate_values = np.zeros((n_items,), dtype=np.float32)
+
+    if not isinstance(selected, pd.DataFrame) or len(selected) == 0:
+        return ids, attn, item_mask, age_hours, rate_values
+
+    target_ts = pd.to_datetime(target_time, errors="coerce", utc=True)
+    use_n = min(n_items, len(selected))
+
+    for j in range(use_n):
+        row = selected.iloc[j]
+        text = str(row.get(text_col, "") if hasattr(row, "get") else "")
+        enc = tokenizer(
+            text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=n_tokens,
+            return_attention_mask=True,
+        )
+        token_ids = enc.get("input_ids", [])
+        token_mask = enc.get("attention_mask", [1] * len(token_ids))
+        tok_len = min(n_tokens, len(token_ids))
+        if tok_len > 0:
+            ids[j, :tok_len] = np.asarray(token_ids[:tok_len], dtype=np.int64)
+            attn[j, :tok_len] = np.asarray(token_mask[:tok_len], dtype=np.int64)
+        item_mask[j] = 1.0
+
+        if args.news_time_col in selected.columns:
+            news_ts = pd.to_datetime(row.get(args.news_time_col, None), errors="coerce", utc=True)
+            if pd.notna(target_ts) and pd.notna(news_ts):
+                try:
+                    diff_h = float((target_ts - news_ts).total_seconds() / 3600.0)
+                except Exception:
+                    diff_h = 0.0
+                if np.isfinite(diff_h):
+                    age_hours[j] = max(0.0, diff_h)
+
+        if "rate" in selected.columns:
+            rv = row.get("rate", 0.0)
+            try:
+                rv = float(rv)
+            except Exception:
+                rv = 0.0
+            if np.isfinite(rv):
+                rate_values[j] = rv
+
+    return ids, attn, item_mask, age_hours, rate_values
+
+
 # ----------------------------
 # batch build
 # ----------------------------
@@ -827,6 +1058,9 @@ def build_batch_inputs(
     query_base_pred=None,
     retrieval_enable_override: bool | None = None,
     retrieval_mode_override: str | None = None,
+    news_conv_disable_override: bool | None = None,
+    news_conv_shuffle_override: bool | None = None,
+    api_adapter=None,
 ):
     """
     Returns:
@@ -866,6 +1100,16 @@ def build_batch_inputs(
     news_rl_meta_list = [] if return_news_rl_meta else None
     retrieval_feature_list = []
     retrieval_meta_list = []
+    news_conv_input_ids_list = []
+    news_conv_attn_list = []
+    news_conv_item_mask_list = []
+    news_conv_age_hours_list = []
+    news_conv_rate_values_list = []
+    if news_conv_disable_override is None:
+        build_news_conv = bool(int(getattr(args, "news_conv_enable", 0)))
+    else:
+        build_news_conv = not bool(news_conv_disable_override)
+    shuffle_conv_words = bool(news_conv_shuffle_override)
 
     retrieval_feat_dim = _retrieval_feature_dim(args)
     retrieval_mode = _resolve_retrieval_mode(
@@ -961,7 +1205,7 @@ def build_batch_inputs(
                 tokenizer=tokenizer,
                 max_tokens=news_budget,
                 mode=str(getattr(args, "news_refine_mode", "local")),
-                api_adapter=None,
+                api_adapter=api_adapter,
                 context={"target_time": str(t_target), "region": str(getattr(args, "region", ""))},
             )
 
@@ -973,7 +1217,7 @@ def build_batch_inputs(
                 structured_events = extract_structured_events(
                     raw_or_refined_news=refined_news,
                     mode=str(getattr(args, "news_structured_mode", "off")),
-                    api_adapter=None,
+                    api_adapter=api_adapter,
                     context={"target_time": str(t_target), "region": str(getattr(args, "region", ""))},
                 )
             if need_structured_for_prompt:
@@ -984,6 +1228,36 @@ def build_batch_inputs(
             news_str = "\n\n".join([p for p in pieces if str(p).strip()])
             if news_dropout:
                 news_str = _maybe_news_dropout(news_str, args)
+
+        if build_news_conv:
+            conv_selected = _prepare_conv_selected_news(
+                selected=selected,
+                text_col=news_text_col,
+                refined_news=refined_news,
+                args=args,
+                target_time=t_target,
+                shuffle_words=shuffle_conv_words,
+            )
+        else:
+            conv_selected = None
+        (
+            conv_ids,
+            conv_attn,
+            conv_item_mask,
+            conv_age_hours,
+            conv_rate_values,
+        ) = _build_news_conv_sample_tensors(
+            selected=conv_selected,
+            target_time=t_target,
+            tokenizer=tokenizer,
+            args=args,
+            text_col=news_text_col,
+        )
+        news_conv_input_ids_list.append(conv_ids)
+        news_conv_attn_list.append(conv_attn)
+        news_conv_item_mask_list.append(conv_item_mask)
+        news_conv_age_hours_list.append(conv_age_hours)
+        news_conv_rate_values_list.append(conv_rate_values)
 
         retrieval_feat = np.zeros((retrieval_feat_dim,), dtype=np.float32)
         retrieval_meta = {
@@ -1008,6 +1282,8 @@ def build_batch_inputs(
                 structured_events=structured_events,
                 metadata={"series_id": series_id},
             )
+            with open("query_case_dump.json", "a", encoding="utf-8") as _f:
+                _f.write(json.dumps(query_case, ensure_ascii=False) + "\n")
             retrieval_out = retrieve_similar_cases(
                 query_case=query_case,
                 case_bank=case_bank,
@@ -1123,6 +1399,11 @@ def build_batch_inputs(
     rel_labels = torch.tensor(rel_labels_list, dtype=torch.float32)
     news_counts = torch.tensor(len_selected_news, dtype=torch.float32)
     retrieval_feats = torch.tensor(np.stack(retrieval_feature_list, axis=0), dtype=torch.float32)
+    news_input_ids = torch.tensor(np.stack(news_conv_input_ids_list, axis=0), dtype=torch.long)
+    news_attention_mask = torch.tensor(np.stack(news_conv_attn_list, axis=0), dtype=torch.long)
+    news_item_mask = torch.tensor(np.stack(news_conv_item_mask_list, axis=0), dtype=torch.float32)
+    news_age_hours = torch.tensor(np.stack(news_conv_age_hours_list, axis=0), dtype=torch.float32)
+    news_rate_values = torch.tensor(np.stack(news_conv_rate_values_list, axis=0), dtype=torch.float32)
     if return_news_rl_meta:
         return (
             input_ids,
@@ -1137,6 +1418,11 @@ def build_batch_inputs(
             news_rl_meta_list,
             retrieval_feats,
             retrieval_meta_list,
+            news_input_ids,
+            news_attention_mask,
+            news_item_mask,
+            news_age_hours,
+            news_rate_values,
         )
     return (
         input_ids,
@@ -1150,6 +1436,11 @@ def build_batch_inputs(
         news_counts,
         retrieval_feats,
         retrieval_meta_list,
+        news_input_ids,
+        news_attention_mask,
+        news_item_mask,
+        news_age_hours,
+        news_rate_values,
     )
 
 # ----------------------------
@@ -1174,6 +1465,7 @@ def evaluate_metrics_single(
     news_dropout: bool = False,
     force_no_news: bool = False,
     filename: str = None,
+    api_adapter=None,
 ):
     """
     Single-model evaluation: used for BASE stage.
@@ -1210,6 +1502,11 @@ def evaluate_metrics_single(
             n_selected,
             _retrieval_feats,
             _retrieval_meta,
+            _news_input_ids,
+            _news_attention_mask,
+            _news_item_mask,
+            _news_age_hours,
+            _news_rate_values,
         ) = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
@@ -1226,6 +1523,7 @@ def evaluate_metrics_single(
             testing=testing,
             force_no_news=force_no_news,
             news_dropout=news_dropout,
+            api_adapter=api_adapter,
         )
 
         input_ids = input_ids.to(device)
@@ -1398,7 +1696,10 @@ def evaluate_metrics_residual(
     retrieval_mode_override: str | None = None,
     retrieval_enable_override: bool | None = None,
     retrieval_gate_only_override: bool | None = None,
+    news_conv_disable_override: bool | None = None,
+    news_conv_shuffle_override: bool | None = None,
     return_retrieval_stats: bool = False,
+    api_adapter=None,
 ):
     """
     Residual evaluation:
@@ -1454,6 +1755,11 @@ def evaluate_metrics_residual(
             news_counts,
             retrieval_feats_d,
             retrieval_meta_d,
+            news_input_ids_d,
+            news_attention_mask_d,
+            news_item_mask_d,
+            news_age_hours_d,
+            news_rate_values_d,
         ) = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
@@ -1476,6 +1782,9 @@ def evaluate_metrics_residual(
             query_base_pred=base_pred_cpu,
             retrieval_enable_override=retrieval_enable_override,
             retrieval_mode_override=retrieval_mode_override,
+            news_conv_disable_override=news_conv_disable_override,
+            news_conv_shuffle_override=news_conv_shuffle_override,
+            api_adapter=api_adapter,
         )
 
         ids_d = ids_d.to(device)
@@ -1484,6 +1793,11 @@ def evaluate_metrics_residual(
         ts_pm = ts_pm.to(device)
         targets_z = targets_z.to(device)
         retrieval_feats_d = retrieval_feats_d.to(device=device, dtype=torch.float32)
+        news_input_ids_d = news_input_ids_d.to(device)
+        news_attention_mask_d = news_attention_mask_d.to(device)
+        news_item_mask_d = news_item_mask_d.to(device=device, dtype=torch.float32)
+        news_age_hours_d = news_age_hours_d.to(device=device, dtype=torch.float32)
+        news_rate_values_d = news_rate_values_d.to(device=device, dtype=torch.float32)
 
         # delta pred: adapter on + with news
         out_delta = delta_model(
@@ -1497,6 +1811,11 @@ def evaluate_metrics_residual(
             rel_lambda=0.0,
             retrieval_feats=retrieval_feats_d,
             retrieval_gate_only=retrieval_gate_only,
+            news_input_ids=news_input_ids_d,
+            news_attention_mask=news_attention_mask_d,
+            news_item_mask=news_item_mask_d,
+            news_age_hours=news_age_hours_d,
+            news_rate_values=news_rate_values_d,
         )
         delta_corr = out_delta["pred"].to(torch.float32)
         rel_logits = out_delta["rel_logits"].to(torch.float32)
@@ -1611,6 +1930,7 @@ def run_retrieval_ablations(
     volatility_bin,
     case_bank,
     live_logger,
+    api_adapter=None,
 ):
     if case_bank is None or len(case_bank.get("cases", [])) == 0:
         if live_logger is not None:
@@ -1657,6 +1977,7 @@ def run_retrieval_ablations(
             retrieval_enable_override=p["enable"],
             retrieval_gate_only_override=p["gate_only"],
             return_retrieval_stats=True,
+            api_adapter=api_adapter,
         )
         metric = _select_metric(loss_v, mse_v, mae_v, args.reward_metric)
         results[p["name"]] = {
@@ -1682,6 +2003,99 @@ def run_retrieval_ablations(
                 f"mae_rejected={float(rs.get('mae_rejected', float('nan'))):.6f} "
                 f"strong_valid={float(rs.get('mae_strong_news_valid', float('nan'))):.6f} "
                 f"strong_rej={float(rs.get('mae_strong_news_rejected', float('nan'))):.6f}"
+            )
+    return results
+
+
+@torch.no_grad()
+def run_news_conv_ablations(
+    *,
+    base_model,
+    delta_model,
+    tokenizer,
+    data_loader,
+    split_name: str,
+    templates,
+    tpl_id,
+    args,
+    global_zstats,
+    news_df,
+    policy_name,
+    policy_kw,
+    device,
+    volatility_bin,
+    case_bank,
+    live_logger,
+    api_adapter=None,
+):
+    if int(getattr(args, "news_conv_enable", 0)) != 1:
+        if live_logger is not None:
+            live_logger.info(f"[ABLATION][NEWS_CONV][{split_name}] skip: news_conv_enable=0.")
+        return {}
+
+    plans = [
+        {"name": "conv_on", "disable": False, "shuffle": False},
+        {"name": "conv_off", "disable": True, "shuffle": False},
+        {"name": "conv_shuffle", "disable": False, "shuffle": True},
+    ]
+    results = {}
+    for p in plans:
+        (
+            loss_v,
+            mse_v,
+            mae_v,
+            _base_loss_v,
+            _base_mse_v,
+            _base_mae_v,
+            _retrieval_stats,
+        ) = evaluate_metrics_residual(
+            base_model=base_model,
+            delta_model=delta_model,
+            tokenizer=tokenizer,
+            data_loader=data_loader,
+            templates=templates,
+            tpl_id=tpl_id,
+            args=args,
+            global_zstats=global_zstats,
+            news_df=news_df,
+            policy_name=policy_name,
+            policy_kw=policy_kw,
+            device=device,
+            volatility_bin=volatility_bin,
+            testing=False,
+            true_pred_csv_path=None,
+            news_dropout=False,
+            filename=None,
+            news_rl_selector=None,
+            case_bank=case_bank,
+            retrieval_mode_override=None,
+            retrieval_enable_override=None,
+            retrieval_gate_only_override=None,
+            news_conv_disable_override=p["disable"],
+            news_conv_shuffle_override=p["shuffle"],
+            return_retrieval_stats=True,
+            api_adapter=api_adapter,
+        )
+        metric = _select_metric(loss_v, mse_v, mae_v, args.reward_metric)
+        results[p["name"]] = {
+            "loss": float(loss_v),
+            "mse": float(mse_v),
+            "mae": float(mae_v),
+            "metric": float(metric),
+        }
+
+    base_metric = float(results["conv_on"]["metric"])
+    if live_logger is not None:
+        live_logger.info(
+            f"[ABLATION][NEWS_CONV][{split_name}] metric={str(args.reward_metric).lower()}"
+        )
+        for name in ["conv_on", "conv_off", "conv_shuffle"]:
+            rec = results[name]
+            delta = rec["metric"] - base_metric
+            live_logger.info(
+                f"[ABLATION][NEWS_CONV][{split_name}] {name} "
+                f"metric={rec['metric']:.6f} delta_vs_on={delta:+.6f} "
+                f"loss={rec['loss']:.6f} mse={rec['mse']:.6f} mae={rec['mae']:.6f}"
             )
     return results
 
@@ -1792,6 +2206,7 @@ def bandit_round_update_residual(
     bidx,
     global_step,
     global_zstats,
+    api_adapter=None,
 ):
     delta_model.eval()
 
@@ -1830,6 +2245,7 @@ def bandit_round_update_residual(
         testing=False,
         true_pred_csv_path=None,
         news_dropout=False,
+        api_adapter=api_adapter,
     )
 
     if args.reward_metric == "loss":
@@ -1881,6 +2297,8 @@ def setup_env_and_data(args):
     )
     print(f"[live log] {live_path}  (实时查看: tail -f '{live_path}')")
     _log_run_args(args, live_logger)
+    _log_enabled_mechanisms(args, live_logger, stage=stage)
+    news_api_adapter = build_news_api_adapter(args, live_logger=live_logger)
 
     ckpt_dir = os.path.join("./checkpoints", args.taskName)
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -2016,6 +2434,7 @@ def setup_env_and_data(args):
         "volatility_bin_val": volatility_bin_val,
         "volatility_bin_test": volatility_bin_test,
         "global_zstats": global_zstats,
+        "news_api_adapter": news_api_adapter,
         "prompt_path": prompt_path,
         "test_filename": filename,
     }
@@ -2217,6 +2636,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     volatility_bin_test = bundle["volatility_bin_test"]
     true_pred_csv_path = bundle["true_pred_csv_path"]
     global_zstats_bundle = _coerce_global_zstats(bundle.get("global_zstats", None), args, required=True)
+    news_api_adapter = bundle.get("news_api_adapter", None)
     
 
     lora_cfg = {
@@ -2253,8 +2673,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     )
     live_logger.info(
         f"[DELTA] Loaded base backbone: {base_meta.get('backbone_name')} "
-        f"(L={base_meta.get('history_len')}, H={base_meta.get('horizon')})"
+        f"(L(seq_len)={base_meta.get('history_len')}, H(horizon/pred_len)={base_meta.get('horizon')})"
     )
+    # mu_global = mean value of train_df; sigma_global = std value of train_df (with optional z-score clipping)
+    # z = (x - mu_global) / sigma_global
     global_zstats = _coerce_global_zstats(base_meta, args, required=False)
     if global_zstats is None:
         global_zstats = global_zstats_bundle
@@ -2293,8 +2715,26 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         delta_news_tail_tokens=int(getattr(args, "delta_news_tail_tokens", 160)),
         delta_rel_floor=float(getattr(args, "delta_rel_floor", 0.05)),
         retrieval_feat_dim=int(getattr(args, "case_retrieval_feature_dim", 12)),
+        news_conv_enable=bool(int(getattr(args, "news_conv_enable", 0))),
+        news_conv_max_items=int(getattr(args, "news_conv_max_items", 8)),
+        news_conv_text_max_tokens=int(getattr(args, "news_conv_text_max_tokens", 96)),
+        news_conv_channels=int(getattr(args, "news_conv_channels", 64)),
+        news_conv_dropout=float(getattr(args, "news_conv_dropout", 0.1)),
+        news_conv_gate_scale=float(getattr(args, "news_conv_gate_scale", 1.0)),
+        delta_model_variant=str(getattr(args, "delta_model_variant", "llama")),
+        tiny_news_model_preset=str(getattr(args, "tiny_news_model_preset", "custom")),
+        tiny_news_model=str(getattr(args, "tiny_news_model", "")),
+        tiny_news_tokenizer=str(getattr(args, "tiny_news_tokenizer", "")),
+        tiny_news_hidden_size=int(getattr(args, "tiny_news_hidden_size", 256)),
+        tiny_news_text_trainable=bool(int(getattr(args, "tiny_news_text_trainable", 0))),
+        tiny_news_loader=str(getattr(args, "tiny_news_loader", "auto")),
     )
     delta_model.to(device)
+    live_logger.info(
+        f"[DELTA] model_variant={str(getattr(delta_model, 'model_variant', 'llama')).lower()}"
+    )
+
+    # when to run validation set
     delta_val_mode = _normalize_delta_val_mode(getattr(args, "delta_val_mode", "each_epoch"))
     live_logger.info(f"[DELTA] validation mode: {delta_val_mode}")
 
@@ -2372,19 +2812,19 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
     # Scheme2: bypass RL/bandit and keep fixed template/policy.
     use_bandit = False
-    if int(getattr(args, "rl_use", 0)) == 1:
-        live_logger.info("[DELTA] Scheme2 disables RL/bandit; using fixed template/policy.")
+    # if int(getattr(args, "rl_use", 0)) == 1:
+    #     live_logger.info("[DELTA] Scheme2 disables RL/bandit; using fixed template/policy.")
 
-    normalizer = RewardNormalizer(ema=args.reward_ema, use_group_norm=args.domain_reward_norm) if use_bandit else None
-    val_state = ValidationState(ema_alpha=args.val_ema_alpha)
-    context_vector = encode_instruction(args, ctx={}, volatility_bin=volatility_bin)
+    # normalizer = RewardNormalizer(ema=args.reward_ema, use_group_norm=args.domain_reward_norm) if use_bandit else None
+    # val_state = ValidationState(ema_alpha=args.val_ema_alpha)
+    # context_vector = encode_instruction(args, ctx={}, volatility_bin=volatility_bin)
 
-    tpl_features, feat_dim = make_tpl_feature_fn(
-        templates=templates,
-        add_one_hot=True,
-        add_cost_proxy=False,
-        add_cross_terms=True,
-    )
+    # tpl_features, feat_dim = make_tpl_feature_fn(
+    #     templates=templates,
+    #     add_one_hot=True,
+    #     add_cost_proxy=False,
+    #     add_cross_terms=True,
+    # )
     allowed_tpl_ids = sorted([t["id"] for t in templates.values()])
     tpl_id = allowed_tpl_ids[0]
     policy_space = args.policy_space
@@ -2418,6 +2858,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             policy_name=policy_name,
             policy_kw=policy_kw,
             live_logger=live_logger,
+            api_adapter=news_api_adapter,
         )
         if int(getattr(args, "case_retrieval_save_bank", 1)) == 1:
             case_bank_path = os.path.join(
@@ -2428,16 +2869,20 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     else:
         live_logger.info("[CASE_BANK] retrieval disabled; skip active case bank build.")
 
-    d_tpl = len(context_vector) + len(tpl_features(allowed_tpl_ids[0], context_vector=context_vector))
-    d_pol = len(context_vector)
-    bandit_tpl = LinTS(d_tpl, v=args.ts_v) if (use_bandit and args.rl_algo == "lints") else (
-        LinUCB(d_tpl, alpha=args.ucb_alpha) if use_bandit else None
-    )
-    bandit_pol = LinTS(d_pol, v=args.ts_v) if (use_bandit and args.rl_algo == "lints") else (
-        LinUCB(d_pol, alpha=args.ucb_alpha) if use_bandit else None
-    )
+    # d_tpl = len(context_vector) + len(tpl_features(allowed_tpl_ids[0], context_vector=context_vector))
+    # d_pol = len(context_vector)
+    # bandit_tpl = LinTS(d_tpl, v=args.ts_v) if (use_bandit and args.rl_algo == "lints") else (
+    #     LinUCB(d_tpl, alpha=args.ucb_alpha) if use_bandit else None
+    # )
+    # bandit_pol = LinTS(d_pol, v=args.ts_v) if (use_bandit and args.rl_algo == "lints") else (
+    #     LinUCB(d_pol, alpha=args.ucb_alpha) if use_bandit else None
+    # )
     if math.isfinite(float(best_base_metric)):
-        best_metric = float(best_base_metric)
+        base_ref_metric = float(best_base_metric)
+        live_logger.info(
+            f"[DELTA] base reference on val: threshold={base_ref_metric:.6f} "
+            f"(metric={str(args.reward_metric).lower()})"
+        )
     else:
         base_ref_loss, base_ref_mse, base_ref_mae = evaluate_metrics_backbone(
             base_backbone=base_backbone,
@@ -2450,15 +2895,16 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             filename=None,
         )
         if args.reward_metric == "loss":
-            best_metric = float(base_ref_loss)
+            base_ref_metric = float(base_ref_loss)
         elif args.reward_metric == "mse":
-            best_metric = float(base_ref_mse)
+            base_ref_metric = float(base_ref_mse)
         else:
-            best_metric = float(base_ref_mae)
+            base_ref_metric = float(base_ref_mae)
         live_logger.info(
             f"[DELTA] base reference on val: loss={base_ref_loss:.6f} mse={base_ref_mse:.6f} "
-            f"mae={base_ref_mae:.6f}; threshold={best_metric:.6f}"
+            f"mae={base_ref_mae:.6f}; threshold={base_ref_metric:.6f}"
         )
+    best_metric = float("inf")
     stale_rounds = 0
     has_saved_delta = False
     loss_window = deque(maxlen=50)
@@ -2495,9 +2941,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             json.dump(
                 {
                     "best_base": os.path.basename(best_base_path),
-                    "best_delta": f"best_delta_{args.taskName}",
-                    "best_tpl_id": int(tpl_id_now),
-                    "best_policy_name": str(policy_name_now),
+                    # "best_delta": f"best_delta_{args.taskName}",
+                    # "best_tpl_id": int(tpl_id_now),
+                    # "best_policy_name": str(policy_name_now),
                     "best_delta_alpha": float(best_delta_alpha),
                     "reward_metric": str(args.reward_metric),
                     "best_metric": metric_value,
@@ -2513,84 +2959,48 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         hard_reflect_buffer = []
 
         # epoch-level bandit selection (optional)
-        if (args.select_policy_by == "epoch") and use_bandit:
-            context_vector = get_context_features(
-                None,
-                news_df,
-                args,
-                prev_model_loss_n=None,
-                prev_model_loss_ema_n=None,
-                val_state=val_state,
-                train_loader=train_loader,
-                volatility_bin=volatility_bin,
-            )
+        # if (args.select_policy_by == "epoch") and use_bandit:
+        #     context_vector = get_context_features(
+        #         None,
+        #         news_df,
+        #         args,
+        #         prev_model_loss_n=None,
+        #         prev_model_loss_ema_n=None,
+        #         val_state=val_state,
+        #         train_loader=train_loader,
+        #         volatility_bin=volatility_bin,
+        #     )
 
-            tpl_id, policy_name, pol_idx = bandit_round_update_residual(
-                base_model=base_backbone,
-                delta_model=delta_model,
-                tokenizer=tokenizer,
-                probe_loader=val_loader,
-                templates=templates,
-                allowed_tpl_ids=allowed_tpl_ids,
-                news_df=news_df,
-                policy_space=policy_space,
-                policy_kw=policy_kw,
-                args=args,
-                device=device,
-                volatility_bin=volatility_bin_val,
-                context_vector=context_vector,
-                tpl_features=tpl_features,
-                bandit_tpl=bandit_tpl,
-                bandit_pol=bandit_pol,
-                normalizer=normalizer,
-                live_logger=live_logger,
-                round_id=epoch + 1,
-                bidx=None,
-                global_step=global_step,
-                global_zstats=global_zstats,
-            )
+        #     tpl_id, policy_name, pol_idx = bandit_round_update_residual(
+        #         base_model=base_backbone,
+        #         delta_model=delta_model,
+        #         tokenizer=tokenizer,
+        #         probe_loader=val_loader,
+        #         templates=templates,
+        #         allowed_tpl_ids=allowed_tpl_ids,
+        #         news_df=news_df,
+        #         policy_space=policy_space,
+        #         policy_kw=policy_kw,
+        #         args=args,
+        #         device=device,
+        #         volatility_bin=volatility_bin_val,
+        #         context_vector=context_vector,
+        #         tpl_features=tpl_features,
+        #         bandit_tpl=bandit_tpl,
+        #         bandit_pol=bandit_pol,
+        #         normalizer=normalizer,
+        #         live_logger=live_logger,
+        #         round_id=epoch + 1,
+        #         bidx=None,
+        #         global_step=global_step,
+        #         global_zstats=global_zstats,
+        #         api_adapter=news_api_adapter,
+        #     )
 
-            live_logger.info(f"[DELTA] EPOCH_BEGIN epoch={epoch+1}, tpl_id={tpl_id}, policy={policy_name}")
+        #     live_logger.info(f"[DELTA] EPOCH_BEGIN epoch={epoch+1}, tpl_id={tpl_id}, policy={policy_name}")
 
         for bidx, batch in enumerate(pbar):
             # batch-level bandit selection (optional)
-            if (args.select_policy_by == "batch") and use_bandit and global_step % 50 == 0:
-                context_vector = get_context_features(
-                    batch,
-                    news_df,
-                    args,
-                    prev_model_loss_n=None,
-                    prev_model_loss_ema_n=None,
-                    val_state=val_state,
-                    train_loader=train_loader,
-                    volatility_bin=volatility_bin,
-                )
-
-                tpl_id, policy_name, pol_idx = bandit_round_update_residual(
-                    base_model=base_backbone,
-                    delta_model=delta_model,
-                    tokenizer=tokenizer,
-                    probe_loader=val_loader,
-                    templates=templates,
-                    allowed_tpl_ids=allowed_tpl_ids,
-                    news_df=news_df,
-                    policy_space=policy_space,
-                    policy_kw=policy_kw,
-                    args=args,
-                    device=device,
-                    volatility_bin=volatility_bin_val,
-                    context_vector=context_vector,
-                    tpl_features=tpl_features,
-                    bandit_tpl=bandit_tpl,
-                    bandit_pol=bandit_pol,
-                    normalizer=normalizer,
-                    live_logger=live_logger,
-                    round_id=epoch * len(pbar) + bidx,
-                    bidx=bidx,
-                    global_step=global_step,
-                    global_zstats=global_zstats,
-                )
-
             with torch.no_grad():
                 history_z, _, _ = _z_batch_tensors(batch, args, global_zstats=global_zstats)
                 history_z = history_z.to(device)
@@ -2611,6 +3021,11 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 news_rl_meta_d,
                 retrieval_feats_d,
                 retrieval_meta_d,
+                news_input_ids_d,
+                news_attention_mask_d,
+                news_item_mask_d,
+                news_age_hours_d,
+                news_rate_values_d,
             ) = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
@@ -2633,6 +3048,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 return_news_rl_meta=True,
                 case_bank=active_case_bank,
                 query_base_pred=base_pred_cpu,
+                api_adapter=news_api_adapter,
             )
             # build base text inputs (no news)
             (
@@ -2647,6 +3063,11 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 _news_counts_b,
                 retrieval_feats_b,
                 _retrieval_meta_b,
+                news_input_ids_b,
+                news_attention_mask_b,
+                news_item_mask_b,
+                news_age_hours_b,
+                news_rate_values_b,
             ) = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
@@ -2666,6 +3087,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 case_bank=active_case_bank,
                 query_base_pred=base_pred_cpu,
                 retrieval_enable_override=False,
+                api_adapter=news_api_adapter,
             )
 
             ids_d = ids_d.to(device)
@@ -2679,6 +3101,16 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             news_counts_d = news_counts_d.to(device=device, dtype=torch.float32)
             retrieval_feats_d = retrieval_feats_d.to(device=device, dtype=torch.float32)
             retrieval_feats_b = retrieval_feats_b.to(device=device, dtype=torch.float32)
+            news_input_ids_d = news_input_ids_d.to(device)
+            news_attention_mask_d = news_attention_mask_d.to(device)
+            news_item_mask_d = news_item_mask_d.to(device=device, dtype=torch.float32)
+            news_age_hours_d = news_age_hours_d.to(device=device, dtype=torch.float32)
+            news_rate_values_d = news_rate_values_d.to(device=device, dtype=torch.float32)
+            news_input_ids_b = news_input_ids_b.to(device)
+            news_attention_mask_b = news_attention_mask_b.to(device)
+            news_item_mask_b = news_item_mask_b.to(device=device, dtype=torch.float32)
+            news_age_hours_b = news_age_hours_b.to(device=device, dtype=torch.float32)
+            news_rate_values_b = news_rate_values_b.to(device=device, dtype=torch.float32)
             has_news = (news_counts_d > 0).to(dtype=torch.float32)
 
             delta_model.train()
@@ -2700,6 +3132,11 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 rel_lambda=0.0,
                 retrieval_feats=retrieval_feats_d,
                 retrieval_gate_only=retrieval_gate_only,
+                news_input_ids=news_input_ids_d,
+                news_attention_mask=news_attention_mask_d,
+                news_item_mask=news_item_mask_d,
+                news_age_hours=news_age_hours_d,
+                news_rate_values=news_rate_values_d,
             )
             delta_pred_real = out_delta["pred"].to(torch.float32)
             rel_logits_real = out_delta["rel_logits"].to(torch.float32)
@@ -2744,6 +3181,11 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     rel_lambda=0.0,
                     retrieval_feats=retrieval_feats_b,
                     retrieval_gate_only=retrieval_gate_only,
+                    news_input_ids=news_input_ids_b,
+                    news_attention_mask=news_attention_mask_b,
+                    news_item_mask=news_item_mask_b,
+                    news_age_hours=news_age_hours_b,
+                    news_rate_values=news_rate_values_b,
                 )
                 delta_pred_null = out_null["pred"].to(torch.float32)
                 rel_logits_null = out_null["rel_logits"].to(torch.float32)
@@ -2872,6 +3314,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 news_dropout=False,
                 news_rl_selector=news_rl_selector,
                 case_bank=active_case_bank,
+                api_adapter=news_api_adapter,
             )
             val_loss_per_epoch.append(val_loss)
             mse_loss_per_epoch.append(val_mse)
@@ -2891,11 +3334,16 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
             # update val_state for context
             metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
-            val_state.update(metric_now)
+            # val_state.update(metric_now)
+            delta_vs_base = float(metric_now - base_ref_metric)
+            live_logger.info(
+                f"[DELTA][COMPARE][VAL] epoch={epoch+1} metric={metric_now:.6f} "
+                f"delta_vs_base={delta_vs_base:+.6f}"
+            )
 
             should_save = (not has_saved_delta) or (metric_now < best_metric - 1e-6)
             if should_save:
-                best_metric = min(best_metric, metric_now)
+                best_metric = float(metric_now)
                 stale_rounds = 0
                 has_saved_delta = True
                 best_tpl_id = tpl_id
@@ -2909,13 +3357,15 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 )
                 live_logger.info(
                     f"[DELTA] New best delta saved: {best_delta_path} "
-                    f"({args.reward_metric}={best_metric:.6f})"
+                    f"({args.reward_metric}={best_metric:.6f}, "
+                    f"delta_vs_base={best_metric - base_ref_metric:+.6f})"
                 )
             else:
                 stale_rounds += 1
                 if early_stop_patience > 0:
                     live_logger.info(
-                        f"[DELTA] stale_rounds={stale_rounds}/{early_stop_patience} best={best_metric:.6f}"
+                        f"[DELTA] stale_rounds={stale_rounds}/{early_stop_patience} "
+                        f"best={best_metric:.6f} delta_vs_base={best_metric - base_ref_metric:+.6f}"
                     )
 
             if early_stop_patience > 0 and stale_rounds >= early_stop_patience:
@@ -2932,7 +3382,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             reflections = reflect_hard_samples(
                 hard_samples=hard_reflect_buffer,
                 mode=hard_reflect_mode,
-                api_adapter=None,
+                api_adapter=news_api_adapter,
             )
             live_logger.info(
                 f"[DELTA][REFLECT] epoch={epoch+1} mode={hard_reflect_mode} "
@@ -2966,6 +3416,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 news_dropout=False,
                 news_rl_selector=news_rl_selector,
                 case_bank=active_case_bank,
+                api_adapter=news_api_adapter,
             )
             metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
             best_metric = float(metric_now)
@@ -3026,6 +3477,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 news_dropout=False,
                 news_rl_selector=news_rl_selector,
                 case_bank=active_case_bank,
+                api_adapter=news_api_adapter,
             )
             metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
             best_metric = float(metric_now)
@@ -3157,6 +3609,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     volatility_bin=volatility_bin_val,
                     case_bank=active_case_bank,
                     live_logger=live_logger,
+                    api_adapter=news_api_adapter,
                 )
             if ablation_split in {"test", "both"}:
                 run_retrieval_ablations(
@@ -3176,6 +3629,49 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     volatility_bin=volatility_bin_test,
                     case_bank=active_case_bank,
                     live_logger=live_logger,
+                    api_adapter=news_api_adapter,
+                )
+        if int(getattr(args, "news_conv_run_ablations", 1)) == 1:
+            conv_ablation_split = str(getattr(args, "news_conv_ablation_split", "val")).lower().strip()
+            if conv_ablation_split in {"val", "both"}:
+                run_news_conv_ablations(
+                    base_model=base_backbone,
+                    delta_model=model_best,
+                    tokenizer=tokenizer,
+                    data_loader=val_loader,
+                    split_name="VAL",
+                    templates=templates,
+                    tpl_id=tpl_for_test,
+                    args=args,
+                    global_zstats=global_zstats_eval,
+                    news_df=news_df,
+                    policy_name=pol_for_test,
+                    policy_kw=policy_kw,
+                    device=device,
+                    volatility_bin=volatility_bin_val,
+                    case_bank=active_case_bank,
+                    live_logger=live_logger,
+                    api_adapter=news_api_adapter,
+                )
+            if conv_ablation_split in {"test", "both"}:
+                run_news_conv_ablations(
+                    base_model=base_backbone,
+                    delta_model=model_best,
+                    tokenizer=tokenizer,
+                    data_loader=test_loader,
+                    split_name="TEST",
+                    templates=templates,
+                    tpl_id=tpl_for_test,
+                    args=args,
+                    global_zstats=global_zstats_eval,
+                    news_df=news_df,
+                    policy_name=pol_for_test,
+                    policy_kw=policy_kw,
+                    device=device,
+                    volatility_bin=volatility_bin_test,
+                    case_bank=active_case_bank,
+                    live_logger=live_logger,
+                    api_adapter=news_api_adapter,
                 )
         test_loss, test_mse, test_mae, base_test_loss, base_test_mse, base_test_mae = evaluate_metrics_residual(
             base_model=base_backbone,
@@ -3197,6 +3693,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             filename=bundle["test_filename"],
             news_rl_selector=news_rl_selector,
             case_bank=active_case_bank,
+            api_adapter=news_api_adapter,
         )
 
         live_logger.info("---------------------testset prompt statistics--------------------------------")
