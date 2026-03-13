@@ -73,7 +73,7 @@ TEST_FILE="dataset/2024NSWelecprice/2024NSWelecprice_testset.csv"
 NEWS_TEXT_COL="content"
 NEWS_TIME_COL="date"
 
-DELTA_EPOCHS="40"
+DELTA_EPOCHS="100"
 BASE_EPOCHS="40"
 # NEWS_WINDOW_DAYS="7"
 NEWS_TOPM="999"
@@ -86,7 +86,7 @@ TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 
 # Keep task settings aligned with your existing NSW scripts.
 RESIDUAL_LOSS="smooth_l1"
-REWARD_METRIC="mae"
+SELECT_METRIC="mae"
 STRIDE="48"
 HORIZON="48"
 PATCH_DROPOUT="0"
@@ -94,16 +94,13 @@ HEAD_DROPOUT="0.1"
 STAGE="all"
 DELTA_VAL_MODE="${DELTA_VAL_MODE:-each_epoch}"  # each_epoch | end_only | none
 DELTA_CLIP="${DELTA_CLIP:-1.0}"
-EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-8}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-4}"
 NEWS_GATE_FLOOR="${NEWS_GATE_FLOOR:-0.0}"
-# Memory-safe defaults for 8B + SFT on limited VRAM.
-LOAD_IN_4BIT="${LOAD_IN_4BIT:-1}"
-GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
 
 # pure TS base backbone (scheme2)
 BASE_BACKBONES=(
-  # "dlinear"
   "mlp"
+  # "mlp"
 )
 BASE_HIDDEN_DIM="256"
 BASE_MOVING_AVG="25"
@@ -127,7 +124,7 @@ UTILITY_MIN_SCORE="-1.0"
 UTILITY_SHOW_IN_PROMPT="1"
 
 # Delta news extension hooks
-NEWS_API_ENABLE="${NEWS_API_ENABLE:-0}"                       # 1 => use OpenAI API for refine/structured hooks
+NEWS_API_ENABLE="${NEWS_API_ENABLE:-1}"                       # 1 => use OpenAI API for news refine hooks
 NEWS_API_MODEL="${NEWS_API_MODEL:-gpt-5.1}"
 NEWS_API_KEY_PATH="${NEWS_API_KEY_PATH:-api_key.txt}"
 NEWS_API_BASE_URL="${NEWS_API_BASE_URL:-}"
@@ -135,41 +132,54 @@ NEWS_API_TIMEOUT_SEC="${NEWS_API_TIMEOUT_SEC:-30}"
 NEWS_API_MAX_RETRIES="${NEWS_API_MAX_RETRIES:-2}"
 if [[ "$NEWS_API_ENABLE" == "1" ]]; then
   NEWS_REFINE_MODE="${NEWS_REFINE_MODE:-api}"                 # local | api
-  NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-api}"         # off | heuristic | api
+  NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-heuristic}"   # off | heuristic | api
 else
   NEWS_REFINE_MODE="${NEWS_REFINE_MODE:-local}"               # local | api
   NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-heuristic}"   # off | heuristic | api
 fi
+NEWS_REFINE_CACHE_ENABLE="${NEWS_REFINE_CACHE_ENABLE:-1}"
+NEWS_REFINE_CACHE_PATH="${NEWS_REFINE_CACHE_PATH:-}"
+NEWS_REFINE_PREWARM="${NEWS_REFINE_PREWARM:-1}"
+NEWS_REFINE_PREWARM_MAX_BATCHES="${NEWS_REFINE_PREWARM_MAX_BATCHES:--1}"
 DELTA_INCLUDE_STRUCTURED_NEWS="${DELTA_INCLUDE_STRUCTURED_NEWS:-1}"  # 1 to append structured fields
-CASE_RETRIEVAL_ENABLE="${CASE_RETRIEVAL_ENABLE:-0}"           # default off for conv-focused runs
-CASE_RETRIEVAL_TOPK="${CASE_RETRIEVAL_TOPK:-3}"
-CASE_RETRIEVAL_MODE="${CASE_RETRIEVAL_MODE:-price_event}"      # off | price | price_event
+
+CASE_RETRIEVAL_ENABLE="${CASE_RETRIEVAL_ENABLE:-1}"           # default on for case-focused runs
+CASE_RETRIEVAL_TOPK="${CASE_RETRIEVAL_TOPK:-5}"
+CASE_RETRIEVAL_MODE="${CASE_RETRIEVAL_MODE:-price_event}"            # off | price | price_event | random
 CASE_RETRIEVAL_ALPHA_PRICE="${CASE_RETRIEVAL_ALPHA_PRICE:-0.85}"
 CASE_RETRIEVAL_ALPHA_EVENT="${CASE_RETRIEVAL_ALPHA_EVENT:-0.15}"
+CASE_RETRIEVAL_ALPHA_TEXT="${CASE_RETRIEVAL_ALPHA_TEXT:-0.20}"
+CASE_RETRIEVAL_ALPHA_RECENCY="${CASE_RETRIEVAL_ALPHA_RECENCY:-0.10}"
+CASE_RETRIEVAL_ALPHA_REGIME="${CASE_RETRIEVAL_ALPHA_REGIME:-0.05}"
+CASE_RETRIEVAL_RECENCY_TAU_HOURS="${CASE_RETRIEVAL_RECENCY_TAU_HOURS:-168.0}"
 CASE_RETRIEVAL_MIN_TOP_SCORE="${CASE_RETRIEVAL_MIN_TOP_SCORE:-0.12}"
 CASE_RETRIEVAL_MIN_CANDIDATES="${CASE_RETRIEVAL_MIN_CANDIDATES:-2}"
-CASE_RETRIEVAL_MIN_DIR_AGREE="${CASE_RETRIEVAL_MIN_DIR_AGREE:-0.45}"
+CASE_RETRIEVAL_MIN_DIR_AGREE="${CASE_RETRIEVAL_MIN_DIR_AGREE:-0.25}"
 CASE_RETRIEVAL_MAX_EVENT_MISMATCH="${CASE_RETRIEVAL_MAX_EVENT_MISMATCH:-0.80}"
 CASE_RETRIEVAL_FEATURE_DIM="${CASE_RETRIEVAL_FEATURE_DIM:-12}"
 CASE_RETRIEVAL_GATE_ONLY="${CASE_RETRIEVAL_GATE_ONLY:-0}"      # 1 => retrieval only assists gate/confidence
-CASE_RETRIEVAL_RUN_ABLATIONS="${CASE_RETRIEVAL_RUN_ABLATIONS:-1}"
-CASE_RETRIEVAL_ABLATION_SPLIT="${CASE_RETRIEVAL_ABLATION_SPLIT:-val}"  # val | test | both
+CASE_RETRIEVAL_RUN_ABLATIONS="${CASE_RETRIEVAL_RUN_ABLATIONS:-0}"
+CASE_RETRIEVAL_ABLATION_SPLIT="${CASE_RETRIEVAL_ABLATION_SPLIT:-test}"  # val | test | both
 CASE_RETRIEVAL_STRONG_NEWS_THRESH="${CASE_RETRIEVAL_STRONG_NEWS_THRESH:-0.6}"
-NEWS_CONV_ENABLE="${NEWS_CONV_ENABLE:-1}"
-NEWS_CONV_MAX_ITEMS="${NEWS_CONV_MAX_ITEMS:-8}"
-NEWS_CONV_TEXT_MAX_TOKENS="${NEWS_CONV_TEXT_MAX_TOKENS:-96}"
-NEWS_CONV_CHANNELS="${NEWS_CONV_CHANNELS:-64}"
-NEWS_CONV_DROPOUT="${NEWS_CONV_DROPOUT:-0.1}"
-NEWS_CONV_GATE_SCALE="${NEWS_CONV_GATE_SCALE:-1.0}"
-NEWS_CONV_RUN_ABLATIONS="${NEWS_CONV_RUN_ABLATIONS:-1}"
-NEWS_CONV_ABLATION_SPLIT="${NEWS_CONV_ABLATION_SPLIT:-val}"  # val | test | both
+
+CASE_RETRIEVAL_KNN_ENABLE="${CASE_RETRIEVAL_KNN_ENABLE:-1}"
+CASE_RETRIEVAL_KNN_ALPHA="${CASE_RETRIEVAL_KNN_ALPHA:-0.35}"
+CASE_RETRIEVAL_KNN_ALPHA_CAP="${CASE_RETRIEVAL_KNN_ALPHA_CAP:-0.85}"
+CASE_RETRIEVAL_KNN_TEMPERATURE="${CASE_RETRIEVAL_KNN_TEMPERATURE:-0.20}"
+CASE_RETRIEVAL_DEBUG_DUMP="${CASE_RETRIEVAL_DEBUG_DUMP:-0}"
+
 DELTA_MODEL_VARIANT="${DELTA_MODEL_VARIANT:-tiny_news_ts}"
-TINY_NEWS_PRESET="${TINY_NEWS_PRESET:-tinyllama}"  # distilbert | gpt2 | tinyllama | custom
+TINY_NEWS_PRESET="${TINY_NEWS_PRESET:-distilbert}"  # distilbert | gpt2 | bert_base | roberta_base | deberta_v3_base | custom
 TINY_NEWS_LOADER="${TINY_NEWS_LOADER:-auto}"        # auto | encoder | causal_lm
 TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-}"
 TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-}"
 TINY_NEWS_HIDDEN_SIZE="${TINY_NEWS_HIDDEN_SIZE:-256}"
 TINY_NEWS_TEXT_TRAINABLE="${TINY_NEWS_TEXT_TRAINABLE:-0}"
+DELTA_TEXT_DIRECT_ENABLE="${DELTA_TEXT_DIRECT_ENABLE:-1}"
+DELTA_TEXT_FUSE_LAMBDA="${DELTA_TEXT_FUSE_LAMBDA:-12}"
+DELTA_TEXT_GATE_INIT_BIAS="${DELTA_TEXT_GATE_INIT_BIAS:--2.0}"
+DELTA_TEXT_CLIP="${DELTA_TEXT_CLIP:-1.5}"
+DELTA_TEXT_MAX_LEN="${DELTA_TEXT_MAX_LEN:-160}"
 
 case "$TINY_NEWS_PRESET" in
   distilbert)
@@ -180,9 +190,17 @@ case "$TINY_NEWS_PRESET" in
     TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-gpt2}"
     TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-gpt2}"
     ;;
-  tinyllama)
-    TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}"
-    TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}"
+  bert_base)
+    TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-bert-base-uncased}"
+    TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-bert-base-uncased}"
+    ;;
+  roberta_base)
+    TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-roberta-base}"
+    TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-roberta-base}"
+    ;;
+  deberta_v3_base)
+    TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-microsoft/deberta-v3-base}"
+    TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-microsoft/deberta-v3-base}"
     ;;
   custom)
     TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-distilbert-base-uncased}"
@@ -196,13 +214,19 @@ case "$TINY_NEWS_PRESET" in
     ;;
 esac
 
-DELTA_CF_LAMBDA="0.01"
+DELTA_CF_LAMBDA="0.001"
 DELTA_CF_MARGIN="0.05"
-DELTA_GATE_REG_LAMBDA="0.01"
-DELTA_NULL_LAMBDA="0.01"
-DELTA_LORA_LR_SCALE="0.5"
+DELTA_GATE_REG_LAMBDA="0.001"
+DELTA_NULL_LAMBDA="0.001"
+DELTA_RESIDUAL_MODE="${DELTA_RESIDUAL_MODE:-relative}"     # additive | relative
+DELTA_RELATIVE_DENOM_FLOOR="${DELTA_RELATIVE_DENOM_FLOOR:-20}"
+DELTA_RELATIVE_RATIO_CLIP="${DELTA_RELATIVE_RATIO_CLIP:-0.5}"
 DELTA_HEAD_LR_SCALE="1.0"
 DELTA_AUX_LAMBDA="0.05"
+DELTA_WARMUP_EPOCHS="${DELTA_WARMUP_EPOCHS:-2}"
+DELTA_CURRICULUM_EPOCHS="${DELTA_CURRICULUM_EPOCHS:-6}"
+DELTA_NULL_WARMUP_STEPS="${DELTA_NULL_WARMUP_STEPS:-1200}"
+DELTA_NULL_RAMP_STEPS="${DELTA_NULL_RAMP_STEPS:-1200}"
 # =======================
 # 2) Sweep spaces (same style as your original)
 # =======================
@@ -253,7 +277,13 @@ COMMON_ARGS=(
   --delta_gate_reg_lambda "$DELTA_GATE_REG_LAMBDA"
   --delta_aux_lambda "$DELTA_AUX_LAMBDA"
   --delta_null_lambda "$DELTA_NULL_LAMBDA"
-  --delta_lora_lr_scale "$DELTA_LORA_LR_SCALE"
+  --delta_residual_mode "$DELTA_RESIDUAL_MODE"
+  --delta_relative_denom_floor "$DELTA_RELATIVE_DENOM_FLOOR"
+  --delta_relative_ratio_clip "$DELTA_RELATIVE_RATIO_CLIP"
+  --delta_warmup_epochs "$DELTA_WARMUP_EPOCHS"
+  --delta_curriculum_epochs "$DELTA_CURRICULUM_EPOCHS"
+  --delta_null_warmup_steps "$DELTA_NULL_WARMUP_STEPS"
+  --delta_null_ramp_steps "$DELTA_NULL_RAMP_STEPS"
   --delta_head_lr_scale "$DELTA_HEAD_LR_SCALE"
   --news_gate_floor "$NEWS_GATE_FLOOR"
   --early_stop_patience "$EARLY_STOP_PATIENCE"
@@ -272,7 +302,7 @@ COMMON_ARGS=(
   --news_topK "$NEWS_TOPK"
   --batch_size "$BATCH_SIZE"
   --gpu "$GPU_ID"
-  --reward_metric "$REWARD_METRIC"
+  --select_metric "$SELECT_METRIC"
   --default_policy "$DEFAULT_POLICY"
   --utility_rerank_enable "$UTILITY_RERANK_ENABLE"
   --utility_keyword_weight "$UTILITY_KEYWORD_WEIGHT"
@@ -287,6 +317,10 @@ COMMON_ARGS=(
   --utility_min_score "$UTILITY_MIN_SCORE"
   --utility_show_in_prompt "$UTILITY_SHOW_IN_PROMPT"
   --news_refine_mode "$NEWS_REFINE_MODE"
+  --news_refine_cache_enable "$NEWS_REFINE_CACHE_ENABLE"
+  --news_refine_cache_path "$NEWS_REFINE_CACHE_PATH"
+  --news_refine_prewarm "$NEWS_REFINE_PREWARM"
+  --news_refine_prewarm_max_batches "$NEWS_REFINE_PREWARM_MAX_BATCHES"
   --news_api_model "$NEWS_API_MODEL"
   --news_api_key_path "$NEWS_API_KEY_PATH"
   --news_api_base_url "$NEWS_API_BASE_URL"
@@ -294,14 +328,6 @@ COMMON_ARGS=(
   --news_api_max_retries "$NEWS_API_MAX_RETRIES"
   --delta_include_structured_news "$DELTA_INCLUDE_STRUCTURED_NEWS"
   --news_structured_mode "$NEWS_STRUCTURED_MODE"
-  --news_conv_enable "$NEWS_CONV_ENABLE"
-  --news_conv_max_items "$NEWS_CONV_MAX_ITEMS"
-  --news_conv_text_max_tokens "$NEWS_CONV_TEXT_MAX_TOKENS"
-  --news_conv_channels "$NEWS_CONV_CHANNELS"
-  --news_conv_dropout "$NEWS_CONV_DROPOUT"
-  --news_conv_gate_scale "$NEWS_CONV_GATE_SCALE"
-  --news_conv_run_ablations "$NEWS_CONV_RUN_ABLATIONS"
-  --news_conv_ablation_split "$NEWS_CONV_ABLATION_SPLIT"
   --delta_model_variant "$DELTA_MODEL_VARIANT"
   --tiny_news_model_preset "$TINY_NEWS_PRESET"
   --tiny_news_model "$TINY_NEWS_MODEL"
@@ -309,11 +335,20 @@ COMMON_ARGS=(
   --tiny_news_hidden_size "$TINY_NEWS_HIDDEN_SIZE"
   --tiny_news_text_trainable "$TINY_NEWS_TEXT_TRAINABLE"
   --tiny_news_loader "$TINY_NEWS_LOADER"
+  --delta_text_direct_enable "$DELTA_TEXT_DIRECT_ENABLE"
+  --delta_text_fuse_lambda "$DELTA_TEXT_FUSE_LAMBDA"
+  --delta_text_gate_init_bias "$DELTA_TEXT_GATE_INIT_BIAS"
+  --delta_text_clip "$DELTA_TEXT_CLIP"
+  --delta_text_max_len "$DELTA_TEXT_MAX_LEN"
   --case_retrieval_enable "$CASE_RETRIEVAL_ENABLE"
   --case_retrieval_topk "$CASE_RETRIEVAL_TOPK"
   --case_retrieval_mode "$CASE_RETRIEVAL_MODE"
   --case_retrieval_alpha_price "$CASE_RETRIEVAL_ALPHA_PRICE"
   --case_retrieval_alpha_event "$CASE_RETRIEVAL_ALPHA_EVENT"
+  --case_retrieval_alpha_text "$CASE_RETRIEVAL_ALPHA_TEXT"
+  --case_retrieval_alpha_recency "$CASE_RETRIEVAL_ALPHA_RECENCY"
+  --case_retrieval_alpha_regime "$CASE_RETRIEVAL_ALPHA_REGIME"
+  --case_retrieval_recency_tau_hours "$CASE_RETRIEVAL_RECENCY_TAU_HOURS"
   --case_retrieval_min_top_score "$CASE_RETRIEVAL_MIN_TOP_SCORE"
   --case_retrieval_min_candidates "$CASE_RETRIEVAL_MIN_CANDIDATES"
   --case_retrieval_min_dir_agree "$CASE_RETRIEVAL_MIN_DIR_AGREE"
@@ -323,6 +358,11 @@ COMMON_ARGS=(
   --case_retrieval_run_ablations "$CASE_RETRIEVAL_RUN_ABLATIONS"
   --case_retrieval_ablation_split "$CASE_RETRIEVAL_ABLATION_SPLIT"
   --case_retrieval_strong_news_thresh "$CASE_RETRIEVAL_STRONG_NEWS_THRESH"
+  --case_retrieval_knn_enable "$CASE_RETRIEVAL_KNN_ENABLE"
+  --case_retrieval_knn_alpha "$CASE_RETRIEVAL_KNN_ALPHA"
+  --case_retrieval_knn_alpha_cap "$CASE_RETRIEVAL_KNN_ALPHA_CAP"
+  --case_retrieval_knn_temperature "$CASE_RETRIEVAL_KNN_TEMPERATURE"
+  --case_retrieval_debug_dump "$CASE_RETRIEVAL_DEBUG_DUMP"
   --residual_loss "$RESIDUAL_LOSS"
   --stage "$STAGE"
   --delta_val_mode "$DELTA_VAL_MODE"
@@ -344,7 +384,7 @@ for i in "${!TASK_NAMES[@]}"; do
           for sch in "${SCHEDULERS[@]}"; do
             for grad_acc in "${GRAD_ACCS[@]}"; do
               run_task="${task}_${base_backbone}"
-              args=( --taskName "$run_task" --rl_use "0" "${COMMON_ARGS[@]}" )
+              args=( --taskName "$run_task" "${COMMON_ARGS[@]}" )
 
               args+=( --news_path "${NEWS_CHOICES[$j]}" )
               if [[ -n "$tpool" ]]; then
@@ -369,13 +409,6 @@ for i in "${!TASK_NAMES[@]}"; do
               args+=( --grad_accum "$grad_acc" )
               args+=( --lr "$lr" )
               args+=( --scheduler "$sch" )
-              if [[ "$LOAD_IN_4BIT" == "1" ]]; then
-                args+=( --load_in_4bit )
-              fi
-              if [[ "$GRADIENT_CHECKPOINTING" == "1" ]]; then
-                args+=( --gradient_checkpointing )
-              fi
-
               if [[ "$run_or_not" == "1" ]]; then
                 echo "==> Running: ${run_task} (base_backbone=${base_backbone})"
                 "$PYTHON_BIN" "$ENTRY" "${args[@]}"

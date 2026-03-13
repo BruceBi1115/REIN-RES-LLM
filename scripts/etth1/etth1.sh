@@ -25,30 +25,24 @@ NEWS_WINDOW=3
 NEWS_TOPM=20
 NEWS_TOPK=5
 BATCH_SIZE=1
-
-RL_ALGO="lints"
-REWARD_METRIC="mse"
-RL_CYCLE_STEPS=1
-SELECT_POLICY="epoch"
+SELECT_METRIC="mse"
 
 BASE_TASK="TestEtth1withElecpriceNewsfrom2015To2020"
 
 ############################
 # 实验配置
-# name | rl_use | use_news
+# name | use_news
 ############################
 CONFIGS=(
-  # "Normal|1|1"
-  "NoRL|0|1"
-  # "NoNews|1|0"
-  "Pure|0|0"
+  "Normal|1"
+  "NoNews|0"
 )
 
 ############################
 # 主循环
 ############################
 for CFG in "${CONFIGS[@]}"; do
-  IFS="|" read TAG RL_USE USE_NEWS <<< "$CFG"
+  IFS="|" read TAG USE_NEWS <<< "$CFG"
 
   if [ "$TAG" == "Normal" ]; then
     TASK_NAME="${BASE_TASK}"
@@ -73,10 +67,7 @@ for CFG in "${CONFIGS[@]}"; do
     --news_topM ${NEWS_TOPM} \
     --news_topK ${NEWS_TOPK} \
     --batch_size ${BATCH_SIZE} \
-    --rl_use ${RL_USE} \
-    --rl_algo ${RL_ALGO} \
-    --reward_metric ${REWARD_METRIC} \
-    --select_policy_by ${SELECT_POLICY}
+    --select_metric ${SELECT_METRIC} \
   "
 
   if [ "$USE_NEWS" -eq 1 ]; then
@@ -89,20 +80,19 @@ for CFG in "${CONFIGS[@]}"; do
 
   pure_template_config="configs/pure_template.yaml"
   norl_template_config="configs/norl_template.yaml"
-  if [ "$RL_USE" -eq 0 ]; then
-      CMD+=" \
+  if [ "$USE_NEWS" -eq 1 ]; then
+    CMD+=" \
       --template_pool ${norl_template_config}
-      "
-    if [ "$USE_NEWS" -eq 0 ]; then
-      CMD+=" \
+    "
+  else
+    CMD+=" \
       --template_pool ${pure_template_config}
-      "
-    fi
+    "
   fi
 
   echo "========================================"
   echo "Running: ${TASK_NAME}"
-  echo "RL_USE=${RL_USE}, USE_NEWS=${USE_NEWS}"
+  echo "USE_NEWS=${USE_NEWS}"
   echo "========================================"
 
   eval $CMD

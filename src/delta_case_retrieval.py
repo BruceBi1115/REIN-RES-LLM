@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import hashlib
+import zlib
+import re
 from datetime import datetime
 from typing import Any
 
@@ -39,6 +42,104 @@ def _safe_array(x: Any, default_len: int = 0) -> np.ndarray:
     if arr.size == 0 and default_len > 0:
         return np.zeros((default_len,), dtype=np.float32)
     return arr
+
+
+def _build_text_vector(text: Any, dim: int = 128) -> np.ndarray:
+    s = str(text or "").strip().lower()
+    if not s:
+        return np.zeros((0,), dtype=np.float32)
+    toks = re.findall(r"[a-z0-9]+", s)
+    if len(toks) == 0:
+        return np.zeros((0,), dtype=np.float32)
+    d = int(max(16, dim))
+    vec = np.zeros((d,), dtype=np.float32)
+    for tok in toks:
+        h = hashlib.sha1(tok.encode("utf-8")).digest()
+        idx = int.from_bytes(h[:4], "little", signed=False) % d
+        sign = 1.0 if (int(h[4]) & 1) == 0 else -1.0
+        vec[idx] += sign
+    n = float(np.linalg.norm(vec))
+    if n <= 1e-8:
+        return np.zeros((0,), dtype=np.float32)
+    vec = vec / n
+    return vec.astype(np.float32, copy=False)
+
+
+def _case_text_vector(case_like: dict, dim: int = 128) -> np.ndarray:
+    if not isinstance(case_like, dict):
+        return np.zeros((0,), dtype=np.float32)
+    tv = _safe_array(case_like.get("text_vector", []))
+    if tv.size > 0:
+        return tv
+    return _build_text_vector(case_like.get("refined_news", ""), dim=dim)
+
+
+def _text_similarity_from_query_vec(query_vec: np.ndarray, case_like: dict, dim: int = 128) -> float:
+    q = _safe_array(query_vec)
+    c = _case_text_vector(case_like, dim=dim)
+    if q.size == 0 or c.size == 0:
+        return 0.0
+    d = min(int(q.size), int(c.size))
+    if d <= 0:
+        return 0.0
+    qv = q[:d].astype(np.float32, copy=False)
+    cv = c[:d].astype(np.float32, copy=False)
+    qn = float(np.linalg.norm(qv))
+    cn = float(np.linalg.norm(cv))
+    if qn <= 1e-8 or cn <= 1e-8:
+        return 0.0
+    cos = float(np.dot(qv, cv) / (qn * cn))
+    return float(max(0.0, min(1.0, 0.5 * (cos + 1.0))))
+
+
+def _refine_cache_key_for_case(
+    *,
+    raw_news_texts: list[str],
+    context: dict,
+    mode: str,
+    model: str,
+    max_tokens: int,
+) -> str:
+    clean = [str(x).strip() for x in raw_news_texts if str(x).strip()]
+    payload = {
+        "mode": str(mode or "").lower().strip(),
+        "model": str(model or "").strip(),
+        "max_tokens": int(max(1, max_tokens)),
+        "target_time": str(context.get("target_time", "")).strip(),
+        "region": str(context.get("region", "")).strip(),
+        "description": str(context.get("description", "")).strip(),
+        "news": clean,
+    }
+    s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def _to_utc_time(ts_like: Any) -> pd.Timestamp | None:
+    try:
+        ts = pd.to_datetime(ts_like, errors="coerce", utc=True)
+    except Exception:
+        ts = pd.NaT
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def _recency_similarity(query_time: Any, case_time: Any, tau_hours: float = 168.0) -> float:
+    qt = _to_utc_time(query_time)
+    ct = _to_utc_time(case_time)
+    if qt is None or ct is None:
+        return 0.0
+    tau = max(1e-3, float(tau_hours))
+    diff_h = abs(float((qt - ct).total_seconds()) / 3600.0)
+    return float(math.exp(-diff_h / tau))
+
+
+def _regime_similarity(query_regime: Any, case_regime: Any) -> float:
+    q = str(query_regime or "").strip().lower()
+    c = str(case_regime or "").strip().lower()
+    if not q or not c:
+        return 0.0
+    return 1.0 if q == c else 0.0
 
 
 def _parse_time_features(target_time: str) -> tuple[float, float, float, float]:
@@ -217,6 +318,7 @@ def build_case_record(
 
     state_vec, state_features = _state_vector(history_arr, base_arr, target_time=str(target_time))
     norm_events = normalize_structured_events(structured_events)
+    text_vec = _build_text_vector(refined_news, dim=128)
 
     return {
         "sample_id": str(sample_id),
@@ -229,6 +331,7 @@ def build_case_record(
         "state_vector": state_vec.tolist(),
         "state_features": state_features,
         "refined_news": str(refined_news or ""),
+        "text_vector": text_vec.tolist(),
         "structured_events": norm_events,
         "metadata": dict(metadata or {}),
     }
@@ -294,22 +397,68 @@ def rerank_cases_by_event(
     query_case: dict,
     candidates: list[dict],
     *,
+    mode: str = "price_event",
     alpha_price: float = 0.85,
     alpha_event: float = 0.15,
+    alpha_text: float = 0.20,
+    alpha_recency: float = 0.10,
+    alpha_regime: float = 0.05,
+    recency_tau_hours: float = 168.0,
 ) -> list[dict]:
     if not candidates:
         return []
+    use_mode = str(mode or "price_event").lower().strip()
     q_event = query_case.get("structured_events", {})
-    use_event = isinstance(q_event, dict) and len(q_event) > 0 and alpha_event > 0.0
+    q_time = query_case.get("target_time", "")
+    q_regime = query_case.get("state_features", {}).get("regime", "")
+    q_text_vec = _case_text_vector(query_case, dim=128)
+    use_event = (
+        use_mode == "price_event"
+        and isinstance(q_event, dict)
+        and len(q_event) > 0
+        and float(alpha_event) > 0.0
+    )
+    use_text = q_text_vec.size > 0 and float(alpha_text) > 0.0
+
+    w_price = float(max(0.0, alpha_price))
+    w_event = float(max(0.0, alpha_event if use_event else 0.0))
+    w_text = float(max(0.0, alpha_text if use_text else 0.0))
+    w_recency = float(max(0.0, alpha_recency))
+    w_regime = float(max(0.0, alpha_regime))
+    denom = w_price + w_event + w_text + w_recency + w_regime
+    if denom <= 1e-8:
+        w_price, w_event, w_text, w_recency, w_regime, denom = 1.0, 0.0, 0.0, 0.0, 0.0, 1.0
+
     ranked = []
     for c in candidates:
         price_score = _safe_float(c.get("price_score", 0.0), default=0.0)
         event_score = 0.0
         if use_event:
             event_score = _event_similarity(q_event, c.get("structured_events", {}))
-        final_score = alpha_price * price_score + alpha_event * event_score
+        text_score = 0.0
+        if use_text:
+            text_score = _text_similarity_from_query_vec(q_text_vec, c, dim=128)
+        recency_score = _recency_similarity(
+            q_time,
+            c.get("target_time", ""),
+            tau_hours=float(recency_tau_hours),
+        )
+        regime_score = _regime_similarity(
+            q_regime,
+            c.get("state_features", {}).get("regime", ""),
+        )
+        final_score = (
+            w_price * price_score
+            + w_event * event_score
+            + w_text * text_score
+            + w_recency * recency_score
+            + w_regime * regime_score
+        ) / denom
         cc = dict(c)
         cc["event_score"] = float(event_score)
+        cc["text_score"] = float(text_score)
+        cc["recency_score"] = float(recency_score)
+        cc["regime_score"] = float(regime_score)
         cc["final_score"] = float(final_score)
         ranked.append(cc)
     ranked.sort(key=lambda x: float(x.get("final_score", 0.0)), reverse=True)
@@ -403,6 +552,81 @@ def reject_low_confidence_retrieval(
     }
 
 
+def _compute_retrieval_soft_weight(reject_meta: dict, n_candidates: int) -> float:
+    if int(max(0, n_candidates)) <= 0:
+        return 0.0
+    conf = float(max(0.0, min(1.0, _safe_float(reject_meta.get("retrieval_confidence", 0.0)))))
+    valid = bool(reject_meta.get("retrieval_valid", False))
+    reason = str(reject_meta.get("reject_reason", "")).strip().lower()
+    direction_agree = float(max(0.0, min(1.0, _safe_float(reject_meta.get("direction_agreement", 0.0)))))
+    mismatch = float(max(0.0, min(1.0, _safe_float(reject_meta.get("event_mismatch_rate", 1.0)))))
+
+    if valid:
+        base = 0.5 + 0.5 * conf
+    elif reason == "direction_disagree":
+        base = 0.35 * conf
+    elif reason == "event_mismatch":
+        base = 0.30 * conf
+    elif reason == "low_top_score":
+        base = 0.25 * conf
+    elif reason == "too_few_candidates":
+        base = 0.20 * conf
+    else:
+        base = 0.0
+
+    base *= (0.6 + 0.4 * direction_agree)
+    base *= (0.7 + 0.3 * (1.0 - mismatch))
+    return float(max(0.0, min(1.0, base)))
+
+
+def _compute_knn_delta_prior(
+    ranked_cases: list[dict],
+    *,
+    horizon: int = 0,
+    temperature: float = 0.20,
+) -> np.ndarray:
+    if not ranked_cases:
+        return np.zeros((max(0, int(horizon))), dtype=np.float32)
+
+    horizon_int = int(max(0, horizon))
+    if horizon_int <= 0:
+        horizon_int = max(int(_safe_array(c.get("residual_z", [])).size) for c in ranked_cases)
+    if horizon_int <= 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    res_rows = []
+    score_rows = []
+    for c in ranked_cases:
+        r = _safe_array(c.get("residual_z", []), default_len=horizon_int)
+        if r.size > horizon_int:
+            r = r[:horizon_int]
+        elif r.size < horizon_int:
+            pad = np.zeros((horizon_int - r.size,), dtype=np.float32)
+            r = np.concatenate([r, pad], axis=0)
+        res_rows.append(r.astype(np.float32, copy=False))
+        score_rows.append(_safe_float(c.get("final_score", c.get("price_score", 0.0)), default=0.0))
+
+    res_m = np.asarray(res_rows, dtype=np.float32)
+    scores = np.asarray(score_rows, dtype=np.float32).reshape(-1)
+    if res_m.ndim != 2 or res_m.shape[0] == 0:
+        return np.zeros((horizon_int,), dtype=np.float32)
+
+    if res_m.shape[0] == 1:
+        weights = np.ones((1,), dtype=np.float32)
+    else:
+        t = max(1e-4, float(temperature))
+        logits = (scores - float(scores.max(initial=0.0))) / t
+        w = np.exp(logits)
+        z = float(w.sum())
+        if not math.isfinite(z) or z <= 1e-12:
+            weights = np.full((res_m.shape[0],), 1.0 / float(res_m.shape[0]), dtype=np.float32)
+        else:
+            weights = (w / z).astype(np.float32)
+
+    prior = (weights.reshape(-1, 1) * res_m).sum(axis=0)
+    return prior.astype(np.float32, copy=False)
+
+
 def retrieve_similar_cases(
     *,
     query_case: dict,
@@ -411,10 +635,16 @@ def retrieve_similar_cases(
     mode: str = "price_event",
     alpha_price: float = 0.85,
     alpha_event: float = 0.15,
+    alpha_text: float = 0.20,
+    alpha_recency: float = 0.10,
+    alpha_regime: float = 0.05,
+    recency_tau_hours: float = 168.0,
     min_top_score: float = 0.12,
     min_candidates: int = 2,
     min_direction_agreement: float = 0.45,
     max_event_mismatch: float = 0.8,
+    knn_temperature: float = 0.20,
+    knn_horizon: int = 0,
 ) -> dict:
     top_n = int(max(1, top_n))
     if not isinstance(case_bank, dict) or len(case_bank.get("cases", [])) == 0:
@@ -426,6 +656,8 @@ def retrieve_similar_cases(
             "direction_agreement": 0.0,
             "event_mismatch_rate": 1.0,
             "mode": str(mode),
+            "retrieval_soft_weight": 0.0,
+            "knn_delta_prior_z": [],
         }
 
     cases = case_bank.get("cases", [])
@@ -444,6 +676,8 @@ def retrieve_similar_cases(
             "direction_agreement": 0.0,
             "event_mismatch_rate": 1.0,
             "mode": str(mode),
+            "retrieval_soft_weight": 0.0,
+            "knn_delta_prior_z": [],
         }
 
     qid = str(query_case.get("sample_id", ""))
@@ -465,30 +699,61 @@ def retrieve_similar_cases(
             "direction_agreement": 0.0,
             "event_mismatch_rate": 1.0,
             "mode": str(mode),
+            "retrieval_soft_weight": 0.0,
+            "knn_delta_prior_z": [],
         }
 
     candidates.sort(key=lambda x: float(x.get("price_score", 0.0)), reverse=True)
     pre_top = candidates[: max(top_n * 4, top_n)]
 
     use_mode = str(mode or "price_event").lower().strip()
-    if use_mode == "price":
-        ranked = []
-        for c in pre_top:
-            cc = dict(c)
-            cc["event_score"] = 0.0
-            cc["final_score"] = float(cc.get("price_score", 0.0))
-            ranked.append(cc)
-    else:
-        ap = float(max(0.5, min(1.0, alpha_price)))
-        ae = float(max(0.0, min(0.5, alpha_event)))
-        if ap <= ae:
-            ap = 0.7
-            ae = 0.3
+    if use_mode == "random":
+        seed = zlib.adler32(str(qid or "random").encode("utf-8"))
+        rng = np.random.default_rng(seed)
+        pick_n = min(top_n, len(candidates))
+        if pick_n <= 0:
+            ranked = []
+        else:
+            picked = rng.choice(len(candidates), size=pick_n, replace=False).tolist()
+            ranked = [dict(candidates[int(i)]) for i in picked]
+            q_event = query_case.get("structured_events", {})
+            q_time = query_case.get("target_time", "")
+            q_regime = query_case.get("state_features", {}).get("regime", "")
+            for cc in ranked:
+                cc["event_score"] = _event_similarity(q_event, cc.get("structured_events", {}))
+                cc["recency_score"] = _recency_similarity(
+                    q_time,
+                    cc.get("target_time", ""),
+                    tau_hours=float(recency_tau_hours),
+                )
+                cc["regime_score"] = _regime_similarity(
+                    q_regime,
+                    cc.get("state_features", {}).get("regime", ""),
+                )
+                cc["final_score"] = float(cc.get("price_score", 0.0))
+    elif use_mode == "price":
         ranked = rerank_cases_by_event(
             query_case=query_case,
             candidates=pre_top,
-            alpha_price=ap,
-            alpha_event=ae,
+            mode="price",
+            alpha_price=1.0,
+            alpha_event=0.0,
+            alpha_text=float(alpha_text),
+            alpha_recency=float(alpha_recency),
+            alpha_regime=float(alpha_regime),
+            recency_tau_hours=float(recency_tau_hours),
+        )
+    else:
+        ranked = rerank_cases_by_event(
+            query_case=query_case,
+            candidates=pre_top,
+            mode="price_event",
+            alpha_price=float(alpha_price),
+            alpha_event=float(alpha_event),
+            alpha_text=float(alpha_text),
+            alpha_recency=float(alpha_recency),
+            alpha_regime=float(alpha_regime),
+            recency_tau_hours=float(recency_tau_hours),
         )
 
     ranked = ranked[:top_n]
@@ -500,9 +765,17 @@ def retrieve_similar_cases(
         min_direction_agreement=float(min_direction_agreement),
         max_event_mismatch=float(max_event_mismatch),
     )
+    soft_w = _compute_retrieval_soft_weight(reject, n_candidates=len(ranked))
+    knn_prior = _compute_knn_delta_prior(
+        ranked,
+        horizon=int(max(0, knn_horizon)),
+        temperature=float(knn_temperature),
+    )
     out = {
         "candidates": ranked,
         "mode": use_mode,
+        "retrieval_soft_weight": float(soft_w),
+        "knn_delta_prior_z": knn_prior.tolist(),
     }
     out.update(reject)
     return out
@@ -518,22 +791,30 @@ def build_retrieval_features(
     candidates = list(retrieval_output.get("candidates", []))
     valid = float(bool(retrieval_output.get("retrieval_valid", False)))
     confidence = float(_safe_float(retrieval_output.get("retrieval_confidence", 0.0)))
+    soft_weight = float(_safe_float(retrieval_output.get("retrieval_soft_weight", valid * confidence)))
+    soft_weight = float(max(0.0, min(1.0, soft_weight)))
+    knn_delta_prior = _safe_array(retrieval_output.get("knn_delta_prior_z", []))
 
     if not candidates:
         feat = np.zeros((feature_dim,), dtype=np.float32)
-        feat[0] = valid
+        feat[0] = soft_weight
         feat[1] = confidence
+        feat[2] = valid
         meta = {
             "retrieval_valid": bool(valid > 0.5),
             "retrieval_confidence": confidence,
+            "retrieval_soft_weight": soft_weight,
             "retrieval_mode": str(retrieval_output.get("mode", "off")),
             "reject_reason": str(retrieval_output.get("reject_reason", "empty")),
             "coverage": float(valid),
+            "knn_delta_prior_z": knn_delta_prior.tolist(),
         }
         return feat, meta
 
     price_scores = np.asarray([_safe_float(c.get("price_score", 0.0)) for c in candidates], dtype=np.float32)
     event_scores = np.asarray([_safe_float(c.get("event_score", 0.0)) for c in candidates], dtype=np.float32)
+    recency_scores = np.asarray([_safe_float(c.get("recency_score", 0.0)) for c in candidates], dtype=np.float32)
+    regime_scores = np.asarray([_safe_float(c.get("regime_score", 0.0)) for c in candidates], dtype=np.float32)
     final_scores = np.asarray([_safe_float(c.get("final_score", 0.0)) for c in candidates], dtype=np.float32)
 
     residual_means = []
@@ -561,13 +842,16 @@ def build_retrieval_features(
         direction_agree = max(pos_frac, neg_frac)
 
     feat_vals = [
-        valid,
+        soft_weight,
         confidence,
+        valid,
         float(price_scores.max(initial=0.0)),
         float(price_scores.mean() if price_scores.size else 0.0),
         float(price_scores.std() if price_scores.size else 0.0),
         float(event_scores.max(initial=0.0)),
         float(event_scores.mean() if event_scores.size else 0.0),
+        float(recency_scores.mean() if recency_scores.size else 0.0),
+        float(regime_scores.mean() if regime_scores.size else 0.0),
         float(np.mean(residual_abs_means) if residual_abs_means else 0.0),
         float(np.std(residual_abs_means) if residual_abs_means else 0.0),
         float(pos_frac),
@@ -585,6 +869,7 @@ def build_retrieval_features(
     meta = {
         "retrieval_valid": bool(valid > 0.5),
         "retrieval_confidence": confidence,
+        "retrieval_soft_weight": soft_weight,
         "retrieval_mode": str(retrieval_output.get("mode", "off")),
         "reject_reason": str(retrieval_output.get("reject_reason", "")),
         "direction_agreement": float(_safe_float(retrieval_output.get("direction_agreement", direction_agree))),
@@ -597,6 +882,7 @@ def build_retrieval_features(
             )
         ),
         "topk": int(len(candidates)),
+        "knn_delta_prior_z": knn_delta_prior.tolist(),
     }
     return feat, meta
 
@@ -637,21 +923,62 @@ def _build_news_context_for_case(
     if selected is None or len(selected) == 0:
         return "", {}
     raw_news_texts = selected[text_col].fillna("").astype(str).tolist()
-    refined_news = refine_news_text(
-        raw_news_texts=raw_news_texts,
-        tokenizer=tokenizer,
-        max_tokens=int(getattr(args, "token_budget", 700) * float(getattr(args, "token_budget_news_frac", 0.9))),
-        mode=str(getattr(args, "news_refine_mode", "local")),
-        api_adapter=api_adapter,
-        context={"target_time": str(target_time), "region": str(getattr(args, "region", ""))},
-    )
+    max_tokens = int(getattr(args, "token_budget", 700) * float(getattr(args, "token_budget_news_frac", 0.9)))
+    context = {
+        "target_time": str(target_time),
+        "region": str(getattr(args, "region", "")),
+        "description": str(getattr(args, "description", "")),
+    }
+    refine_mode = str(getattr(args, "news_refine_mode", "local"))
+    refine_model = str(getattr(api_adapter, "model", getattr(args, "news_api_model", "")))
+    cache_enabled = bool(getattr(args, "_refine_cache_enabled", False))
+    cache_store = getattr(args, "_refine_cache_store", None)
+    cache_key = ""
+    refined_news = ""
+    if cache_enabled and isinstance(cache_store, dict):
+        cache_key = _refine_cache_key_for_case(
+            raw_news_texts=raw_news_texts,
+            context=context,
+            mode=refine_mode,
+            model=refine_model,
+            max_tokens=max_tokens,
+        )
+        cached = cache_store.get(cache_key, "")
+        if isinstance(cached, str) and cached.strip():
+            refined_news = cached.strip()
+            setattr(
+                args,
+                "_refine_cache_hits",
+                int(getattr(args, "_refine_cache_hits", 0)) + 1,
+            )
+
+    if not refined_news:
+        refined_news = refine_news_text(
+            raw_news_texts=raw_news_texts,
+            tokenizer=tokenizer,
+            max_tokens=max_tokens,
+            mode=refine_mode,
+            api_adapter=api_adapter,
+            context=context,
+        )
+        if cache_enabled and isinstance(cache_store, dict) and cache_key and refined_news:
+            cache_store[cache_key] = str(refined_news)
+            setattr(args, "_refine_cache_store", cache_store)
+            setattr(args, "_refine_cache_dirty", True)
+        if cache_enabled:
+            setattr(
+                args,
+                "_refine_cache_misses",
+                int(getattr(args, "_refine_cache_misses", 0)) + 1,
+            )
+
     if not refined_news:
         return "", {}
     events = extract_structured_events(
         raw_or_refined_news=refined_news,
         mode=str(getattr(args, "news_structured_mode", "off")),
         api_adapter=api_adapter,
-        context={"target_time": str(target_time), "region": str(getattr(args, "region", ""))},
+        context=context,
     )
     return refined_news, events
 
@@ -681,7 +1008,7 @@ def build_case_bank(
     base_model.eval()
     cases: list[dict] = []
     bank_limit = int(max(0, getattr(args, "case_retrieval_bank_max", 0)))
-    use_events = str(getattr(args, "news_structured_mode", "off")).lower().strip() in {"heuristic", "api"}
+    use_news_context = int(getattr(args, "case_retrieval_enable", 0)) == 1
     for batch in train_loader:
         history_raw = batch["history_value"].to(torch.float32)
         target_raw = batch["target_value"].to(torch.float32)
@@ -697,7 +1024,7 @@ def build_case_bank(
 
             refined_news = ""
             structured_events = {}
-            if use_events and news_df is not None and len(news_df) > 0:
+            if use_news_context and news_df is not None and len(news_df) > 0:
                 refined_news, structured_events = _build_news_context_for_case(
                     target_time=target_time,
                     news_df=news_df,
@@ -722,8 +1049,8 @@ def build_case_bank(
                 },
             )
             cases.append(case)
-            with open("case711.json", "a", encoding="utf-8") as _f:
-                _f.write(json.dumps(case, ensure_ascii=False) + "\n")
+            # with open("case711.json", "a", encoding="utf-8") as _f:
+            #     _f.write(json.dumps(case, ensure_ascii=False) + "\n")
             if bank_limit > 0 and len(cases) >= bank_limit:
                 break
         if bank_limit > 0 and len(cases) >= bank_limit:

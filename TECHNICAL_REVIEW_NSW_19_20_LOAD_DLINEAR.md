@@ -1,207 +1,124 @@
-# Technical Review: REIN-LLM-Forecast（2024 NSW ElecPrice Case, dlinear）
+# TECHNICAL REVIEW (Current Project State)
 
-## 1. Review Scope
+Last updated: 2026-03-13  
+Scope: `tinynews + base/delta + case retrieval` current code path (no conv branch in active forward path)
 
-本评审基于以下运行与代码：
+## 1) Executive Summary
 
-- 运行日志：`checkpoints/[2024-nswelecPrice-case]_dlinear/[2024-nswelecPrice-case]_dlinear_dlinear.log`
-- 启动脚本：`scripts/nswelecprice_2024_case.sh`
-- 入口与训练主干：`run.py`、`src/base_delta_decoouple_trainer.py`
-- 模型实现：`src/base_backbone.py`、`src/model2.py`
-- 数据与提示词构建：`src/data_construction/data.py`、`src/data_construction/prompt.py`
-- 新闻与检索：`src/news_rules.py`、`src/delta_news_hooks.py`、`src/delta_case_retrieval.py`
+- 当前主实验（NSW 2024 electricity price）已经进入“稳定小幅提升”阶段：  
+  - Base-only test MAE: **118.4445**  
+  - Final (Base+Delta) test MAE: **117.8560**  
+  - 绝对提升: **0.5885 MAE**（约 **0.50%**）
+- 提升主要来自 **case retrieval + delta residual correction**，而不是文本 token 直接建模。
+- 当前代码中，预测主干并未直接使用大模型做生成式预测；OpenAI API 主要用于 **news refine / structured event extraction**（可缓存）。
+- 风险点不是“模型不会学”，而是“增益上限偏低”：delta 主要在 base 周围做小修正，提升容易被门控/先验约束压住。
 
----
+## 2) What Is Actually Running Now
 
-## 2. Experiment Snapshot
+### 2.1 Core Pipeline
 
-### 2.1 数据规模（L=48, H=48, stride=48）
+1. Base stage: 纯时间序列 backbone（当前脚本默认 `mlp`）训练并保存 best base。  
+2. Case bank build: 若启用 retrieval，用 train split + base 预测构建 case bank。  
+3. Refine cache prewarm: 预热新闻 refine cache，减少 delta 阶段 API 成本与等待。  
+4. Delta stage: 训练 residual correction（支持 additive/relative，两者当前脚本默认 relative）。  
+5. Test + ablation: 运行最终测试和 retrieval 消融。
 
-- Train rows: 9600, windows: 199
-- Val rows: 4800, windows: 99
-- Test rows: 3168, windows: 65
+### 2.2 Model Path (Important)
 
-### 2.2 本次关键配置
+- 当前 `TinyNewsTSRegressor` 的 forward 实际用的是：
+  - `ts_patches` -> patch MLP encoder -> pooled TS feature
+  - base head / delta head / delta gate / retrieval bias
+- `input_ids`、`attention_mask` 在 forward 里被显式丢弃（不参与预测计算）。
+- 这意味着：
+  - 文本并不直接进入预测头；
+  - 文本影响是间接的，主要通过 refine -> structured/retrieval 特征 -> delta 修正链路。
 
-- Task: `[2024-nswelecPrice-case]_dlinear`
-- Stage: `all`（先 base 后 delta）
-- Base backbone: `dlinear`
-- Base epochs: 40（early stop 到第20轮）
-- Delta epochs: 40（early stop 到第5轮）
-- Value column: `RRP`
-- Unit: `$/MWh`
-- News source: `dataset/news_2024_2025.json`
-- News columns: `date` + `content`
-- News policy: `all`
-- Case retrieval: `enable=1, mode=price_event, topk=3`
-- LoRA: Llama-3-8B, `r=8, alpha=32, dropout=0.05`
-- Global z-score（来自 train）：
-  - `mu_global = 129.026443`
-  - `sigma_global = 628.777100`
+### 2.3 API Usage
 
----
+- API 模型（脚本默认 `gpt-5.1`）用于：
+  - `refine_news_text`：压缩为固定模板方向摘要；
+  - `extract_structured_events`（若 `news_structured_mode=api`）；
+- cache 机制已生效，格式为标准 JSON array（`cache_key + refined_news`），并在日志中持续记录 hit/miss。
 
-## 3. End-to-End Pipeline（实验全流程）
+## 3) Current Script Snapshot (tinynews main script)
 
-1. `scripts/nswelecprice_2024_case.sh` 组织参数并调用 `python run.py ...`。
-2. `run.py` 解析参数并进入 `src/base_delta_decoouple_trainer.main(args)`。
-3. `setup_env_and_data()` 读取 train/val/test CSV，计算全局 z-score。
-4. `make_loader()` 按 `(L,H,stride)` 切窗构建 DataLoader。
-5. 读取新闻 JSON，按 `news_time_col/news_text_col` 清洗文本。
-6. 加载模板 `configs/deltaWithNews_template.yaml`。
-7. **Base 阶段**：训练 `DLinearBackbone`，输入 `history_z (B,L)` 输出 `base_pred_z (B,H)`，每轮在 val 上评估并保存 best。
-8. **Delta 阶段初始化**：加载 best base（冻结）+ LLaMA/LoRA + `TSForecastRegressor`。
-9. 构建 train-only case bank（本次 `n_cases=199`）。
-10. 每个 delta batch 先由 base backbone 得到 `base_pred`。
-11. 同批次构建两套输入：
-    - with-news（真实新闻上下文）
-    - no-news（counterfactual 空新闻）
-12. with-news 过程：候选筛选 -> policy 选取 -> utility 重排 -> news RL 选择 -> refine -> structured event。
-13. 若开启检索：query case 对 case bank 检索，生成 retrieval features 与 validity/confidence 元信息。
-14. Delta 前向：文本 token + patch token 共送 LLM，做层融合与池化，输出 `delta_pred` 和 `rel_logits`。
-15. 最终预测：
-    - `gate = bounded_sigmoid(rel_logits)`
-    - `pred_final_z = base_pred_z + gate * delta_pred_z`
-    - 反归一化到原值域并统计指标。
+`scripts/nswelecprice_2024_tinynews.sh` 当前关键设置：
 
----
+- Stage: `all`
+- Base backbone: `mlp`
+- Delta residual mode: `relative`
+- Case retrieval: `enable=1`, `mode=price_event`, `topk=3`
+- Ablation split: `test`
+- Refine mode: 默认 API（如果 key 可用）
+- Conv 相关开关：当前主路径无 conv forward 贡献
 
-## 4. 单样本预测是如何生成的
+## 4) Latest Observed Results
 
-1. 从滑窗取历史 48 点和未来 48 点标签。
-2. 用 train 全局 `mu/sigma` 做 z-score。
-3. Base 先预测 `base_pred_z`（无新闻）。
-4. 历史 z 序列生成 history 文本（含 slope）。
-5. 以 `target_time` 为锚点，检索过去 `news_window_days=1` 天新闻。
-6. 新闻经筛选/重排/截断，附加 structured event（heuristic）。
-7. 拼接 prompt（history + news + output instruction）。
-8. 历史 z 切 patch（`patch_len=4`，48点=>12 patch）。
-9. Prompt token 与 patch token 一起输入 LLM。
-10. Delta head 生成残差修正 `delta_pred_z`。
-11. Relevance head 生成 `rel_logits`，经过门控得到 `gate`。
-12. 最终：
-    - `final_pred_z = base_pred_z + gate * delta_pred_z`
-    - `final_pred = final_pred_z * sigma + mu`
+From `checkpoints/[2024-nswelecPrice-tinynews]_mlp/[2024-nswelecPrice-tinynews]_mlp_mlp.log`:
 
----
+- Best delta validation (epoch 6):  
+  - Delta val MAE: **62.383731**  
+  - Base-only val MAE: **62.610653**  
+  - Delta vs base: **-0.226922**
+- Final test:
+  - `[TEST][FINAL]` MAE: **117.855973**
+  - `[TEST][BASE_ONLY]` MAE: **118.444495**
 
-## 5. 本次实验结果解读
+From test ablation:
 
-### 5.1 Base 训练
+- `no_retrieval`: **118.436602**
+- `price_only`: **117.861588** (improve 0.5750)
+- `price_event`: **117.855973** (best, improve 0.5806)
+- `gate_only`: **117.856918** (几乎与 full 持平)
+- `random_retrieval`: **118.474581** (负贡献)
 
-- 最优 val 出现在 epoch16：`val_mae = 91.335106`
-- epoch20 触发 early stop（patience=4）
+Interpretation:
 
-### 5.2 Delta 训练
+- 检索本身是有效信号（price / price_event 明显优于 no_retrieval）。
+- 随机检索会恶化表现，说明不是“多加一个分支就有用”，而是“相似性质量决定收益”。
+- `gate_only` 接近 full，说明当前阶段 retrieval 对“门控/可信度”贡献大于对“delta数值形状”贡献。
 
-- epoch1~5 的 val MAE：`92.837763 -> 91.449093 -> 91.438855 -> 91.433438 -> 91.428947`
-- 对比 base-only val（91.335106），delta 阶段始终未超过 base
-- epoch5 触发 early stop
+## 5) Why Improvement Is Still Limited
 
-### 5.3 `[ABLATION]` 到底在做什么（VAL）
+1. Delta correction幅度被多重稳定项限制（gate、null regularization、knn blending等），策略偏保守。  
+2. Delta 训练目标本质仍是“围绕 base 的小修正”，不是重建主预测。  
+3. 检索先验有效但上限有限，尤其在高波动样本上，top-k 先验可能过于平滑。  
+4. 当前文本作用路径是“摘要->结构化->检索特征”，不是端到端语义建模，信息利用深度受限。  
 
-#### 5.3.1 触发时机
+## 6) Highest-Impact Next Steps (Practical)
 
-训练结束后，加载 best delta，再对同一数据集做 4 组“检索注入方式”对照：
+### P0 (先做，低风险高收益)
 
-- `case_retrieval_run_ablations=1` 才会执行
-- `case_retrieval_ablation_split=val` 本次只跑验证集
+1. 做“高波动子集”参数分桶：对高波动样本放宽 gate 与 knn 抑制，低波动维持保守。  
+2. 调整 knn blend：降低默认 alpha，改为更依赖 retrieval confidence 的自适应 alpha。  
+3. 提高 retrieval 特征的信息密度：增加“候选分歧度、残差分位数、event一致性”输入，而不是仅均值统计。
 
-#### 5.3.2 四个模式
+### P1 (中等改动)
 
-- `no_retrieval`
-  - 强制关闭检索
-  - 用作基线
-- `price_only`
-  - 开启检索，仅按状态向量相似度排序
-- `price_event`
-  - 在 price 相似度上融合结构化事件相似度重排
-- `gate_only`
-  - 检索流程同 `price_event`
-  - 但检索特征只影响 gate/confidence，不注入 delta 主干特征
+1. 两阶段 delta：先学 gate/relevance，再学 correction magnitude（冻结/半冻结策略）。  
+2. 检索候选重排增加“时段结构约束”（同小时/同weekday权重更高）。  
+3. 对 `relative` 模式增加 regime-aware denominator floor（不是全局常数 floor）。
 
-#### 5.3.3 日志字段解释
+### P2 (研究向)
 
-- `metric`：本次比较主指标（由 `reward_metric` 决定；本 run 为 MAE）
-- `delta_vs_no`：相对 `no_retrieval` 的差值（负值更好）
-- `coverage`：检索判定有效（`retrieval_valid=True`）的样本占比
-- `mae_valid`：有效检索子集上的 MAE
-- `mae_rejected`：被拒绝检索子集上的 MAE
-- `strong_valid/strong_rej`：仅“强新闻样本”子集上的 MAE
+1. 从 case bank 的 top-k 序列构建轻量 cross-attn 聚合器，替代手工统计特征。  
+2. 针对 retrieval fail 样本加入 hard-negative 对比训练，提升 reject 机制与权重标定。
 
-#### 5.3.4 本次 ablation 数值
+## 7) Reproducibility Notes
 
-- `no_retrieval`: 92.771487（基线）
-- `price_only`: 92.770754（`-0.000733`）
-- `price_event`: 92.770353（`-0.001135`，四者中最佳）
-- `gate_only`: 92.771058（`-0.000429`）
+- 当前结果对应的是“最新代码 + 当前 tinynews 脚本配置”；历史 run 的可比性会受以下因素影响：
+  - 是否命中 refine cache；
+  - case bank是否重建；
+  - train/val/test split 是否完全一致；
+  - 随机种子与 checkpoint 选择策略。
+- 如果要做严谨对比，建议固定：
+  1. cache 文件；
+  2. case bank 文件；
+  3. seed；
+  4. 单一脚本快照（commit hash）。
 
-可读结论：
+## 8) Bottom Line
 
-1. 全局差异极小（千分之一量级），检索分支对总 MAE 的边际收益很弱。
-2. `price_event` 相比 `price_only` 略好，说明事件重排有轻微正向增益。
-3. `gate_only` 逊于 `price_event`，说明“检索特征注入 delta 主干”仍有微弱贡献。
-4. `coverage` 从 `0.657` 提到 `0.929`，表示 price_event 策略下更多样本被判为检索有效。
-5. `strong_valid/strong_rej` 为 `nan`，这是因为本次数据里新闻没有 `rate` 字段，强新闻标签基本不可用。
-
-### 5.4 Test 最终
-
-- `[TEST][FINAL] mse(raw)=721256.694098, mae(raw)=176.461609`
-- `[TEST][BASE_ONLY] mse(raw)=721377.949785, mae(raw)=175.887803`
-
-对比结论：
-
-- MSE 小幅改善：`-121.255687`（约 `-0.0168%`）
-- MAE 退化：`+0.573806`（约 `+0.3262%`）
-
-总体上，这次 delta 在测试集上没有带来稳定收益（尤其 MAE 变差）。
-
----
-
-## 6. 关键技术风险（按优先级）
-
-1. **参数覆盖导致“看起来开了、实际没生效”**
-   - `delta_margin_lambda/delta_adv_margin` 会被 `delta_cf_lambda/delta_cf_margin` 覆盖。
-   - 本次配置里 `delta_cf_lambda=0.0`，导致 margin类约束几乎没参与。
-
-2. **`gate_lambda` 可能未真正生效**
-   - 训练逻辑优先读 `delta_gate_reg_lambda`，本次是 0。
-
-3. **best-delta 日志语义与真实性能可能不一致**
-   - 首次保存 best delta 时，`best_metric` 可能仍沿用 base 阈值。
-
-4. **日志损失名与实际 loss 类型有语义偏差**
-   - 日志里多处写 `zMSE`，实现中常用 `L1/smooth_l1`。
-
-5. **数据集新闻缺少 `rate` 字段**
-   - `rel_label` 与 strong-news 统计可解释性下降，`strong_*` 结果失效（`nan`）。
-
-6. **数据切窗前未强制排序**
-   - 若原始 CSV 顺序异常，窗口会混入时序错位样本。
-
-7. **配置日志误脱敏**
-   - 非敏感字段（如 `tokenizer`、`token_budget`）被打码，不利于复现。
-
----
-
-## 7. 建议的最小修复路线
-
-1. 合并并规范 counterfactual 参数命名，避免双命名覆盖。
-2. 明确 `gate_lambda` 与 `delta_gate_reg_lambda` 的优先级逻辑。
-3. 修正 best-delta 保存与日志语义（best 值与真实 checkpoint 对齐）。
-4. 统一日志中的 loss 命名，按真实实现输出。
-5. 对无 `rate` 新闻源增加 fallback 的强新闻定义，避免 `strong_* = nan`。
-6. 在 `SlidingDataset` 中恢复时间排序，防止潜在错窗。
-7. 调整敏感字段掩码规则，只屏蔽真正敏感键。
-
----
-
-## 8. 产物清单（本次 run）
-
-- Base ckpt: `checkpoints/[2024-nswelecPrice-case]_dlinear/best_base_[2024-nswelecPrice-case]_dlinear`
-- Delta ckpt: `checkpoints/[2024-nswelecPrice-case]_dlinear/best_delta_[2024-nswelecPrice-case]_dlinear`
-- Case bank: `checkpoints/[2024-nswelecPrice-case]_dlinear/case_bank_train_[2024-nswelecPrice-case]_dlinear.json`
-- Prompt dump: `checkpoints/[2024-nswelecPrice-case]_dlinear/prompts_[2024-nswelecPrice-case]_dlinear_dlinear.json`
-- Test answers: `checkpoints/[2024-nswelecPrice-case]_dlinear/test_answers_[2024-nswelecPrice-case]_dlinear_dlinear.json`
-- True vs Pred CSV: `checkpoints/[2024-nswelecPrice-case]_dlinear/true_pred_[2024-nswelecPrice-case]_dlinear_dlinear.csv`
-- Plot: `checkpoints/[2024-nswelecPrice-case]_dlinear/PredVsTrue_[2024-nswelecPrice-case]_dlinear.png`
+- 当前框架已经验证：**case retrieval 对 test 有稳定正贡献**。  
+- 但系统仍偏“稳健保守型 delta”，所以提升不是爆发式。  
+- 想把 MAE 再明显压低，关键不是继续加模块，而是做“按样本难度/波动状态的自适应放权与检索质量提升”。

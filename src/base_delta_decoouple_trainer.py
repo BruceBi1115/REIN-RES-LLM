@@ -17,6 +17,7 @@ import gc
 import os
 import json
 import math
+import hashlib
 import re
 from collections import deque
 from contextlib import nullcontext
@@ -41,12 +42,9 @@ from .news_rules import (
     rerank_selected_news_by_utility,
 )
 from .data_construction.prompt import load_templates, build_prompt
-from .RL.rl_bandit import LinTS, LinUCB, RewardNormalizer
-from .ValidationState import ValidationState
 from .utils.logger import setup_live_logger
-from .RL.features import bandit_select, get_context_features, encode_instruction
 
-from .model2 import load_checkpoint, load_llama_lora, save_checkpoint
+from .model2 import build_delta_model, load_checkpoint, save_checkpoint
 from .base_backbone import (
     build_base_backbone,
     save_base_backbone_checkpoint,
@@ -183,6 +181,111 @@ def _maybe_news_dropout(news_str: str, args) -> str:
     return news_str
 
 
+def _refine_cache_key(
+    *,
+    raw_news_texts: list[str],
+    context: dict,
+    mode: str,
+    model: str,
+    max_tokens: int,
+) -> str:
+    clean = [str(x).strip() for x in raw_news_texts if str(x).strip()]
+    payload = {
+        "mode": str(mode or "").lower().strip(),
+        "model": str(model or "").strip(),
+        "max_tokens": int(max(1, max_tokens)),
+        "target_time": str(context.get("target_time", "")).strip(),
+        "region": str(context.get("region", "")).strip(),
+        "description": str(context.get("description", "")).strip(),
+        "news": clean,
+    }
+    s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def _refine_cache_path(args) -> str:
+    p = str(getattr(args, "news_refine_cache_path", "") or "").strip()
+    if p:
+        return p
+    return os.path.join("./checkpoints", str(args.taskName), "refine_news_cache.json")
+
+
+def _init_refine_cache(args, live_logger=None):
+    enabled = int(getattr(args, "news_refine_cache_enable", 1)) == 1
+    setattr(args, "_refine_cache_enabled", bool(enabled))
+    setattr(args, "_refine_cache_store", {})
+    setattr(args, "_refine_cache_dirty", False)
+    setattr(args, "_refine_cache_hits", 0)
+    setattr(args, "_refine_cache_misses", 0)
+    if not enabled:
+        if live_logger is not None:
+            live_logger.info("[NEWS_REFINE_CACHE] disabled.")
+        return
+
+    path = _refine_cache_path(args)
+    setattr(args, "_refine_cache_path", path)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    store = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                store = {str(k): str(v) for k, v in obj.items() if isinstance(v, str)}
+            elif isinstance(obj, list):
+                parsed = {}
+                for rec in obj:
+                    if not isinstance(rec, dict):
+                        continue
+                    key = rec.get("cache_key", rec.get("key", rec.get("id", "")))
+                    value = rec.get("refined_news", rec.get("value", rec.get("text", "")))
+                    if isinstance(key, str) and isinstance(value, str):
+                        k = key.strip()
+                        if k:
+                            parsed[k] = value
+                store = parsed
+        except Exception:
+            store = {}
+    setattr(args, "_refine_cache_store", store)
+    if live_logger is not None:
+        live_logger.info(
+            f"[NEWS_REFINE_CACHE] enabled path={path} entries={len(store)}"
+        )
+
+
+def _save_refine_cache(args, live_logger=None, force: bool = False):
+    if not bool(getattr(args, "_refine_cache_enabled", False)):
+        return
+    dirty = bool(getattr(args, "_refine_cache_dirty", False))
+    if (not force) and (not dirty):
+        return
+    path = str(getattr(args, "_refine_cache_path", "")).strip()
+    store = getattr(args, "_refine_cache_store", None)
+    if not path or not isinstance(store, dict):
+        return
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    tmp = path + ".tmp"
+    payload = [
+        {"cache_key": str(k), "refined_news": str(v)}
+        for k, v in sorted(store.items(), key=lambda x: str(x[0]))
+        if isinstance(v, str)
+    ]
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    setattr(args, "_refine_cache_dirty", False)
+    if live_logger is not None:
+        hits = int(getattr(args, "_refine_cache_hits", 0))
+        misses = int(getattr(args, "_refine_cache_misses", 0))
+        live_logger.info(
+            f"[NEWS_REFINE_CACHE] saved entries={len(store)} hits={hits} misses={misses}"
+        )
+
+
 def _bounded_sigmoid_gate(logits: torch.Tensor, args) -> torch.Tensor:
     """
     Sample-wise gate in [floor, 1], controlled by temperature.
@@ -195,49 +298,148 @@ def _bounded_sigmoid_gate(logits: torch.Tensor, args) -> torch.Tensor:
     return floor + (1.0 - floor) * gate
 
 
+def _epoch_ramp_scale(epoch_idx: int, warmup_epochs: int, curriculum_epochs: int) -> float:
+    """
+    Piecewise ramp:
+      - 0 before warmup end
+      - linearly to 1 during curriculum window
+      - 1 afterwards
+    """
+    e = int(max(0, epoch_idx))
+    w = int(max(0, warmup_epochs))
+    c = int(max(1, curriculum_epochs))
+    if e < w:
+        return 0.0
+    progress = float(e - w + 1) / float(c)
+    return float(max(0.0, min(1.0, progress)))
+
+
+def _step_ramp_scale(step_idx: int, warmup_steps: int, ramp_steps: int) -> float:
+    """
+    Step-wise ramp used for null regularization:
+      - 0 before warmup steps
+      - linearly to 1 during ramp window
+      - 1 afterwards
+    """
+    s = int(max(0, step_idx))
+    w = int(max(0, warmup_steps))
+    r = int(max(0, ramp_steps))
+    if s < w:
+        return 0.0
+    if r <= 0:
+        return 1.0
+    progress = float(s - w + 1) / float(r)
+    return float(max(0.0, min(1.0, progress)))
+
+
+def _resolve_delta_residual_mode(args) -> str:
+    mode = str(getattr(args, "delta_residual_mode", "additive")).lower().strip()
+    if mode not in {"additive", "relative"}:
+        mode = "additive"
+    return mode
+
+
+def _z_to_raw_tensor(x_z: torch.Tensor, mu_global: float, sigma_global: float) -> torch.Tensor:
+    return x_z.to(torch.float32) * float(sigma_global) + float(mu_global)
+
+
+def _raw_to_z_tensor(x_raw: torch.Tensor, mu_global: float, sigma_global: float) -> torch.Tensor:
+    sigma = max(float(sigma_global), 1e-6)
+    return (x_raw.to(torch.float32) - float(mu_global)) / sigma
+
+
+def _safe_signed_denom_tensor(base_raw: torch.Tensor, args) -> torch.Tensor:
+    floor = float(getattr(args, "delta_relative_denom_floor", 1.0) or 1.0)
+    floor = max(1e-6, floor)
+    sign = torch.where(base_raw >= 0, torch.ones_like(base_raw), -torch.ones_like(base_raw))
+    return torch.where(base_raw.abs() >= floor, base_raw, sign * floor)
+
+
+def _convert_knn_prior_z_to_relative_np(
+    prior_z: np.ndarray,
+    base_pred_z: np.ndarray,
+    args,
+    mu_global: float,
+    sigma_global: float,
+) -> np.ndarray:
+    prior = np.asarray(prior_z, dtype=np.float32).reshape(-1)
+    base = np.asarray(base_pred_z, dtype=np.float32).reshape(-1)
+    if prior.size == 0:
+        return prior
+    if base.size < prior.size:
+        pad = np.zeros((prior.size - base.size,), dtype=np.float32)
+        base = np.concatenate([base, pad], axis=0)
+    elif base.size > prior.size:
+        base = base[: prior.size]
+
+    prior_raw = prior * float(sigma_global)
+    base_raw = base * float(sigma_global) + float(mu_global)
+
+    floor = float(getattr(args, "delta_relative_denom_floor", 1.0) or 1.0)
+    floor = max(1e-6, floor)
+    sign = np.where(base_raw >= 0.0, 1.0, -1.0).astype(np.float32)
+    denom = np.where(np.abs(base_raw) >= floor, base_raw, sign * floor).astype(np.float32)
+    ratio = prior_raw / denom
+
+    ratio_clip = float(getattr(args, "delta_relative_ratio_clip", 0.0) or 0.0)
+    if ratio_clip > 0.0:
+        ratio = np.clip(ratio, -ratio_clip, ratio_clip)
+    return ratio.astype(np.float32, copy=False)
+
+
+def _fuse_base_and_delta(
+    *,
+    base_pred_z: torch.Tensor,
+    delta_pred: torch.Tensor,
+    gate_h: torch.Tensor,
+    args,
+    mu_global: float,
+    sigma_global: float,
+) -> torch.Tensor:
+    mode = _resolve_delta_residual_mode(args)
+    base_z = base_pred_z.to(torch.float32)
+    delta = delta_pred.to(torch.float32)
+    gate = gate_h.to(torch.float32)
+    if mode == "additive":
+        return base_z + gate * delta
+
+    base_raw = _z_to_raw_tensor(base_z, mu_global=mu_global, sigma_global=sigma_global)
+    ratio = gate * delta
+    ratio_clip = float(getattr(args, "delta_relative_ratio_clip", 0.0) or 0.0)
+    if ratio_clip > 0.0:
+        ratio = ratio.clamp(min=-ratio_clip, max=ratio_clip)
+    pred_raw = base_raw * (1.0 + ratio)
+    return _raw_to_z_tensor(pred_raw, mu_global=mu_global, sigma_global=sigma_global)
+
+
 def _build_delta_targets(
     targets_z: torch.Tensor,
     base_pred: torch.Tensor,
+    mu_global: float,
+    sigma_global: float,
     args,
 ) -> torch.Tensor:
-    delta_target = (targets_z.to(torch.float32) - base_pred.to(torch.float32)).detach()
+    mode = _resolve_delta_residual_mode(args)
+    if mode == "relative":
+        target_raw = _z_to_raw_tensor(targets_z.to(torch.float32), mu_global=mu_global, sigma_global=sigma_global)
+        base_raw = _z_to_raw_tensor(base_pred.to(torch.float32), mu_global=mu_global, sigma_global=sigma_global)
+        denom = _safe_signed_denom_tensor(base_raw, args)
+        delta_target = ((target_raw - base_raw) / denom).detach()
+    else:
+        delta_target = (targets_z.to(torch.float32) - base_pred.to(torch.float32)).detach()
     target_clip = float(getattr(args, "delta_target_clip", 0.0) or 0.0)
     if target_clip > 0.0:
         delta_target = delta_target.clamp(min=-target_clip, max=target_clip)
     return delta_target
 
 
-def _select_metric(loss_v: float, mse_v: float, mae_v: float, reward_metric: str) -> float:
-    rm = str(reward_metric).lower()
+def _select_metric(loss_v: float, mse_v: float, mae_v: float, select_metric: str) -> float:
+    rm = str(select_metric).lower()
     if rm == "loss":
         return float(loss_v)
     if rm == "mse":
         return float(mse_v)
     return float(mae_v)
-
-
-def _parse_int_choices_csv(raw: str, default: list[int]) -> list[int]:
-    vals = []
-    for part in str(raw or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            v = int(part)
-        except Exception:
-            continue
-        if v > 0:
-            vals.append(v)
-    if not vals:
-        vals = list(default)
-    uniq = []
-    seen = set()
-    for v in vals:
-        if v in seen:
-            continue
-        seen.add(v)
-        uniq.append(int(v))
-    return uniq
 
 
 def _resolve_retrieval_mode(
@@ -249,7 +451,7 @@ def _resolve_retrieval_mode(
         mode = str(retrieval_mode_override).lower().strip()
     else:
         mode = str(getattr(args, "case_retrieval_mode", "price_event")).lower().strip()
-    if mode not in {"off", "price", "price_event"}:
+    if mode not in {"off", "price", "price_event", "random"}:
         mode = "price_event"
 
     if retrieval_enable_override is None:
@@ -264,6 +466,53 @@ def _resolve_retrieval_mode(
 
 def _retrieval_feature_dim(args) -> int:
     return int(max(8, getattr(args, "case_retrieval_feature_dim", 12)))
+
+
+def _blend_with_retrieval_knn_prior(
+    *,
+    delta_pred: torch.Tensor,
+    retrieval_feats: torch.Tensor | None,
+    retrieval_delta_prior: torch.Tensor | None,
+    args,
+    enabled: bool = True,
+) -> torch.Tensor:
+    if (not enabled) or int(getattr(args, "case_retrieval_knn_enable", 1)) != 1:
+        return delta_pred
+    if retrieval_delta_prior is None:
+        return delta_pred
+    if delta_pred.ndim != 2:
+        return delta_pred
+    alpha_base = float(getattr(args, "case_retrieval_knn_alpha", 0.35))
+    alpha_cap = float(getattr(args, "case_retrieval_knn_alpha_cap", 0.85))
+    if alpha_base <= 0.0:
+        return delta_pred
+
+    prior = retrieval_delta_prior.to(device=delta_pred.device, dtype=delta_pred.dtype)
+    if prior.ndim == 1:
+        prior = prior.unsqueeze(0)
+    if prior.size(0) != delta_pred.size(0):
+        if prior.size(0) == 1:
+            prior = prior.expand(delta_pred.size(0), -1)
+        else:
+            return delta_pred
+    if prior.size(1) != delta_pred.size(1):
+        h = int(delta_pred.size(1))
+        if prior.size(1) > h:
+            prior = prior[:, :h]
+        else:
+            pad = prior.new_zeros((prior.size(0), h - prior.size(1)))
+            prior = torch.cat([prior, pad], dim=1)
+
+    if retrieval_feats is not None and retrieval_feats.ndim == 2 and retrieval_feats.size(0) == delta_pred.size(0):
+        rf = retrieval_feats.to(device=delta_pred.device, dtype=delta_pred.dtype)
+        soft = rf[:, 0].clamp(0.0, 1.0) if rf.size(1) >= 1 else torch.ones((rf.size(0),), device=rf.device, dtype=rf.dtype)
+        conf = rf[:, 1].clamp(0.0, 1.0) if rf.size(1) >= 2 else torch.ones((rf.size(0),), device=rf.device, dtype=rf.dtype)
+        alpha = (soft * conf * float(alpha_base)).clamp(0.0, float(max(0.0, alpha_cap)))
+    else:
+        alpha = delta_pred.new_full((delta_pred.size(0),), float(alpha_base))
+        alpha = alpha.clamp(0.0, float(max(0.0, alpha_cap)))
+
+    return (1.0 - alpha.unsqueeze(1)) * delta_pred + alpha.unsqueeze(1) * prior
 
 
 def _summarize_retrieval_stats(
@@ -285,10 +534,19 @@ def _summarize_retrieval_stats(
         }
     mae_arr = np.asarray(sample_mae, dtype=np.float32)
     rel_arr = np.asarray(rel_labels, dtype=np.float32)
-    valid_mask = np.asarray(
-        [1.0 if bool(m.get("retrieval_valid", False)) else 0.0 for m in retrieval_meta],
+    soft_weights = np.asarray(
+        [
+            float(
+                m.get(
+                    "retrieval_soft_weight",
+                    1.0 if bool(m.get("retrieval_valid", False)) else 0.0,
+                )
+            )
+            for m in retrieval_meta
+        ],
         dtype=np.float32,
-    ) > 0.5
+    )
+    valid_mask = soft_weights > 0.05
     strong_mask = rel_arr >= float(strong_news_thresh)
 
     def _masked_mean(arr: np.ndarray, mask: np.ndarray) -> float:
@@ -304,6 +562,7 @@ def _summarize_retrieval_stats(
 
     return {
         "coverage_rate": float(valid_mask.mean()),
+        "effective_coverage": float(np.clip(soft_weights, 0.0, 1.0).mean()),
         "mae_valid": mae_valid,
         "mae_rejected": mae_rej,
         "mae_gap_valid_minus_rejected": gap,
@@ -360,25 +619,6 @@ def _log_enabled_mechanisms(args, live_logger, stage: str):
     stage_norm = str(stage or "").lower().strip()
     delta_active = stage_norm in {"delta", "all"}
 
-    rl_tpl = int(getattr(args, "rl_use", 0)) == 1
-    rl_news = int(getattr(args, "news_rl_enable", 0)) == 1
-    if rl_tpl:
-        live_logger.info(
-            "[MECH][RL_TEMPLATE] configured (--rl_use=1), "
-            "but current Scheme2 keeps fixed template/policy so this bandit is not executed."
-        )
-    if rl_news:
-        if delta_active:
-            live_logger.info(
-                "[MECH][RL_NEWS] enabled: contextual news bandit is used in DELTA stage "
-                "to select news K and item subset for prompt construction."
-            )
-        else:
-            live_logger.info(
-                "[MECH][RL_NEWS] enabled in args, but current stage is BASE-only; "
-                "it will not be executed in this run."
-            )
-
     retrieval_mode = _resolve_retrieval_mode(args)
     if retrieval_mode != "off":
         if delta_active:
@@ -391,315 +631,44 @@ def _log_enabled_mechanisms(args, live_logger, stage: str):
                 "[MECH][CASE_RETRIEVAL] enabled in args, but current stage is BASE-only; "
                 "it will not be executed in this run."
             )
-
-    news_conv_enable = int(getattr(args, "news_conv_enable", 0)) == 1
-    if news_conv_enable:
+    if int(getattr(args, "delta_text_direct_enable", 0)) == 1:
         if delta_active:
             live_logger.info(
-                "[MECH][NEWS_CONV] enabled: auxiliary TextCNN encodes selected news "
-                "(text + age + rate), then provides extra DELTA feature fusion and rel-logit bias."
+                "[MECH][TEXT_DIRECT] enabled: refined-news text encoder branch is fused into DELTA correction."
             )
         else:
             live_logger.info(
-                "[MECH][NEWS_CONV] enabled in args, but current stage is BASE-only; "
+                "[MECH][TEXT_DIRECT] enabled in args, but current stage is BASE-only; "
                 "it will not be executed in this run."
             )
-
-
-class NewsRLBanditSelector:
-    """
-    Contextual bandit for per-prompt news selection:
-    - choose how many items (K)
-    - choose which items to keep
-    """
-    def __init__(self, args, live_logger=None):
-        self.enable = int(getattr(args, "news_rl_enable", 0)) == 1
-        self.live_logger = live_logger
-        self.epsilon = float(getattr(args, "news_rl_epsilon", 0.05))
-        self.epsilon = max(0.0, min(1.0, self.epsilon))
-        self.prefilter_mult = int(getattr(args, "news_rl_prefilter_mult", 4))
-        self.prefilter_mult = max(1, self.prefilter_mult)
-        self.pool_cap = int(getattr(args, "news_rl_pool_cap", 128))
-        self.pool_cap = max(8, self.pool_cap)
-        self.reward_clip = float(getattr(args, "news_rl_reward_clip", 3.0))
-        self.reward_clip = max(1e-3, self.reward_clip)
-        self.recency_tau_h = float(getattr(args, "news_rl_recency_tau_hours", 24.0))
-        self.recency_tau_h = max(1e-6, self.recency_tau_h)
-
-        default_k = max(1, int(getattr(args, "news_topK", 5)))
-        k_raw = getattr(args, "news_rl_k_choices", "1,2,3,5,7,10")
-        self.k_choices = _parse_int_choices_csv(k_raw, default=[default_k])
-        allow_over_topk = int(getattr(args, "news_rl_allow_over_topk", 0)) == 1
-        if not allow_over_topk:
-            self.k_choices = [k for k in self.k_choices if int(k) <= default_k]
-            if not self.k_choices:
-                self.k_choices = [default_k]
-        if default_k not in self.k_choices:
-            self.k_choices.append(default_k)
-            self.k_choices = sorted(self.k_choices)
-        self.max_k = max(self.k_choices)
-
-        algo = str(getattr(args, "news_rl_algo", "auto")).lower()
-        if algo == "auto":
-            algo = str(getattr(args, "rl_algo", "lints")).lower()
-        if algo not in {"lints", "linucb"}:
-            algo = "lints"
-        self.algo = algo
-        self.ts_v = float(getattr(args, "ts_v", 1.0))
-        self.ucb_alpha = float(getattr(args, "ucb_alpha", 1.0))
-
-        # item features: [1, kw, recency, rate, utility, text_len, mix]
-        self.item_dim = 7
-        # context for K-arm: [1, pool_n, hist_std, trend_abs, hour_sin, hour_cos] + onehot(K)
-        self.ctx_dim = 6
-        self.k_dim = self.ctx_dim + len(self.k_choices)
-
-        if self.algo == "linucb":
-            self.item_bandit = LinUCB(self.item_dim, alpha=self.ucb_alpha)
-            self.k_bandit = LinUCB(self.k_dim, alpha=self.ucb_alpha)
-        else:
-            self.item_bandit = LinTS(self.item_dim, v=self.ts_v)
-            self.k_bandit = LinTS(self.k_dim, v=self.ts_v)
-
-        self.total_updates = 0
-
-        if self.enable and self.live_logger is not None:
-            self.live_logger.info(
-                "[DELTA][NEWS_RL] enabled: "
-                f"algo={self.algo}, k_choices={self.k_choices}, "
-                f"prefilter_mult={self.prefilter_mult}, pool_cap={self.pool_cap}"
-            )
-
-    @staticmethod
-    def _norm01(x: np.ndarray) -> np.ndarray:
-        if x.size == 0:
-            return x
-        lo = float(np.nanmin(x))
-        hi = float(np.nanmax(x))
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-8:
-            return np.zeros_like(x, dtype=np.float32)
-        return ((x - lo) / (hi - lo)).astype(np.float32)
-
-    def policy_pool_k(self, default_k: int, n_cand: int) -> int:
-        if n_cand <= 0:
-            return 0
-        target = max(int(default_k), int(self.max_k * self.prefilter_mult))
-        target = min(target, self.pool_cap)
-        return max(1, min(int(target), int(n_cand)))
-
-    def _bandit_score(self, bandit, x: np.ndarray, explore: bool) -> float:
-        x = np.asarray(x, dtype=np.float32)
-        if isinstance(bandit, LinTS):
-            if explore:
-                return float(bandit.sample_score(x))
-            A_inv = np.linalg.inv(bandit.A)
-            mu = A_inv @ bandit.b
-            return float(mu @ x)
-        if isinstance(bandit, LinUCB):
-            if explore:
-                return float(bandit.ucb_score(x))
-            A_inv = np.linalg.inv(bandit.A)
-            mu = A_inv @ bandit.b
-            return float(mu @ x)
-        return 0.0
-
-    def _k_arm_feature(self, ctx: np.ndarray, k: int) -> np.ndarray:
-        onehot = np.zeros((len(self.k_choices),), dtype=np.float32)
-        if k in self.k_choices:
-            onehot[self.k_choices.index(int(k))] = 1.0
-        return np.concatenate([ctx.astype(np.float32), onehot], axis=0).astype(np.float32)
-
-    def _context_features(self, history_z, pool_n: int, target_time) -> np.ndarray:
-        hz = np.asarray(history_z, dtype=np.float32)
-        if hz.size == 0:
-            hz = np.zeros((1,), dtype=np.float32)
-        hist_std = float(np.clip(float(np.std(hz)) / 2.5, 0.0, 1.0))
-        if hz.size >= 2:
-            look = int(min(12, hz.size - 1))
-            trend = float(abs(float(hz[-1] - hz[-1 - look])))
-        else:
-            trend = 0.0
-        trend_n = float(np.clip(trend / 6.0, 0.0, 1.0))
-        pool_n_norm = float(np.clip(float(pool_n) / float(max(1, self.pool_cap)), 0.0, 1.0))
-
-        hour_sin, hour_cos = 0.0, 0.0
-        try:
-            tt = pd.to_datetime(target_time, errors="coerce")
-            if not pd.isna(tt):
-                h = float(tt.hour) + float(tt.minute) / 60.0
-                hour_sin = float(np.sin(2.0 * np.pi * h / 24.0))
-                hour_cos = float(np.cos(2.0 * np.pi * h / 24.0))
-        except Exception:
-            pass
-
-        return np.asarray(
-            [1.0, pool_n_norm, hist_std, trend_n, hour_sin, hour_cos],
-            dtype=np.float32,
-        )
-
-    def _item_features(self, pool_df: pd.DataFrame, target_time, time_col: str, text_col: str, policy_kw) -> np.ndarray:
-        n = len(pool_df)
-        if n == 0:
-            return np.zeros((0, self.item_dim), dtype=np.float32)
-
-        texts = pool_df[text_col].fillna("").astype(str)
-        texts_l = texts.str.lower()
-
-        kw_list = [str(k).strip().lower() for k in (policy_kw or []) if str(k).strip()]
-        if kw_list:
-            kw_raw = texts_l.apply(lambda s: sum((kw in s) for kw in kw_list) / float(len(kw_list))).to_numpy(dtype=np.float32)
-        else:
-            kw_raw = np.zeros((n,), dtype=np.float32)
-        kw = np.clip(kw_raw, 0.0, 1.0).astype(np.float32)
-
-        recency = np.ones((n,), dtype=np.float32)
-        if time_col in pool_df.columns:
-            try:
-                ts = pd.to_datetime(pool_df[time_col], errors="coerce")
-                tt = pd.to_datetime(target_time, errors="coerce")
-                if not pd.isna(tt):
-                    age_h = (tt - ts).dt.total_seconds() / 3600.0
-                    age_h = age_h.fillna(1e9).clip(lower=0.0)
-                    recency = np.exp(-(age_h.to_numpy(dtype=np.float32) / self.recency_tau_h)).astype(np.float32)
-                    recency = self._norm01(recency)
-            except Exception:
-                recency = np.ones((n,), dtype=np.float32)
-
-        if "rate" in pool_df.columns:
-            rate = pool_df["rate"].fillna(0.0).astype(float).to_numpy(dtype=np.float32)
-            rate = self._norm01(rate)
-        else:
-            rate = np.zeros((n,), dtype=np.float32)
-
-        if "utility_score" in pool_df.columns:
-            utility = pool_df["utility_score"].fillna(0.0).astype(float).to_numpy(dtype=np.float32)
-            utility = self._norm01(utility)
-        else:
-            utility = np.zeros((n,), dtype=np.float32)
-
-        text_len = np.minimum(texts.str.len().to_numpy(dtype=np.float32) / 400.0, 1.0).astype(np.float32)
-        mix = np.clip(0.5 * kw + 0.5 * recency, 0.0, 1.0).astype(np.float32)
-
-        ones = np.ones((n,), dtype=np.float32)
-        return np.stack([ones, kw, recency, rate, utility, text_len, mix], axis=1).astype(np.float32)
-
-    def select(
-        self,
-        pool_df: pd.DataFrame,
-        target_time,
-        time_col: str,
-        text_col: str,
-        policy_kw,
-        history_z,
-        default_k: int,
-        explore: bool,
-    ) -> tuple[pd.DataFrame, dict | None]:
-        if (not self.enable) or pool_df is None or len(pool_df) == 0:
-            return pool_df, None
-
-        pool = pool_df.reset_index(drop=True).copy()
-        n = len(pool)
-        valid_default_k = max(1, min(int(default_k), n))
-
-        valid_k = [k for k in self.k_choices if 1 <= int(k) <= n]
-        if not valid_k:
-            valid_k = [valid_default_k]
-
-        X = self._item_features(pool, target_time, time_col=time_col, text_col=text_col, policy_kw=policy_kw)
-        ctx = self._context_features(history_z=history_z, pool_n=n, target_time=target_time)
-
-        k_feats = [self._k_arm_feature(ctx, k) for k in valid_k]
-        k_scores = [self._bandit_score(self.k_bandit, xk, explore=explore) for xk in k_feats]
-        if explore and np.random.rand() < self.epsilon:
-            k_idx = int(np.random.randint(len(valid_k)))
-        else:
-            k_idx = int(np.argmax(np.asarray(k_scores, dtype=np.float32)))
-        chosen_k = int(valid_k[k_idx])
-        chosen_k_feat = k_feats[k_idx]
-
-        item_scores = np.asarray(
-            [self._bandit_score(self.item_bandit, x, explore=explore) for x in X],
-            dtype=np.float32,
-        )
-        if explore and np.random.rand() < self.epsilon:
-            order = np.random.permutation(n).tolist()
-        else:
-            order = np.argsort(-item_scores).tolist()
-
-        chosen_idx = order[:chosen_k]
-        selected = pool.iloc[chosen_idx].copy()
-        selected["news_rl_score"] = item_scores[chosen_idx]
-        selected = selected.sort_values("news_rl_score", ascending=False).reset_index(drop=True)
-
-        meta = {
-            "k_x": chosen_k_feat.astype(np.float32),
-            "item_x": [X[int(i)].astype(np.float32) for i in chosen_idx],
-            "chosen_k": int(chosen_k),
-            "pool_n": int(n),
-        }
-        return selected, meta
-
-    def update_batch(self, metas: list[dict | None], rewards: np.ndarray | list[float]):
-        if (not self.enable) or metas is None:
-            return
-        if rewards is None:
-            return
-
-        rew = np.asarray(rewards, dtype=np.float32).reshape(-1)
-        for i, meta in enumerate(metas):
-            if meta is None:
-                continue
-            if i >= rew.shape[0]:
-                break
-            r = float(rew[i])
-            if not np.isfinite(r):
-                continue
-            r = float(np.clip(r, -self.reward_clip, self.reward_clip))
-
-            k_x = meta.get("k_x", None)
-            if isinstance(k_x, np.ndarray):
-                self.k_bandit.update(k_x.astype(np.float32), r)
-
-            item_xs = meta.get("item_x", [])
-            for x in item_xs:
-                if x is None:
-                    continue
-                self.item_bandit.update(np.asarray(x, dtype=np.float32), r)
-
-            self.total_updates += 1
 
 def _build_delta_optimizer(delta_model, args):
     base_lr = float(args.lr)
     wd = float(args.weight_decay)
 
-    lora_scale = float(getattr(args, "delta_lora_lr_scale", 1.0))
     head_scale = float(getattr(args, "delta_head_lr_scale", 1.0))
     other_scale = float(getattr(args, "delta_other_lr_scale", 1.0))
 
-    lora_params, head_params, other_params = [], [], []
+    head_params, other_params = [], []
     for name, p in delta_model.named_parameters():
         if not p.requires_grad:
             continue
         lname = name.lower()
-        if "lora_" in lname:
-            lora_params.append(p)
-        elif (
+        if (
             lname.startswith("delta_head")
             or lname.startswith("delta_gate")
             or lname.startswith("delta_fuse")
             or lname.startswith("delta_text_ln")
             or lname.startswith("delta_log_scale")
+            or lname.startswith("text_")
             or lname.startswith("rel_head")
             or lname.startswith("retrieval_")
-            or lname.startswith("news_conv")
         ):
             head_params.append(p)
         else:
             other_params.append(p)
 
     param_groups = []
-    if lora_params:
-        param_groups.append({"params": lora_params, "lr": base_lr * lora_scale, "weight_decay": wd})
     if head_params:
         param_groups.append({"params": head_params, "lr": base_lr * head_scale, "weight_decay": wd})
     if other_params:
@@ -711,10 +680,8 @@ def _build_delta_optimizer(delta_model, args):
     optimizer = AdamW(param_groups)
     lr_info = {
         "base_lr": base_lr,
-        "lora_lr": base_lr * lora_scale if lora_params else 0.0,
         "head_lr": base_lr * head_scale if head_params else 0.0,
         "other_lr": base_lr * other_scale if other_params else 0.0,
-        "n_lora": len(lora_params),
         "n_head": len(head_params),
         "n_other": len(other_params),
     }
@@ -854,182 +821,6 @@ def _pad_patches(
     return ts_patches, ts_patch_mask
 
 
-def _news_conv_pad_id(tokenizer) -> int:
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = getattr(tokenizer, "eos_token_id", None)
-    if pad_id is None:
-        pad_id = 0
-    return int(pad_id)
-
-
-def _stable_text_seed(text: str) -> int:
-    s = str(text or "")
-    seed = 0
-    for i, ch in enumerate(s):
-        seed = (seed * 131 + ord(ch) + i) & 0xFFFFFFFF
-    return int(seed)
-
-
-def _clean_news_text_for_conv(text: str) -> str:
-    s = str(text or "")
-    if not s:
-        return ""
-    s = re.sub(r"https?://\S+|www\.\S+", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = re.sub(r"[_\-]{3,}", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _split_refined_news_for_conv(refined_news: str, max_items: int) -> list[str]:
-    text = str(refined_news or "").strip()
-    if not text:
-        return []
-    items = []
-    for line in text.splitlines():
-        ln = re.sub(r"^\s*[-*•]+\s*", "", str(line).strip())
-        if not ln:
-            continue
-        if ln.lower().startswith("[structured event]"):
-            continue
-        ln = _clean_news_text_for_conv(ln)
-        if ln:
-            items.append(ln)
-        if len(items) >= int(max_items):
-            break
-    if items:
-        return items
-    chunks = re.split(r"(?<=[\.\!\?;])\s+", text)
-    for ck in chunks:
-        ck2 = _clean_news_text_for_conv(ck)
-        if ck2:
-            items.append(ck2)
-        if len(items) >= int(max_items):
-            break
-    return items
-
-
-def _shuffle_news_words_for_conv(text: str, seed: int) -> str:
-    toks = str(text or "").split()
-    if len(toks) <= 2:
-        return str(text or "")
-    rng = np.random.RandomState(int(seed) & 0xFFFFFFFF)
-    idx = np.arange(len(toks))
-    rng.shuffle(idx)
-    shuffled = [toks[int(i)] for i in idx.tolist()]
-    return " ".join(shuffled)
-
-
-def _prepare_conv_selected_news(
-    *,
-    selected: pd.DataFrame | None,
-    text_col: str,
-    refined_news: str,
-    args,
-    target_time,
-    shuffle_words: bool = False,
-) -> pd.DataFrame:
-    n_items = int(max(1, getattr(args, "news_conv_max_items", 8)))
-    rows = []
-    selected_df = selected if isinstance(selected, pd.DataFrame) else pd.DataFrame()
-    base_texts = []
-    if len(selected_df) > 0 and text_col in selected_df.columns:
-        base_texts = [
-            _clean_news_text_for_conv(x)
-            for x in selected_df[text_col].fillna("").astype(str).tolist()
-            if str(x).strip()
-        ]
-    refined_items = _split_refined_news_for_conv(refined_news, max_items=n_items)
-    use_texts = refined_items if len(refined_items) > 0 else base_texts
-    if len(use_texts) == 0:
-        return pd.DataFrame(columns=[args.news_time_col, text_col, "rate"])
-
-    use_n = min(n_items, len(use_texts))
-    for j in range(use_n):
-        txt = str(use_texts[j]).strip()
-        if not txt:
-            continue
-        if shuffle_words:
-            txt = _shuffle_news_words_for_conv(
-                txt, seed=_stable_text_seed(f"{target_time}::{j}::{txt}")
-            )
-        row = {text_col: txt, args.news_time_col: target_time, "rate": 0.0}
-        if len(selected_df) > 0 and j < len(selected_df):
-            src = selected_df.iloc[j]
-            if args.news_time_col in selected_df.columns:
-                row[args.news_time_col] = src.get(args.news_time_col, target_time)
-            if "rate" in selected_df.columns:
-                try:
-                    row["rate"] = float(src.get("rate", 0.0) or 0.0)
-                except Exception:
-                    row["rate"] = 0.0
-        rows.append(row)
-    return pd.DataFrame(rows, columns=[args.news_time_col, text_col, "rate"])
-
-
-def _build_news_conv_sample_tensors(
-    selected: pd.DataFrame | None,
-    target_time,
-    tokenizer,
-    args,
-    text_col: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    n_items = int(max(1, getattr(args, "news_conv_max_items", 8)))
-    n_tokens = int(max(1, getattr(args, "news_conv_text_max_tokens", 96)))
-    pad_id = _news_conv_pad_id(tokenizer)
-
-    ids = np.full((n_items, n_tokens), pad_id, dtype=np.int64)
-    attn = np.zeros((n_items, n_tokens), dtype=np.int64)
-    item_mask = np.zeros((n_items,), dtype=np.float32)
-    age_hours = np.zeros((n_items,), dtype=np.float32)
-    rate_values = np.zeros((n_items,), dtype=np.float32)
-
-    if not isinstance(selected, pd.DataFrame) or len(selected) == 0:
-        return ids, attn, item_mask, age_hours, rate_values
-
-    target_ts = pd.to_datetime(target_time, errors="coerce", utc=True)
-    use_n = min(n_items, len(selected))
-
-    for j in range(use_n):
-        row = selected.iloc[j]
-        text = str(row.get(text_col, "") if hasattr(row, "get") else "")
-        enc = tokenizer(
-            text,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=n_tokens,
-            return_attention_mask=True,
-        )
-        token_ids = enc.get("input_ids", [])
-        token_mask = enc.get("attention_mask", [1] * len(token_ids))
-        tok_len = min(n_tokens, len(token_ids))
-        if tok_len > 0:
-            ids[j, :tok_len] = np.asarray(token_ids[:tok_len], dtype=np.int64)
-            attn[j, :tok_len] = np.asarray(token_mask[:tok_len], dtype=np.int64)
-        item_mask[j] = 1.0
-
-        if args.news_time_col in selected.columns:
-            news_ts = pd.to_datetime(row.get(args.news_time_col, None), errors="coerce", utc=True)
-            if pd.notna(target_ts) and pd.notna(news_ts):
-                try:
-                    diff_h = float((target_ts - news_ts).total_seconds() / 3600.0)
-                except Exception:
-                    diff_h = 0.0
-                if np.isfinite(diff_h):
-                    age_hours[j] = max(0.0, diff_h)
-
-        if "rate" in selected.columns:
-            rv = row.get("rate", 0.0)
-            try:
-                rv = float(rv)
-            except Exception:
-                rv = 0.0
-            if np.isfinite(rv):
-                rate_values[j] = rv
-
-    return ids, attn, item_mask, age_hours, rate_values
-
 
 # ----------------------------
 # batch build
@@ -1051,15 +842,10 @@ def build_batch_inputs(
     force_no_news: bool = False,
     news_dropout: bool = False,
     prompt_path: str = None,
-    news_rl_selector: NewsRLBanditSelector | None = None,
-    news_rl_explore: bool = False,
-    return_news_rl_meta: bool = False,
     case_bank=None,
     query_base_pred=None,
     retrieval_enable_override: bool | None = None,
     retrieval_mode_override: str | None = None,
-    news_conv_disable_override: bool | None = None,
-    news_conv_shuffle_override: bool | None = None,
     api_adapter=None,
 ):
     """
@@ -1089,6 +875,7 @@ def build_batch_inputs(
 
     hist_strs = []
     news_str_list = []
+    refined_news_list = []
     rel_labels_list = []
 
     start_dates = []
@@ -1097,19 +884,9 @@ def build_batch_inputs(
     pred_ends = []
 
     len_selected_news = []
-    news_rl_meta_list = [] if return_news_rl_meta else None
     retrieval_feature_list = []
+    retrieval_delta_prior_list = []
     retrieval_meta_list = []
-    news_conv_input_ids_list = []
-    news_conv_attn_list = []
-    news_conv_item_mask_list = []
-    news_conv_age_hours_list = []
-    news_conv_rate_values_list = []
-    if news_conv_disable_override is None:
-        build_news_conv = bool(int(getattr(args, "news_conv_enable", 0)))
-    else:
-        build_news_conv = not bool(news_conv_disable_override)
-    shuffle_conv_words = bool(news_conv_shuffle_override)
 
     retrieval_feat_dim = _retrieval_feature_dim(args)
     retrieval_mode = _resolve_retrieval_mode(
@@ -1150,14 +927,11 @@ def build_batch_inputs(
             news_text_col = "sum_v0"
         # news
         avg_rate = 0.0
-        news_rl_meta = None
         if force_no_news or (news_df is None) or (len(news_df) == 0):
             selected = pd.DataFrame(columns=[args.news_time_col, news_text_col])
         else:
             cand = get_candidates(news_df, args.news_time_col, t_target, args.news_window_days, args.news_topM)
             policy_k = int(args.news_topK)
-            if news_rl_selector is not None and news_rl_selector.enable:
-                policy_k = news_rl_selector.policy_pool_k(default_k=int(args.news_topK), n_cand=len(cand))
 
             selected, avg_rate = select_news(
                 cand, policy_name, news_text_col, policy_kw, policy_k, args=args
@@ -1176,38 +950,65 @@ def build_batch_inputs(
                     args=args,
                 )
 
-            if news_rl_selector is not None and news_rl_selector.enable and len(selected) > 0:
-                selected, news_rl_meta = news_rl_selector.select(
-                    pool_df=selected,
-                    target_time=t_target,
-                    time_col=args.news_time_col,
-                    text_col=news_text_col,
-                    policy_kw=policy_kw,
-                    history_z=history_z,
-                    default_k=int(args.news_topK),
-                    explore=bool(news_rl_explore),
-                )
-
             if (not selected.empty) and ("rate" in selected.columns):
                 avg_rate = float(selected["rate"].mean())
 
         len_selected_news.append(len(selected))
-        if return_news_rl_meta:
-            news_rl_meta_list.append(news_rl_meta)
 
         news_str = ""
         refined_news = ""
         structured_events = {}
         if (not force_no_news) and len(selected) > 0:
             raw_news_texts = selected[news_text_col].fillna("").astype(str).tolist()
-            refined_news = refine_news_text(
-                raw_news_texts=raw_news_texts,
-                tokenizer=tokenizer,
-                max_tokens=news_budget,
-                mode=str(getattr(args, "news_refine_mode", "local")),
-                api_adapter=api_adapter,
-                context={"target_time": str(t_target), "region": str(getattr(args, "region", ""))},
+            refine_context = {
+                "target_time": str(t_target),
+                "region": str(getattr(args, "region", "")),
+                "description": str(getattr(args, "description", "")),
+            }
+            refine_mode = str(getattr(args, "news_refine_mode", "local"))
+            refine_model = str(
+                getattr(api_adapter, "model", getattr(args, "news_api_model", ""))
             )
+
+            cache_key = ""
+            cache_store = getattr(args, "_refine_cache_store", None)
+            cache_enabled = bool(getattr(args, "_refine_cache_enabled", False))
+            if cache_enabled and isinstance(cache_store, dict):
+                cache_key = _refine_cache_key(
+                    raw_news_texts=raw_news_texts,
+                    context=refine_context,
+                    mode=refine_mode,
+                    model=refine_model,
+                    max_tokens=news_budget,
+                )
+                cached = cache_store.get(cache_key, "")
+                if isinstance(cached, str) and cached.strip():
+                    refined_news = cached.strip()
+                    setattr(
+                        args,
+                        "_refine_cache_hits",
+                        int(getattr(args, "_refine_cache_hits", 0)) + 1,
+                    )
+
+            if not refined_news:
+                refined_news = refine_news_text(
+                    raw_news_texts=raw_news_texts,
+                    tokenizer=tokenizer,
+                    max_tokens=news_budget,
+                    mode=refine_mode,
+                    api_adapter=api_adapter,
+                    context=refine_context,
+                )
+                if cache_enabled and isinstance(cache_store, dict) and cache_key and refined_news:
+                    cache_store[cache_key] = str(refined_news)
+                    setattr(args, "_refine_cache_store", cache_store)
+                    setattr(args, "_refine_cache_dirty", True)
+                if cache_enabled:
+                    setattr(
+                        args,
+                        "_refine_cache_misses",
+                        int(getattr(args, "_refine_cache_misses", 0)) + 1,
+                    )
 
             pieces = [refined_news] if refined_news else []
 
@@ -1218,7 +1019,7 @@ def build_batch_inputs(
                     raw_or_refined_news=refined_news,
                     mode=str(getattr(args, "news_structured_mode", "off")),
                     api_adapter=api_adapter,
-                    context={"target_time": str(t_target), "region": str(getattr(args, "region", ""))},
+                    context=refine_context,
                 )
             if need_structured_for_prompt:
                 structured_text = format_structured_events_for_prompt(structured_events)
@@ -1229,40 +1030,12 @@ def build_batch_inputs(
             if news_dropout:
                 news_str = _maybe_news_dropout(news_str, args)
 
-        if build_news_conv:
-            conv_selected = _prepare_conv_selected_news(
-                selected=selected,
-                text_col=news_text_col,
-                refined_news=refined_news,
-                args=args,
-                target_time=t_target,
-                shuffle_words=shuffle_conv_words,
-            )
-        else:
-            conv_selected = None
-        (
-            conv_ids,
-            conv_attn,
-            conv_item_mask,
-            conv_age_hours,
-            conv_rate_values,
-        ) = _build_news_conv_sample_tensors(
-            selected=conv_selected,
-            target_time=t_target,
-            tokenizer=tokenizer,
-            args=args,
-            text_col=news_text_col,
-        )
-        news_conv_input_ids_list.append(conv_ids)
-        news_conv_attn_list.append(conv_attn)
-        news_conv_item_mask_list.append(conv_item_mask)
-        news_conv_age_hours_list.append(conv_age_hours)
-        news_conv_rate_values_list.append(conv_rate_values)
-
         retrieval_feat = np.zeros((retrieval_feat_dim,), dtype=np.float32)
+        retrieval_delta_prior = np.zeros((H,), dtype=np.float32)
         retrieval_meta = {
             "retrieval_valid": False,
             "retrieval_confidence": 0.0,
+            "retrieval_soft_weight": 0.0,
             "retrieval_mode": "off",
             "reject_reason": "disabled",
             "direction_agreement": 0.0,
@@ -1282,8 +1055,8 @@ def build_batch_inputs(
                 structured_events=structured_events,
                 metadata={"series_id": series_id},
             )
-            with open("query_case_dump.json", "a", encoding="utf-8") as _f:
-                _f.write(json.dumps(query_case, ensure_ascii=False) + "\n")
+            # with open("query_case_dump.json", "a", encoding="utf-8") as _f:
+            #     _f.write(json.dumps(query_case, ensure_ascii=False) + "\n")
             retrieval_out = retrieve_similar_cases(
                 query_case=query_case,
                 case_bank=case_bank,
@@ -1291,17 +1064,41 @@ def build_batch_inputs(
                 mode=retrieval_mode,
                 alpha_price=float(getattr(args, "case_retrieval_alpha_price", 0.85)),
                 alpha_event=float(getattr(args, "case_retrieval_alpha_event", 0.15)),
+                alpha_text=float(getattr(args, "case_retrieval_alpha_text", 0.20)),
+                alpha_recency=float(getattr(args, "case_retrieval_alpha_recency", 0.10)),
+                alpha_regime=float(getattr(args, "case_retrieval_alpha_regime", 0.05)),
+                recency_tau_hours=float(getattr(args, "case_retrieval_recency_tau_hours", 168.0)),
                 min_top_score=float(getattr(args, "case_retrieval_min_top_score", 0.12)),
                 min_candidates=int(max(1, getattr(args, "case_retrieval_min_candidates", 2))),
                 min_direction_agreement=float(getattr(args, "case_retrieval_min_dir_agree", 0.45)),
                 max_event_mismatch=float(getattr(args, "case_retrieval_max_event_mismatch", 0.8)),
+                knn_temperature=float(getattr(args, "case_retrieval_knn_temperature", 0.20)),
+                knn_horizon=int(H),
             )
             retrieval_feat, retrieval_meta = build_retrieval_features(
                 query_case=query_case,
                 retrieval_output=retrieval_out,
                 feature_dim=retrieval_feat_dim,
             )
+            prior_arr = np.asarray(
+                retrieval_meta.get("knn_delta_prior_z", []), dtype=np.float32
+            ).reshape(-1)
+            if prior_arr.size > H:
+                prior_arr = prior_arr[:H]
+            elif prior_arr.size < H:
+                pad = np.zeros((H - prior_arr.size,), dtype=np.float32)
+                prior_arr = np.concatenate([prior_arr, pad], axis=0)
+            if _resolve_delta_residual_mode(args) == "relative":
+                prior_arr = _convert_knn_prior_z_to_relative_np(
+                    prior_z=prior_arr,
+                    base_pred_z=base_pred_query,
+                    args=args,
+                    mu_global=mu_global,
+                    sigma_global=sigma_global,
+                )
+            retrieval_delta_prior = prior_arr.astype(np.float32, copy=False)
         retrieval_feature_list.append(np.asarray(retrieval_feat, dtype=np.float32))
+        retrieval_delta_prior_list.append(np.asarray(retrieval_delta_prior, dtype=np.float32))
         retrieval_meta_list.append(dict(retrieval_meta))
 
 
@@ -1332,6 +1129,7 @@ def build_batch_inputs(
 
         hist_strs.append(history_text(history_z, mu_global, sigma_global))
         news_str_list.append(news_str)
+        refined_news_list.append(str(refined_news or ""))
 
         start_dates.append(start_date)
         end_dates.append(end_date)
@@ -1393,37 +1191,29 @@ def build_batch_inputs(
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     input_ids, attn = _pad_2d_int(ids_list, pad_id=tokenizer.pad_token_id)
+    refined_ids_list = []
+    refined_max_len = int(max(1, getattr(args, "delta_text_max_len", 160)))
+    for refined_txt in refined_news_list:
+        txt = str(refined_txt or "").strip()
+        if not txt:
+            refined_ids_list.append([])
+            continue
+        enc = tokenizer(
+            txt,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=refined_max_len,
+            return_attention_mask=False,
+        )
+        refined_ids_list.append(enc["input_ids"])
+    refined_news_ids, refined_news_attn = _pad_2d_int(refined_ids_list, pad_id=tokenizer.pad_token_id)
     ts_patches, ts_patch_mask = _pad_patches(patches_list, patchmask_list, patch_len=patch_len)
     targets_z = torch.stack([torch.tensor(t, dtype=torch.float32) for t in targets_z_list], dim=0)
     # print("max = ", len_selected_news)
     rel_labels = torch.tensor(rel_labels_list, dtype=torch.float32)
     news_counts = torch.tensor(len_selected_news, dtype=torch.float32)
     retrieval_feats = torch.tensor(np.stack(retrieval_feature_list, axis=0), dtype=torch.float32)
-    news_input_ids = torch.tensor(np.stack(news_conv_input_ids_list, axis=0), dtype=torch.long)
-    news_attention_mask = torch.tensor(np.stack(news_conv_attn_list, axis=0), dtype=torch.long)
-    news_item_mask = torch.tensor(np.stack(news_conv_item_mask_list, axis=0), dtype=torch.float32)
-    news_age_hours = torch.tensor(np.stack(news_conv_age_hours_list, axis=0), dtype=torch.float32)
-    news_rate_values = torch.tensor(np.stack(news_conv_rate_values_list, axis=0), dtype=torch.float32)
-    if return_news_rl_meta:
-        return (
-            input_ids,
-            attn,
-            ts_patches,
-            ts_patch_mask,
-            targets_z,
-            metas,
-            prompt_texts,
-            rel_labels,
-            news_counts,
-            news_rl_meta_list,
-            retrieval_feats,
-            retrieval_meta_list,
-            news_input_ids,
-            news_attention_mask,
-            news_item_mask,
-            news_age_hours,
-            news_rate_values,
-        )
+    retrieval_delta_prior = torch.tensor(np.stack(retrieval_delta_prior_list, axis=0), dtype=torch.float32)
     return (
         input_ids,
         attn,
@@ -1435,12 +1225,10 @@ def build_batch_inputs(
         rel_labels,
         news_counts,
         retrieval_feats,
+        retrieval_delta_prior,
         retrieval_meta_list,
-        news_input_ids,
-        news_attention_mask,
-        news_item_mask,
-        news_age_hours,
-        news_rate_values,
+        refined_news_ids,
+        refined_news_attn,
     )
 
 # ----------------------------
@@ -1501,12 +1289,10 @@ def evaluate_metrics_single(
             rel_labels,
             n_selected,
             _retrieval_feats,
+            _retrieval_delta_prior,
             _retrieval_meta,
-            _news_input_ids,
-            _news_attention_mask,
-            _news_item_mask,
-            _news_age_hours,
-            _news_rate_values,
+            _refined_news_ids,
+            _refined_news_attn,
         ) = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
@@ -1691,19 +1477,17 @@ def evaluate_metrics_residual(
     true_pred_csv_path: str | None = None,
     news_dropout: bool = False,
     filename: str = None,
-    news_rl_selector: NewsRLBanditSelector | None = None,
     case_bank=None,
     retrieval_mode_override: str | None = None,
     retrieval_enable_override: bool | None = None,
     retrieval_gate_only_override: bool | None = None,
-    news_conv_disable_override: bool | None = None,
-    news_conv_shuffle_override: bool | None = None,
     return_retrieval_stats: bool = False,
     api_adapter=None,
 ):
     """
     Residual evaluation:
-      final_pred = base_pred + gate * delta_pred
+      additive mode: final_pred = base_pred + gate * delta_pred
+      relative mode: final_pred = base_pred * (1 + gate * delta_ratio)
     Returns:
       final_loss, final_mse, final_mae, base_loss, base_mse, base_mae
     """
@@ -1754,12 +1538,10 @@ def evaluate_metrics_residual(
             rel_labels_d,
             news_counts,
             retrieval_feats_d,
+            retrieval_delta_prior_d,
             retrieval_meta_d,
-            news_input_ids_d,
-            news_attention_mask_d,
-            news_item_mask_d,
-            news_age_hours_d,
-            news_rate_values_d,
+            refined_news_ids_d,
+            refined_news_attn_d,
         ) = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
@@ -1776,14 +1558,10 @@ def evaluate_metrics_residual(
             testing=testing,
             force_no_news=False,
             news_dropout=news_dropout,
-            news_rl_selector=news_rl_selector,
-            news_rl_explore=False,
             case_bank=case_bank,
             query_base_pred=base_pred_cpu,
             retrieval_enable_override=retrieval_enable_override,
             retrieval_mode_override=retrieval_mode_override,
-            news_conv_disable_override=news_conv_disable_override,
-            news_conv_shuffle_override=news_conv_shuffle_override,
             api_adapter=api_adapter,
         )
 
@@ -1793,11 +1571,9 @@ def evaluate_metrics_residual(
         ts_pm = ts_pm.to(device)
         targets_z = targets_z.to(device)
         retrieval_feats_d = retrieval_feats_d.to(device=device, dtype=torch.float32)
-        news_input_ids_d = news_input_ids_d.to(device)
-        news_attention_mask_d = news_attention_mask_d.to(device)
-        news_item_mask_d = news_item_mask_d.to(device=device, dtype=torch.float32)
-        news_age_hours_d = news_age_hours_d.to(device=device, dtype=torch.float32)
-        news_rate_values_d = news_rate_values_d.to(device=device, dtype=torch.float32)
+        retrieval_delta_prior_d = retrieval_delta_prior_d.to(device=device, dtype=torch.float32)
+        refined_news_ids_d = refined_news_ids_d.to(device)
+        refined_news_attn_d = refined_news_attn_d.to(device)
 
         # delta pred: adapter on + with news
         out_delta = delta_model(
@@ -1805,19 +1581,23 @@ def evaluate_metrics_residual(
             attention_mask=attn_d,
             ts_patches=ts_p,
             ts_patch_mask=ts_pm,
+            refined_news_input_ids=refined_news_ids_d,
+            refined_news_attention_mask=refined_news_attn_d,
             targets=None,
             head_mode="delta",
             rel_targets=None,
             rel_lambda=0.0,
             retrieval_feats=retrieval_feats_d,
             retrieval_gate_only=retrieval_gate_only,
-            news_input_ids=news_input_ids_d,
-            news_attention_mask=news_attention_mask_d,
-            news_item_mask=news_item_mask_d,
-            news_age_hours=news_age_hours_d,
-            news_rate_values=news_rate_values_d,
         )
         delta_corr = out_delta["pred"].to(torch.float32)
+        delta_corr = _blend_with_retrieval_knn_prior(
+            delta_pred=delta_corr,
+            retrieval_feats=retrieval_feats_d,
+            retrieval_delta_prior=retrieval_delta_prior_d,
+            args=args,
+            enabled=True,
+        )
         rel_logits = out_delta["rel_logits"].to(torch.float32)
         if int(getattr(args, "news_gate_enable", 1)) == 1:
             gate = _bounded_sigmoid_gate(rel_logits, args)
@@ -1831,7 +1611,14 @@ def evaluate_metrics_residual(
         base_pred_f = base_pred.to(torch.float32)
         delta_corr_f = delta_corr.to(torch.float32)
         gate_f = gate.to(torch.float32).unsqueeze(1)
-        pred_z = base_pred_f + gate_f * delta_corr_f
+        pred_z = _fuse_base_and_delta(
+            base_pred_z=base_pred_f,
+            delta_pred=delta_corr_f,
+            gate_h=gate_f,
+            args=args,
+            mu_global=mu_global,
+            sigma_global=sigma_global,
+        )
         loss = F.l1_loss(pred_z, targets_z_f, reduction="mean")
         base_loss = F.l1_loss(base_pred_f, targets_z_f, reduction="mean")
         pred_z_cpu = pred_z.detach().cpu().numpy()
@@ -1941,6 +1728,7 @@ def run_retrieval_ablations(
         {"name": "no_retrieval", "enable": False, "mode": "off", "gate_only": False},
         {"name": "price_only", "enable": True, "mode": "price", "gate_only": False},
         {"name": "price_event", "enable": True, "mode": "price_event", "gate_only": False},
+        {"name": "random_retrieval", "enable": True, "mode": "random", "gate_only": False},
         {"name": "gate_only", "enable": True, "mode": "price_event", "gate_only": True},
     ]
     results = {}
@@ -1971,7 +1759,6 @@ def run_retrieval_ablations(
             true_pred_csv_path=None,
             news_dropout=False,
             filename=None,
-            news_rl_selector=None,
             case_bank=case_bank,
             retrieval_mode_override=p["mode"],
             retrieval_enable_override=p["enable"],
@@ -1979,7 +1766,7 @@ def run_retrieval_ablations(
             return_retrieval_stats=True,
             api_adapter=api_adapter,
         )
-        metric = _select_metric(loss_v, mse_v, mae_v, args.reward_metric)
+        metric = _select_metric(loss_v, mse_v, mae_v, args.select_metric)
         results[p["name"]] = {
             "loss": float(loss_v),
             "mse": float(mse_v),
@@ -1990,8 +1777,8 @@ def run_retrieval_ablations(
 
     base_metric = float(results["no_retrieval"]["metric"])
     if live_logger is not None:
-        live_logger.info(f"[ABLATION][{split_name}] metric={str(args.reward_metric).lower()}")
-        for name in ["no_retrieval", "price_only", "price_event", "gate_only"]:
+        live_logger.info(f"[ABLATION][{split_name}] metric={str(args.select_metric).lower()}")
+        for name in ["no_retrieval", "price_only", "price_event", "random_retrieval", "gate_only"]:
             rec = results[name]
             delta = rec["metric"] - base_metric
             rs = rec["retrieval"]
@@ -2008,51 +1795,43 @@ def run_retrieval_ablations(
 
 
 @torch.no_grad()
-def run_news_conv_ablations(
+def _prewarm_refine_cache(
     *,
-    base_model,
-    delta_model,
-    tokenizer,
-    data_loader,
-    split_name: str,
-    templates,
-    tpl_id,
     args,
+    train_loader,
+    tokenizer,
+    templates,
+    tpl_id: int,
     global_zstats,
     news_df,
-    policy_name,
+    policy_name: str,
     policy_kw,
-    device,
     volatility_bin,
-    case_bank,
     live_logger,
+    case_bank=None,
     api_adapter=None,
 ):
-    if int(getattr(args, "news_conv_enable", 0)) != 1:
+    if not bool(getattr(args, "_refine_cache_enabled", False)):
+        return
+    if int(getattr(args, "news_refine_prewarm", 1)) != 1:
         if live_logger is not None:
-            live_logger.info(f"[ABLATION][NEWS_CONV][{split_name}] skip: news_conv_enable=0.")
-        return {}
+            live_logger.info("[NEWS_REFINE_CACHE] prewarm disabled.")
+        return
+    if train_loader is None:
+        return
 
-    plans = [
-        {"name": "conv_on", "disable": False, "shuffle": False},
-        {"name": "conv_off", "disable": True, "shuffle": False},
-        {"name": "conv_shuffle", "disable": False, "shuffle": True},
-    ]
-    results = {}
-    for p in plans:
-        (
-            loss_v,
-            mse_v,
-            mae_v,
-            _base_loss_v,
-            _base_mse_v,
-            _base_mae_v,
-            _retrieval_stats,
-        ) = evaluate_metrics_residual(
-            base_model=base_model,
-            delta_model=delta_model,
+    max_batches = int(getattr(args, "news_refine_prewarm_max_batches", -1))
+    before_n = len(getattr(args, "_refine_cache_store", {}))
+    hit0 = int(getattr(args, "_refine_cache_hits", 0))
+    miss0 = int(getattr(args, "_refine_cache_misses", 0))
+
+    pbar = tqdm(train_loader, desc="[DELTA][REFINE_PREWARM]", leave=False)
+    for bidx, batch in enumerate(pbar):
+        if max_batches > 0 and bidx >= max_batches:
+            break
+        _ = build_batch_inputs(
+            batch=batch,
             tokenizer=tokenizer,
-            data_loader=data_loader,
             templates=templates,
             tpl_id=tpl_id,
             args=args,
@@ -2060,219 +1839,27 @@ def run_news_conv_ablations(
             news_df=news_df,
             policy_name=policy_name,
             policy_kw=policy_kw,
-            device=device,
             volatility_bin=volatility_bin,
+            epoch=-1,
+            record_train_prompt=False,
             testing=False,
-            true_pred_csv_path=None,
+            force_no_news=False,
             news_dropout=False,
-            filename=None,
-            news_rl_selector=None,
+            prompt_path=None,
             case_bank=case_bank,
-            retrieval_mode_override=None,
-            retrieval_enable_override=None,
-            retrieval_gate_only_override=None,
-            news_conv_disable_override=p["disable"],
-            news_conv_shuffle_override=p["shuffle"],
-            return_retrieval_stats=True,
+            query_base_pred=None,
             api_adapter=api_adapter,
         )
-        metric = _select_metric(loss_v, mse_v, mae_v, args.reward_metric)
-        results[p["name"]] = {
-            "loss": float(loss_v),
-            "mse": float(mse_v),
-            "mae": float(mae_v),
-            "metric": float(metric),
-        }
-
-    base_metric = float(results["conv_on"]["metric"])
+    _save_refine_cache(args, live_logger=live_logger, force=True)
+    after_n = len(getattr(args, "_refine_cache_store", {}))
+    hit1 = int(getattr(args, "_refine_cache_hits", 0))
+    miss1 = int(getattr(args, "_refine_cache_misses", 0))
     if live_logger is not None:
         live_logger.info(
-            f"[ABLATION][NEWS_CONV][{split_name}] metric={str(args.reward_metric).lower()}"
+            "[NEWS_REFINE_CACHE] prewarm done: "
+            f"entries_before={before_n}, entries_after={after_n}, "
+            f"hits_delta={hit1 - hit0}, misses_delta={miss1 - miss0}"
         )
-        for name in ["conv_on", "conv_off", "conv_shuffle"]:
-            rec = results[name]
-            delta = rec["metric"] - base_metric
-            live_logger.info(
-                f"[ABLATION][NEWS_CONV][{split_name}] {name} "
-                f"metric={rec['metric']:.6f} delta_vs_on={delta:+.6f} "
-                f"loss={rec['loss']:.6f} mse={rec['mse']:.6f} mae={rec['mae']:.6f}"
-            )
-    return results
-
-
-# ----------------------------
-# bandit utilities (unchanged)
-# ----------------------------
-def make_tpl_feature_fn(templates, add_one_hot=True, add_cost_proxy=False, add_cross_terms=False):
-    if isinstance(templates, dict):
-        tpl_by_id = templates
-    else:
-        tpl_by_id = {int(t["id"]): t for t in templates}
-
-    tpl_ids = sorted(tpl_by_id.keys())
-    T = len(tpl_ids)
-
-    id2idx = {tid: i for i, tid in enumerate(tpl_ids)}
-    I = np.eye(T, dtype=np.float32)
-
-    tpl_list = [tpl_by_id[tid] for tid in tpl_ids]
-    n_paths_list = [float(t.get("n_paths", 1) or 1) for t in tpl_list]
-    max_n_paths = max(n_paths_list) if n_paths_list else 1.0
-
-    raw_breath_intensity = []
-    for t in tpl_list:
-        hb = float(bool(t.get("has_breath", False)))
-        bf = float(t.get("breath_freq", 0) or 0)
-        raw_breath_intensity.append(hb * (1.0 / bf) if hb > 0 and bf > 0 else 0.0)
-
-    bi_min = min(raw_breath_intensity) if raw_breath_intensity else 0.0
-    bi_max = max(raw_breath_intensity) if raw_breath_intensity else 1.0
-    bi_range = (bi_max - bi_min) if bi_max > bi_min else 1.0
-
-    def _cost_proxy(t):
-        he = float(bool(t.get("has_example", False)))
-        hb = float(bool(t.get("has_breath", False)))
-        hd = float(bool(t.get("has_decomp", False)))
-        hsc = float(bool(t.get("has_self_consistency", False)))
-        np_norm = float(t.get("n_paths", 1) or 1) / max_n_paths
-        return 0.4 * he + 0.5 * hd + 1.0 * hsc + 0.6 * np_norm + 0.2 * hb
-
-    raw_costs = [_cost_proxy(t) for t in tpl_list]
-    c_min = min(raw_costs) if raw_costs else 0.0
-    c_max = max(raw_costs) if raw_costs else 1.0
-    c_range = (c_max - c_min) if c_max > c_min else 1.0
-
-    def _single_tpl_vec(tid: int) -> np.ndarray:
-        t = tpl_by_id[int(tid)]
-
-        he = float(bool(t.get("has_example", False)))
-        hb = float(bool(t.get("has_breath", False)))
-        hd = float(bool(t.get("has_decomp", False)))
-        hsc = float(bool(t.get("has_self_consistency", False)))
-        np_norm = float(t.get("n_paths", 1) or 1) / max_n_paths
-
-        bf = float(t.get("breath_freq", 0) or 0)
-        bi = hb * (1.0 / bf) if hb > 0 and bf > 0 else 0.0
-        bi_norm = (bi - bi_min) / bi_range
-
-        vec = [1.0, he, hb, hd, hsc, np_norm, bi_norm]
-
-        if add_cost_proxy:
-            vec.append((_cost_proxy(t) - c_min) / c_range)
-
-        if add_one_hot:
-            vec.extend(I[id2idx[tid]].tolist())
-
-        return np.asarray(vec, dtype=np.float32)
-
-    def tpl_features(tid: int, context_vector) -> np.ndarray:
-        arm = _single_tpl_vec(tid)
-        if add_cross_terms:
-            if context_vector is None:
-                raise ValueError("add_cross_terms=True requires context_vector")
-            cross = np.outer(context_vector.astype(np.float32), arm).ravel()
-            return np.concatenate([arm, cross]).astype(np.float32)
-        return arm
-
-    def feat_dim(context_dim) -> int:
-        base = len(_single_tpl_vec(tpl_ids[0]))
-        if add_cross_terms:
-            return base + base * context_dim
-        return base
-
-    return tpl_features, feat_dim
-
-
-def bandit_round_update_residual(
-    base_model,
-    delta_model,
-    tokenizer,
-    probe_loader,
-    templates,
-    allowed_tpl_ids,
-    news_df,
-    policy_space,
-    policy_kw,
-    args,
-    device,
-    volatility_bin,
-    context_vector,
-    tpl_features,
-    bandit_tpl,
-    bandit_pol,
-    normalizer,
-    live_logger,
-    round_id,
-    bidx,
-    global_step,
-    global_zstats,
-    api_adapter=None,
-):
-    delta_model.eval()
-
-    cand = bandit_select(
-        args,
-        context_vector,
-        live_logger,
-        allowed_tpl_ids,
-        policy_space,
-        bandit_tpl,
-        bandit_pol,
-        tpl_features,
-        pol_features=None,
-        epoch=round_id,
-        bidx=bidx,
-        global_step=global_step,
-    )
-    tpl_id = cand["tpl_id"]
-    policy_name = cand["policy_name"]
-    pol_idx = cand["pol_idx"]
-
-    probe_loss, probe_mse, probe_mae, _, _, _ = evaluate_metrics_residual(
-        base_model=base_model,
-        delta_model=delta_model,
-        tokenizer=tokenizer,
-        data_loader=probe_loader,
-        templates=templates,
-        tpl_id=tpl_id,
-        args=args,
-        global_zstats=global_zstats,
-        news_df=news_df,
-        policy_name=policy_name,
-        policy_kw=policy_kw,
-        device=device,
-        volatility_bin=volatility_bin,
-        testing=False,
-        true_pred_csv_path=None,
-        news_dropout=False,
-        api_adapter=api_adapter,
-    )
-
-    if args.reward_metric == "loss":
-        metric_now = probe_loss
-    elif args.reward_metric == "mse":
-        metric_now = probe_mse
-    else:
-        metric_now = probe_mae
-
-    r = -metric_now
-    r_hat = normalizer.update_and_normalize(
-        r, group_key=(args.region, args.horizon) if args.domain_reward_norm else None
-    )
-
-    x_tpl = np.concatenate([context_vector, tpl_features(tpl_id, context_vector)], axis=0).astype(np.float32)
-    x_pol = context_vector.astype(np.float32)
-
-    bandit_tpl.update(x_tpl, r_hat)
-    bandit_pol.update(x_pol, r_hat)
-
-    live_logger.info(
-        f"BANDIT_ROUND(residual) round={round_id} tpl_id={tpl_id} policy={policy_name} "
-        f"probe_loss={probe_loss:.6f} probe_mse={probe_mse:.6f} probe_mae={probe_mae:.6f} "
-        f"reward_norm={r_hat:.6f}"
-    )
-
-    return tpl_id, policy_name, pol_idx
 
 
 # ----------------------------
@@ -2554,9 +2141,9 @@ def train_base_stage(args, bundle):
             filename=None,
         )
 
-        if args.reward_metric == "loss":
+        if args.select_metric == "loss":
             metric_now = val_loss
-        elif args.reward_metric == "mse":
+        elif args.select_metric == "mse":
             metric_now = val_mse
         else:
             metric_now = val_mae
@@ -2589,7 +2176,7 @@ def train_base_stage(args, bundle):
                 global_step=global_step,
                 global_zstats=global_zstats,
             )
-            live_logger.info(f"[BASE] New best saved to {best_base_path} ({args.reward_metric}={best_base_metric:.6f})")
+            live_logger.info(f"[BASE] New best saved to {best_base_path} ({args.select_metric}={best_base_metric:.6f})")
         else:
             stale_rounds += 1
             live_logger.info(f"[BASE] stale_rounds={stale_rounds}/{args.early_stop_patience} best={best_base_metric:.6f}")
@@ -2637,14 +2224,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     true_pred_csv_path = bundle["true_pred_csv_path"]
     global_zstats_bundle = _coerce_global_zstats(bundle.get("global_zstats", None), args, required=True)
     news_api_adapter = bundle.get("news_api_adapter", None)
+    _init_refine_cache(args, live_logger=live_logger)
     
 
-    lora_cfg = {
-        "r": int(args.lora_r),
-        "alpha": int(args.lora_alpha),
-        "dropout": float(args.lora_dropout),
-        "target_modules": args.target_modules,
-    }
+    train_cfg = {}
 
     delta_epochs_override = int(getattr(args, "delta_epochs", -1))
     if delta_epochs_override >= 0:
@@ -2692,17 +2275,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             f"sigma_global={global_zstats['sigma_global']:.6f}"
         )
 
-    tokenizer, delta_model = load_llama_lora(
+    tokenizer, delta_model = build_delta_model(
         base_model=args.base_model,
         tokenizer_id=args.tokenizer,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=args.target_modules,
-        load_in_4bit=args.load_in_4bit,
-        gradient_checkpointing=args.gradient_checkpointing,
-        max_seq_len=args.max_seq_len,
-        device=device,
         horizon=args.horizon,
         patch_dim=patch_len,
         patch_dropout=args.patch_dropout,
@@ -2715,23 +2290,22 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         delta_news_tail_tokens=int(getattr(args, "delta_news_tail_tokens", 160)),
         delta_rel_floor=float(getattr(args, "delta_rel_floor", 0.05)),
         retrieval_feat_dim=int(getattr(args, "case_retrieval_feature_dim", 12)),
-        news_conv_enable=bool(int(getattr(args, "news_conv_enable", 0))),
-        news_conv_max_items=int(getattr(args, "news_conv_max_items", 8)),
-        news_conv_text_max_tokens=int(getattr(args, "news_conv_text_max_tokens", 96)),
-        news_conv_channels=int(getattr(args, "news_conv_channels", 64)),
-        news_conv_dropout=float(getattr(args, "news_conv_dropout", 0.1)),
-        news_conv_gate_scale=float(getattr(args, "news_conv_gate_scale", 1.0)),
-        delta_model_variant=str(getattr(args, "delta_model_variant", "llama")),
+        delta_model_variant=str(getattr(args, "delta_model_variant", "tiny_news_ts")),
         tiny_news_model_preset=str(getattr(args, "tiny_news_model_preset", "custom")),
         tiny_news_model=str(getattr(args, "tiny_news_model", "")),
         tiny_news_tokenizer=str(getattr(args, "tiny_news_tokenizer", "")),
         tiny_news_hidden_size=int(getattr(args, "tiny_news_hidden_size", 256)),
         tiny_news_text_trainable=bool(int(getattr(args, "tiny_news_text_trainable", 0))),
         tiny_news_loader=str(getattr(args, "tiny_news_loader", "auto")),
+        delta_text_direct_enable=bool(int(getattr(args, "delta_text_direct_enable", 0))),
+        delta_text_fuse_lambda=float(getattr(args, "delta_text_fuse_lambda", 0.5)),
+        delta_text_gate_init_bias=float(getattr(args, "delta_text_gate_init_bias", -2.0)),
+        delta_text_clip=float(getattr(args, "delta_text_clip", 1.5)),
+        delta_text_max_len=int(getattr(args, "delta_text_max_len", 160)),
     )
     delta_model.to(device)
     live_logger.info(
-        f"[DELTA] model_variant={str(getattr(delta_model, 'model_variant', 'llama')).lower()}"
+        f"[DELTA] model_variant={str(getattr(delta_model, 'model_variant', 'tiny_news_ts')).lower()}"
     )
 
     # when to run validation set
@@ -2774,6 +2348,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         "delta_gate",
         "delta_fuse",
         "delta_text_ln",
+        "text_proj",
+        "text_delta_head",
+        "text_gate",
         "rel_head",
         "retrieval_proj",
         "retrieval_gate_bias",
@@ -2787,12 +2364,13 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     p.requires_grad = True
     if hasattr(delta_model, "delta_log_scale"):
         delta_model.delta_log_scale.requires_grad = True
+    if hasattr(delta_model, "text_log_scale") and delta_model.text_log_scale is not None:
+        delta_model.text_log_scale.requires_grad = True
 
     optim_delta, lr_info = _build_delta_optimizer(delta_model, args)
     live_logger.info(
         "[DELTA] optimizer groups: "
         f"base_lr={lr_info['base_lr']:.3e}, "
-        f"lora_lr={lr_info['lora_lr']:.3e} (n={lr_info['n_lora']}), "
         f"head_lr={lr_info['head_lr']:.3e} (n={lr_info['n_head']}), "
         f"other_lr={lr_info['other_lr']:.3e} (n={lr_info['n_other']})"
     )
@@ -2810,28 +2388,11 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     else:
         scheduler_delta = None
 
-    # Scheme2: bypass RL/bandit and keep fixed template/policy.
-    use_bandit = False
-    # if int(getattr(args, "rl_use", 0)) == 1:
-    #     live_logger.info("[DELTA] Scheme2 disables RL/bandit; using fixed template/policy.")
-
-    # normalizer = RewardNormalizer(ema=args.reward_ema, use_group_norm=args.domain_reward_norm) if use_bandit else None
-    # val_state = ValidationState(ema_alpha=args.val_ema_alpha)
-    # context_vector = encode_instruction(args, ctx={}, volatility_bin=volatility_bin)
-
-    # tpl_features, feat_dim = make_tpl_feature_fn(
-    #     templates=templates,
-    #     add_one_hot=True,
-    #     add_cost_proxy=False,
-    #     add_cross_terms=True,
-    # )
     allowed_tpl_ids = sorted([t["id"] for t in templates.values()])
     tpl_id = allowed_tpl_ids[0]
-    policy_space = args.policy_space
     policy_name = args.default_policy
     best_tpl_id = tpl_id
     best_policy_name = policy_name
-    news_rl_selector = NewsRLBanditSelector(args=args, live_logger=live_logger)
 
     active_case_bank = None
     retrieval_mode_active = _resolve_retrieval_mode(args)
@@ -2869,19 +2430,27 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     else:
         live_logger.info("[CASE_BANK] retrieval disabled; skip active case bank build.")
 
-    # d_tpl = len(context_vector) + len(tpl_features(allowed_tpl_ids[0], context_vector=context_vector))
-    # d_pol = len(context_vector)
-    # bandit_tpl = LinTS(d_tpl, v=args.ts_v) if (use_bandit and args.rl_algo == "lints") else (
-    #     LinUCB(d_tpl, alpha=args.ucb_alpha) if use_bandit else None
-    # )
-    # bandit_pol = LinTS(d_pol, v=args.ts_v) if (use_bandit and args.rl_algo == "lints") else (
-    #     LinUCB(d_pol, alpha=args.ucb_alpha) if use_bandit else None
-    # )
+    _prewarm_refine_cache(
+        args=args,
+        train_loader=train_loader,
+        tokenizer=tokenizer,
+        templates=templates,
+        tpl_id=tpl_id,
+        global_zstats=global_zstats,
+        news_df=news_df,
+        policy_name=policy_name,
+        policy_kw=policy_kw,
+        volatility_bin=volatility_bin,
+        live_logger=live_logger,
+        case_bank=active_case_bank,
+        api_adapter=news_api_adapter,
+    )
+
     if math.isfinite(float(best_base_metric)):
         base_ref_metric = float(best_base_metric)
         live_logger.info(
             f"[DELTA] base reference on val: threshold={base_ref_metric:.6f} "
-            f"(metric={str(args.reward_metric).lower()})"
+            f"(metric={str(args.select_metric).lower()})"
         )
     else:
         base_ref_loss, base_ref_mse, base_ref_mae = evaluate_metrics_backbone(
@@ -2894,9 +2463,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             true_pred_csv_path=None,
             filename=None,
         )
-        if args.reward_metric == "loss":
+        if args.select_metric == "loss":
             base_ref_metric = float(base_ref_loss)
-        elif args.reward_metric == "mse":
+        elif args.select_metric == "mse":
             base_ref_metric = float(base_ref_mse)
         else:
             base_ref_metric = float(base_ref_mae)
@@ -2915,6 +2484,21 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     early_stop_patience = max(0, int(getattr(args, "early_stop_patience", 0))) if delta_val_mode == "each_epoch" else 0
     best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
     retrieval_gate_only = bool(int(getattr(args, "case_retrieval_gate_only", 0)))
+    delta_warmup_epochs = int(max(0, getattr(args, "delta_warmup_epochs", 0)))
+    delta_curriculum_epochs = int(max(1, getattr(args, "delta_curriculum_epochs", 1)))
+    delta_null_warmup_steps = int(max(0, getattr(args, "delta_null_warmup_steps", 0)))
+    delta_null_ramp_steps = int(max(0, getattr(args, "delta_null_ramp_steps", 0)))
+    live_logger.info(
+        "[DELTA] regularization curriculum: "
+        f"warmup_epochs={delta_warmup_epochs}, curriculum_epochs={delta_curriculum_epochs}, "
+        f"null_warmup_steps={delta_null_warmup_steps}, null_ramp_steps={delta_null_ramp_steps}"
+    )
+    live_logger.info(
+        "[DELTA] residual branch: "
+        f"mode={_resolve_delta_residual_mode(args)} "
+        f"denom_floor={float(getattr(args, 'delta_relative_denom_floor', 1.0) or 1.0):.6f} "
+        f"ratio_clip={float(getattr(args, 'delta_relative_ratio_clip', 0.0) or 0.0):.6f}"
+    )
 
     def _save_residual_best(epoch_idx: int, metric_now: float | None, tpl_id_now: int, policy_name_now: str):
         metric_value = None if metric_now is None else float(metric_now)
@@ -2926,7 +2510,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             delta_model,
             base_model_id=args.base_model,
             tokenizer_id=args.tokenizer or args.base_model,
-            lora_cfg=lora_cfg,
+            train_cfg=train_cfg,
             optimizer=optim_delta,
             scheduler=scheduler_delta,
             epoch=int(epoch_idx),
@@ -2934,6 +2518,14 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             extra_meta={
                 "mu_global": float(global_zstats["mu_global"]),
                 "sigma_global": float(global_zstats["sigma_global"]),
+                "delta_residual_mode": _resolve_delta_residual_mode(args),
+                "delta_relative_denom_floor": float(getattr(args, "delta_relative_denom_floor", 1.0) or 1.0),
+                "delta_relative_ratio_clip": float(getattr(args, "delta_relative_ratio_clip", 0.0) or 0.0),
+                "delta_text_direct_enable": int(getattr(args, "delta_text_direct_enable", 0)),
+                "delta_text_fuse_lambda": float(getattr(args, "delta_text_fuse_lambda", 0.5)),
+                "delta_text_gate_init_bias": float(getattr(args, "delta_text_gate_init_bias", -2.0)),
+                "delta_text_clip": float(getattr(args, "delta_text_clip", 1.5)),
+                "delta_text_max_len": int(getattr(args, "delta_text_max_len", 160)),
             },
         )
 
@@ -2945,7 +2537,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     # "best_tpl_id": int(tpl_id_now),
                     # "best_policy_name": str(policy_name_now),
                     "best_delta_alpha": float(best_delta_alpha),
-                    "reward_metric": str(args.reward_metric),
+                    "select_metric": str(args.select_metric),
                     "best_metric": metric_value,
                 },
                 f,
@@ -2957,50 +2549,14 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         pbar = tqdm(train_loader, desc=f"[DELTA] Epoch {epoch+1}/{delta_epochs}")
         hard_reflect_mode = str(getattr(args, "hard_reflection_mode", "off")).lower().strip()
         hard_reflect_buffer = []
-
-        # epoch-level bandit selection (optional)
-        # if (args.select_policy_by == "epoch") and use_bandit:
-        #     context_vector = get_context_features(
-        #         None,
-        #         news_df,
-        #         args,
-        #         prev_model_loss_n=None,
-        #         prev_model_loss_ema_n=None,
-        #         val_state=val_state,
-        #         train_loader=train_loader,
-        #         volatility_bin=volatility_bin,
-        #     )
-
-        #     tpl_id, policy_name, pol_idx = bandit_round_update_residual(
-        #         base_model=base_backbone,
-        #         delta_model=delta_model,
-        #         tokenizer=tokenizer,
-        #         probe_loader=val_loader,
-        #         templates=templates,
-        #         allowed_tpl_ids=allowed_tpl_ids,
-        #         news_df=news_df,
-        #         policy_space=policy_space,
-        #         policy_kw=policy_kw,
-        #         args=args,
-        #         device=device,
-        #         volatility_bin=volatility_bin_val,
-        #         context_vector=context_vector,
-        #         tpl_features=tpl_features,
-        #         bandit_tpl=bandit_tpl,
-        #         bandit_pol=bandit_pol,
-        #         normalizer=normalizer,
-        #         live_logger=live_logger,
-        #         round_id=epoch + 1,
-        #         bidx=None,
-        #         global_step=global_step,
-        #         global_zstats=global_zstats,
-        #         api_adapter=news_api_adapter,
-        #     )
-
-        #     live_logger.info(f"[DELTA] EPOCH_BEGIN epoch={epoch+1}, tpl_id={tpl_id}, policy={policy_name}")
+        epoch_reg_scale = _epoch_ramp_scale(
+            epoch_idx=epoch,
+            warmup_epochs=delta_warmup_epochs,
+            curriculum_epochs=delta_curriculum_epochs,
+        )
+        live_logger.info(f"[DELTA][CURRICULUM] epoch={epoch+1} reg_scale={epoch_reg_scale:.3f}")
 
         for bidx, batch in enumerate(pbar):
-            # batch-level bandit selection (optional)
             with torch.no_grad():
                 history_z, _, _ = _z_batch_tensors(batch, args, global_zstats=global_zstats)
                 history_z = history_z.to(device)
@@ -3018,14 +2574,11 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 prompt_texts_d,
                 _rel_labels_d,
                 news_counts_d,
-                news_rl_meta_d,
                 retrieval_feats_d,
+                retrieval_delta_prior_d,
                 retrieval_meta_d,
-                news_input_ids_d,
-                news_attention_mask_d,
-                news_item_mask_d,
-                news_age_hours_d,
-                news_rate_values_d,
+                refined_news_ids_d,
+                refined_news_attn_d,
             ) = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
@@ -3043,9 +2596,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 force_no_news=False,
                 news_dropout=True,
                 prompt_path=bundle["prompt_path"],
-                news_rl_selector=news_rl_selector,
-                news_rl_explore=True,
-                return_news_rl_meta=True,
                 case_bank=active_case_bank,
                 query_base_pred=base_pred_cpu,
                 api_adapter=news_api_adapter,
@@ -3062,12 +2612,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 _rel_b,
                 _news_counts_b,
                 retrieval_feats_b,
+                retrieval_delta_prior_b,
                 _retrieval_meta_b,
-                news_input_ids_b,
-                news_attention_mask_b,
-                news_item_mask_b,
-                news_age_hours_b,
-                news_rate_values_b,
+                refined_news_ids_b,
+                refined_news_attn_b,
             ) = build_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
@@ -3100,17 +2648,13 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             targets_z = targets_z.to(device)
             news_counts_d = news_counts_d.to(device=device, dtype=torch.float32)
             retrieval_feats_d = retrieval_feats_d.to(device=device, dtype=torch.float32)
+            retrieval_delta_prior_d = retrieval_delta_prior_d.to(device=device, dtype=torch.float32)
             retrieval_feats_b = retrieval_feats_b.to(device=device, dtype=torch.float32)
-            news_input_ids_d = news_input_ids_d.to(device)
-            news_attention_mask_d = news_attention_mask_d.to(device)
-            news_item_mask_d = news_item_mask_d.to(device=device, dtype=torch.float32)
-            news_age_hours_d = news_age_hours_d.to(device=device, dtype=torch.float32)
-            news_rate_values_d = news_rate_values_d.to(device=device, dtype=torch.float32)
-            news_input_ids_b = news_input_ids_b.to(device)
-            news_attention_mask_b = news_attention_mask_b.to(device)
-            news_item_mask_b = news_item_mask_b.to(device=device, dtype=torch.float32)
-            news_age_hours_b = news_age_hours_b.to(device=device, dtype=torch.float32)
-            news_rate_values_b = news_rate_values_b.to(device=device, dtype=torch.float32)
+            retrieval_delta_prior_b = retrieval_delta_prior_b.to(device=device, dtype=torch.float32)
+            refined_news_ids_d = refined_news_ids_d.to(device)
+            refined_news_attn_d = refined_news_attn_d.to(device)
+            refined_news_ids_b = refined_news_ids_b.to(device)
+            refined_news_attn_b = refined_news_attn_b.to(device)
             has_news = (news_counts_d > 0).to(dtype=torch.float32)
 
             delta_model.train()
@@ -3118,6 +2662,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             delta_targets = _build_delta_targets(
                 targets_z=targets_z,
                 base_pred=base_pred,
+                mu_global=float(global_zstats["mu_global"]),
+                sigma_global=float(global_zstats["sigma_global"]),
                 args=args,
             )
 
@@ -3126,19 +2672,23 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 attention_mask=attn_d,
                 ts_patches=ts_p,
                 ts_patch_mask=ts_pm,
+                refined_news_input_ids=refined_news_ids_d,
+                refined_news_attention_mask=refined_news_attn_d,
                 targets=None,
                 head_mode="delta",
                 rel_targets=None,
                 rel_lambda=0.0,
                 retrieval_feats=retrieval_feats_d,
                 retrieval_gate_only=retrieval_gate_only,
-                news_input_ids=news_input_ids_d,
-                news_attention_mask=news_attention_mask_d,
-                news_item_mask=news_item_mask_d,
-                news_age_hours=news_age_hours_d,
-                news_rate_values=news_rate_values_d,
             )
             delta_pred_real = out_delta["pred"].to(torch.float32)
+            delta_pred_real = _blend_with_retrieval_knn_prior(
+                delta_pred=delta_pred_real,
+                retrieval_feats=retrieval_feats_d,
+                retrieval_delta_prior=retrieval_delta_prior_d,
+                args=args,
+                enabled=True,
+            )
             rel_logits_real = out_delta["rel_logits"].to(torch.float32)
 
             if int(getattr(args, "news_gate_enable", 1)) == 1:
@@ -3147,7 +2697,14 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 gate_real = torch.ones_like(rel_logits_real)
             gate_real_h = gate_real.unsqueeze(1)
 
-            pred_real_z = base_pred + gate_real_h * delta_pred_real
+            pred_real_z = _fuse_base_and_delta(
+                base_pred_z=base_pred,
+                delta_pred=delta_pred_real,
+                gate_h=gate_real_h,
+                args=args,
+                mu_global=float(global_zstats["mu_global"]),
+                sigma_global=float(global_zstats["sigma_global"]),
+            )
             targets_z_typed = targets_z.to(torch.float32)
 
             residual_mode = str(getattr(args, "residual_loss", "mae")).lower()
@@ -3166,51 +2723,66 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             delta_cf_lambda = float(getattr(args, "delta_cf_lambda", 0.0))
             delta_cf_margin = float(getattr(args, "delta_cf_margin", 0.0))
             delta_null_lambda = float(getattr(args, "delta_null_lambda", 0.05))
+            null_step_scale = _step_ramp_scale(
+                step_idx=global_step,
+                warmup_steps=delta_null_warmup_steps,
+                ramp_steps=delta_null_ramp_steps,
+            )
+            gate_reg_lambda_eff = gate_reg_lambda * epoch_reg_scale
+            delta_cf_lambda_eff = delta_cf_lambda * epoch_reg_scale
+            delta_null_lambda_eff = delta_null_lambda * epoch_reg_scale * null_step_scale
             loss_cf = torch.zeros((), device=device, dtype=torch.float32)
             loss_null = torch.zeros((), device=device, dtype=torch.float32)
 
-            if delta_cf_lambda > 0.0 or delta_null_lambda > 0.0:
+            if delta_cf_lambda_eff > 0.0 or delta_null_lambda_eff > 0.0:
                 out_null = delta_model(
                     input_ids=ids_b,
                     attention_mask=attn_b,
                     ts_patches=ts_p,
                     ts_patch_mask=ts_pm,
+                    refined_news_input_ids=refined_news_ids_b,
+                    refined_news_attention_mask=refined_news_attn_b,
                     targets=None,
                     head_mode="delta",
                     rel_targets=None,
                     rel_lambda=0.0,
                     retrieval_feats=retrieval_feats_b,
                     retrieval_gate_only=retrieval_gate_only,
-                    news_input_ids=news_input_ids_b,
-                    news_attention_mask=news_attention_mask_b,
-                    news_item_mask=news_item_mask_b,
-                    news_age_hours=news_age_hours_b,
-                    news_rate_values=news_rate_values_b,
                 )
                 delta_pred_null = out_null["pred"].to(torch.float32)
+                delta_pred_null = _blend_with_retrieval_knn_prior(
+                    delta_pred=delta_pred_null,
+                    retrieval_feats=retrieval_feats_b,
+                    retrieval_delta_prior=retrieval_delta_prior_b,
+                    args=args,
+                    enabled=True,
+                )
                 rel_logits_null = out_null["rel_logits"].to(torch.float32)
                 if int(getattr(args, "news_gate_enable", 1)) == 1:
                     gate_null = _bounded_sigmoid_gate(rel_logits_null, args)
                 else:
                     gate_null = torch.ones_like(rel_logits_null)
                 gate_null_h = gate_null.unsqueeze(1)
-                pred_null_z = base_pred + gate_null_h * delta_pred_null
+                pred_null_z = _fuse_base_and_delta(
+                    base_pred_z=base_pred,
+                    delta_pred=delta_pred_null,
+                    gate_h=gate_null_h,
+                    args=args,
+                    mu_global=float(global_zstats["mu_global"]),
+                    sigma_global=float(global_zstats["sigma_global"]),
+                )
 
                 err_real = torch.abs(pred_real_z - targets_z_typed).mean(dim=1)
                 err_null = torch.abs(pred_null_z - targets_z_typed).mean(dim=1)
                 loss_cf = torch.relu(delta_cf_margin + err_real - err_null).mean()
                 loss_null = (gate_null_h * delta_pred_null).pow(2).mean()
 
-                if news_rl_selector is not None and news_rl_selector.enable:
-                    rl_reward = (err_null - err_real).detach().float().cpu().numpy()
-                    news_rl_selector.update_batch(news_rl_meta_d, rl_reward)
-
             loss_total = (
                 loss_final
                 + delta_aux_lambda * loss_delta_aux
-                + gate_reg_lambda * loss_gate_reg
-                + delta_cf_lambda * loss_cf
-                + delta_null_lambda * loss_null
+                + gate_reg_lambda_eff * loss_gate_reg
+                + delta_cf_lambda_eff * loss_cf
+                + delta_null_lambda_eff * loss_null
             )
 
             if hard_reflect_mode not in {"off", "none"} and len(prompt_texts_d) > 0:
@@ -3234,15 +2806,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             loss_window.append(float(loss.detach().cpu()))
             if global_step % 10 == 0:
                 avg_train_loss = sum(loss_window) / len(loss_window)
-                k_now = 0.0
-                k_cnt = 0
-                for _m in news_rl_meta_d:
-                    if _m is None:
-                        continue
-                    k_now += float(_m.get("chosen_k", 0))
-                    k_cnt += 1
-                if k_cnt > 0:
-                    k_now /= float(k_cnt)
                 retr_cov = 0.0
                 retr_conf = 0.0
                 if len(retrieval_meta_d) > 0:
@@ -3258,7 +2821,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     final=float(loss_final.detach().cpu()),
                     aux=float(loss_delta_aux.detach().cpu()),
                     cf=float(loss_cf.detach().cpu()),
-                    k=float(k_now),
                     rcov=float(retr_cov),
                     rconf=float(retr_conf),
                 )
@@ -3272,14 +2834,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                                 dh_grad_terms.append(g * g)
                     if dh_grad_terms:
                         dh_grad = float(np.sqrt(sum(dh_grad_terms)))
-                    lora_grad = sum(
-                        float(p.grad.norm().cpu()) for n, p in delta_model.named_parameters()
-                        if "lora_" in n and p.grad is not None
-                    )
                     live_logger.info(
                             f"[GRAD] step={global_step} delta_head_grad={dh_grad:.6f} "
-                            f"lora_grad={lora_grad:.6f} "
-                            f"delta_scale={float(delta_model.delta_log_scale.exp().detach().cpu()):.4f}"
+                            f"delta_scale={float(delta_model.delta_log_scale.exp().detach().cpu()):.4f} "
+                            f"reg={epoch_reg_scale:.3f} null={null_step_scale:.3f} "
+                            f"lam(g/c/n)=("
+                            f"{gate_reg_lambda_eff:.4f}/{delta_cf_lambda_eff:.4f}/{delta_null_lambda_eff:.4f})"
                         )
 
             if (global_step + 1) % args.grad_accum == 0:
@@ -3312,7 +2872,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 testing=False,
                 true_pred_csv_path=None,
                 news_dropout=False,
-                news_rl_selector=news_rl_selector,
                 case_bank=active_case_bank,
                 api_adapter=news_api_adapter,
             )
@@ -3329,12 +2888,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 f"[DELTA][BASE_ONLY][VAL] epoch={epoch+1} "
                 f"loss(zMAE)={base_val_loss:.6f} mse(raw)={base_val_mse:.6f} mae(raw)={base_val_mae:.6f}"
             )
-            if news_rl_selector is not None and news_rl_selector.enable:
-                live_logger.info(f"[DELTA][NEWS_RL] cumulative_updates={news_rl_selector.total_updates}")
-
-            # update val_state for context
-            metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
-            # val_state.update(metric_now)
+            metric_now = _select_metric(val_loss, val_mse, val_mae, args.select_metric)
             delta_vs_base = float(metric_now - base_ref_metric)
             live_logger.info(
                 f"[DELTA][COMPARE][VAL] epoch={epoch+1} metric={metric_now:.6f} "
@@ -3357,7 +2911,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 )
                 live_logger.info(
                     f"[DELTA] New best delta saved: {best_delta_path} "
-                    f"({args.reward_metric}={best_metric:.6f}, "
+                    f"({args.select_metric}={best_metric:.6f}, "
                     f"delta_vs_base={best_metric - base_ref_metric:+.6f})"
                 )
             else:
@@ -3389,6 +2943,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 f"hard_samples={len(hard_reflect_buffer)} reflections={len(reflections)}"
             )
 
+        _save_refine_cache(args, live_logger=live_logger, force=False)
+
         if epoch == 0:
             live_logger.info("---------------------trainset and valset prompt statistics--------------------------------")
             print_prompt_stats(live_logger, dataStatistic)
@@ -3414,11 +2970,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 testing=False,
                 true_pred_csv_path=None,
                 news_dropout=False,
-                news_rl_selector=news_rl_selector,
                 case_bank=active_case_bank,
                 api_adapter=news_api_adapter,
             )
-            metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
+            metric_now = _select_metric(val_loss, val_mse, val_mae, args.select_metric)
             best_metric = float(metric_now)
             has_saved_delta = True
             best_tpl_id = tpl_id
@@ -3439,7 +2994,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             )
             live_logger.info(
                 f"[DELTA] Saved end_only best delta: {best_delta_path} "
-                f"({args.reward_metric}={best_metric:.6f})"
+                f"({args.select_metric}={best_metric:.6f})"
             )
         elif delta_val_mode == "none":
             has_saved_delta = True
@@ -3475,11 +3030,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 testing=False,
                 true_pred_csv_path=None,
                 news_dropout=False,
-                news_rl_selector=news_rl_selector,
                 case_bank=active_case_bank,
                 api_adapter=news_api_adapter,
             )
-            metric_now = _select_metric(val_loss, val_mse, val_mae, args.reward_metric)
+            metric_now = _select_metric(val_loss, val_mse, val_mae, args.select_metric)
             best_metric = float(metric_now)
             has_saved_delta = True
             best_tpl_id = tpl_id
@@ -3500,6 +3054,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             )
 
     dataStatistic.clear()
+    _save_refine_cache(args, live_logger=live_logger, force=True)
 
     # TEST (combined with best delta; base computed via adapter_off)
     if test_loader is not None:
@@ -3532,6 +3087,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             )
             record_test_results_csv(args, live_logger, test_mse, test_mae)
             draw_pred_true(live_logger, args, true_pred_csv_path)
+            _save_refine_cache(args, live_logger=live_logger, force=True)
             return {
                 "test_loader": test_loader,
                 "device": device,
@@ -3550,8 +3106,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
         tok_d, model_best = load_checkpoint(
             best_delta_path,
-            args.load_in_4bit,
-            args.gradient_checkpointing,
             _single_device_map(args),
             False,
             head_mlp=args.head_mlp,
@@ -3587,8 +3141,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             f"Loaded best DELTA model for testing (final = {base_meta.get('backbone_name')} + delta(adapter_on,news))."
         )
 
-        tpl_for_test = best_tpl_id if use_bandit else tpl_id
-        pol_for_test = best_policy_name if use_bandit else policy_name
+        tpl_for_test = tpl_id
+        pol_for_test = policy_name
         if int(getattr(args, "case_retrieval_run_ablations", 1)) == 1:
             ablation_split = str(getattr(args, "case_retrieval_ablation_split", "val")).lower().strip()
             if ablation_split in {"val", "both"}:
@@ -3631,48 +3185,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     live_logger=live_logger,
                     api_adapter=news_api_adapter,
                 )
-        if int(getattr(args, "news_conv_run_ablations", 1)) == 1:
-            conv_ablation_split = str(getattr(args, "news_conv_ablation_split", "val")).lower().strip()
-            if conv_ablation_split in {"val", "both"}:
-                run_news_conv_ablations(
-                    base_model=base_backbone,
-                    delta_model=model_best,
-                    tokenizer=tokenizer,
-                    data_loader=val_loader,
-                    split_name="VAL",
-                    templates=templates,
-                    tpl_id=tpl_for_test,
-                    args=args,
-                    global_zstats=global_zstats_eval,
-                    news_df=news_df,
-                    policy_name=pol_for_test,
-                    policy_kw=policy_kw,
-                    device=device,
-                    volatility_bin=volatility_bin_val,
-                    case_bank=active_case_bank,
-                    live_logger=live_logger,
-                    api_adapter=news_api_adapter,
-                )
-            if conv_ablation_split in {"test", "both"}:
-                run_news_conv_ablations(
-                    base_model=base_backbone,
-                    delta_model=model_best,
-                    tokenizer=tokenizer,
-                    data_loader=test_loader,
-                    split_name="TEST",
-                    templates=templates,
-                    tpl_id=tpl_for_test,
-                    args=args,
-                    global_zstats=global_zstats_eval,
-                    news_df=news_df,
-                    policy_name=pol_for_test,
-                    policy_kw=policy_kw,
-                    device=device,
-                    volatility_bin=volatility_bin_test,
-                    case_bank=active_case_bank,
-                    live_logger=live_logger,
-                    api_adapter=news_api_adapter,
-                )
         test_loss, test_mse, test_mae, base_test_loss, base_test_mse, base_test_mae = evaluate_metrics_residual(
             base_model=base_backbone,
             delta_model=model_best,
@@ -3691,7 +3203,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             true_pred_csv_path=true_pred_csv_path,
             news_dropout=False,
             filename=bundle["test_filename"],
-            news_rl_selector=news_rl_selector,
             case_bank=active_case_bank,
             api_adapter=news_api_adapter,
         )
@@ -3713,6 +3224,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
         record_test_results_csv(args, live_logger, test_mse, test_mae)
         draw_pred_true(live_logger, args, true_pred_csv_path)
+        _save_refine_cache(args, live_logger=live_logger, force=True)
 
     return {
         "test_loader":test_loader,

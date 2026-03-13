@@ -86,7 +86,7 @@ TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 
 # Keep task settings aligned with your existing NSW scripts.
 RESIDUAL_LOSS="smooth_l1"
-REWARD_METRIC="mae"
+SELECT_METRIC="mae"
 STRIDE="48"
 HORIZON="48"
 PATCH_DROPOUT="0"
@@ -96,9 +96,6 @@ DELTA_VAL_MODE="${DELTA_VAL_MODE:-each_epoch}"  # each_epoch | end_only | none
 DELTA_CLIP="${DELTA_CLIP:-1.0}"
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-8}"
 NEWS_GATE_FLOOR="${NEWS_GATE_FLOOR:-0.0}"
-# Memory-safe defaults for 8B + SFT on limited VRAM.
-LOAD_IN_4BIT="${LOAD_IN_4BIT:-1}"
-GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
 
 # pure TS base backbone (scheme2)
 BASE_BACKBONES=(
@@ -127,7 +124,7 @@ UTILITY_MIN_SCORE="-1.0"
 UTILITY_SHOW_IN_PROMPT="1"
 
 # Delta news extension hooks
-NEWS_API_ENABLE="${NEWS_API_ENABLE:-0}"                       # 1 => use OpenAI API for refine/structured hooks
+NEWS_API_ENABLE="${NEWS_API_ENABLE:-1}"                       # 1 => use OpenAI API for news refine hooks
 NEWS_API_MODEL="${NEWS_API_MODEL:-gpt-5.1}"
 NEWS_API_KEY_PATH="${NEWS_API_KEY_PATH:-api_key.txt}"
 NEWS_API_BASE_URL="${NEWS_API_BASE_URL:-}"
@@ -135,13 +132,17 @@ NEWS_API_TIMEOUT_SEC="${NEWS_API_TIMEOUT_SEC:-30}"
 NEWS_API_MAX_RETRIES="${NEWS_API_MAX_RETRIES:-2}"
 if [[ "$NEWS_API_ENABLE" == "1" ]]; then
   NEWS_REFINE_MODE="${NEWS_REFINE_MODE:-api}"                 # local | api
-  NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-api}"         # off | heuristic | api
+  NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-heuristic}"   # off | heuristic | api
 else
   NEWS_REFINE_MODE="${NEWS_REFINE_MODE:-local}"               # local | api
   NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-heuristic}"   # off | heuristic | api
 fi
+NEWS_REFINE_CACHE_ENABLE="${NEWS_REFINE_CACHE_ENABLE:-1}"
+NEWS_REFINE_CACHE_PATH="${NEWS_REFINE_CACHE_PATH:-}"
+NEWS_REFINE_PREWARM="${NEWS_REFINE_PREWARM:-1}"
+NEWS_REFINE_PREWARM_MAX_BATCHES="${NEWS_REFINE_PREWARM_MAX_BATCHES:--1}"
 DELTA_INCLUDE_STRUCTURED_NEWS="${DELTA_INCLUDE_STRUCTURED_NEWS:-1}"  # 1 to append structured fields
-CASE_RETRIEVAL_ENABLE="${CASE_RETRIEVAL_ENABLE:-0}"           # default off for conv-focused runs
+CASE_RETRIEVAL_ENABLE="${CASE_RETRIEVAL_ENABLE:-0}"           # default off
 CASE_RETRIEVAL_TOPK="${CASE_RETRIEVAL_TOPK:-3}"
 CASE_RETRIEVAL_MODE="${CASE_RETRIEVAL_MODE:-price_event}"      # off | price | price_event
 CASE_RETRIEVAL_ALPHA_PRICE="${CASE_RETRIEVAL_ALPHA_PRICE:-0.85}"
@@ -155,20 +156,11 @@ CASE_RETRIEVAL_GATE_ONLY="${CASE_RETRIEVAL_GATE_ONLY:-0}"      # 1 => retrieval 
 CASE_RETRIEVAL_RUN_ABLATIONS="${CASE_RETRIEVAL_RUN_ABLATIONS:-1}"
 CASE_RETRIEVAL_ABLATION_SPLIT="${CASE_RETRIEVAL_ABLATION_SPLIT:-val}"  # val | test | both
 CASE_RETRIEVAL_STRONG_NEWS_THRESH="${CASE_RETRIEVAL_STRONG_NEWS_THRESH:-0.6}"
-NEWS_CONV_ENABLE="${NEWS_CONV_ENABLE:-1}"
-NEWS_CONV_MAX_ITEMS="${NEWS_CONV_MAX_ITEMS:-8}"
-NEWS_CONV_TEXT_MAX_TOKENS="${NEWS_CONV_TEXT_MAX_TOKENS:-96}"
-NEWS_CONV_CHANNELS="${NEWS_CONV_CHANNELS:-64}"
-NEWS_CONV_DROPOUT="${NEWS_CONV_DROPOUT:-0.1}"
-NEWS_CONV_GATE_SCALE="${NEWS_CONV_GATE_SCALE:-1.0}"
-NEWS_CONV_RUN_ABLATIONS="${NEWS_CONV_RUN_ABLATIONS:-1}"
-NEWS_CONV_ABLATION_SPLIT="${NEWS_CONV_ABLATION_SPLIT:-val}"  # val | test | both
 
 DELTA_CF_LAMBDA="0.01"
 DELTA_CF_MARGIN="0.05"
 DELTA_GATE_REG_LAMBDA="0.01"
 DELTA_NULL_LAMBDA="0.01"
-DELTA_LORA_LR_SCALE="0.5"
 DELTA_HEAD_LR_SCALE="1.0"
 DELTA_AUX_LAMBDA="0.05"
 # =======================
@@ -221,7 +213,6 @@ COMMON_ARGS=(
   --delta_gate_reg_lambda "$DELTA_GATE_REG_LAMBDA"
   --delta_aux_lambda "$DELTA_AUX_LAMBDA"
   --delta_null_lambda "$DELTA_NULL_LAMBDA"
-  --delta_lora_lr_scale "$DELTA_LORA_LR_SCALE"
   --delta_head_lr_scale "$DELTA_HEAD_LR_SCALE"
   --news_gate_floor "$NEWS_GATE_FLOOR"
   --early_stop_patience "$EARLY_STOP_PATIENCE"
@@ -240,7 +231,7 @@ COMMON_ARGS=(
   --news_topK "$NEWS_TOPK"
   --batch_size "$BATCH_SIZE"
   --gpu "$GPU_ID"
-  --reward_metric "$REWARD_METRIC"
+  --select_metric "$SELECT_METRIC"
   --default_policy "$DEFAULT_POLICY"
   --utility_rerank_enable "$UTILITY_RERANK_ENABLE"
   --utility_keyword_weight "$UTILITY_KEYWORD_WEIGHT"
@@ -255,6 +246,10 @@ COMMON_ARGS=(
   --utility_min_score "$UTILITY_MIN_SCORE"
   --utility_show_in_prompt "$UTILITY_SHOW_IN_PROMPT"
   --news_refine_mode "$NEWS_REFINE_MODE"
+  --news_refine_cache_enable "$NEWS_REFINE_CACHE_ENABLE"
+  --news_refine_cache_path "$NEWS_REFINE_CACHE_PATH"
+  --news_refine_prewarm "$NEWS_REFINE_PREWARM"
+  --news_refine_prewarm_max_batches "$NEWS_REFINE_PREWARM_MAX_BATCHES"
   --news_api_model "$NEWS_API_MODEL"
   --news_api_key_path "$NEWS_API_KEY_PATH"
   --news_api_base_url "$NEWS_API_BASE_URL"
@@ -262,14 +257,6 @@ COMMON_ARGS=(
   --news_api_max_retries "$NEWS_API_MAX_RETRIES"
   --delta_include_structured_news "$DELTA_INCLUDE_STRUCTURED_NEWS"
   --news_structured_mode "$NEWS_STRUCTURED_MODE"
-  --news_conv_enable "$NEWS_CONV_ENABLE"
-  --news_conv_max_items "$NEWS_CONV_MAX_ITEMS"
-  --news_conv_text_max_tokens "$NEWS_CONV_TEXT_MAX_TOKENS"
-  --news_conv_channels "$NEWS_CONV_CHANNELS"
-  --news_conv_dropout "$NEWS_CONV_DROPOUT"
-  --news_conv_gate_scale "$NEWS_CONV_GATE_SCALE"
-  --news_conv_run_ablations "$NEWS_CONV_RUN_ABLATIONS"
-  --news_conv_ablation_split "$NEWS_CONV_ABLATION_SPLIT"
   --case_retrieval_enable "$CASE_RETRIEVAL_ENABLE"
   --case_retrieval_topk "$CASE_RETRIEVAL_TOPK"
   --case_retrieval_mode "$CASE_RETRIEVAL_MODE"
@@ -305,7 +292,7 @@ for i in "${!TASK_NAMES[@]}"; do
           for sch in "${SCHEDULERS[@]}"; do
             for grad_acc in "${GRAD_ACCS[@]}"; do
               run_task="${task}_${base_backbone}"
-              args=( --taskName "$run_task" --rl_use "0" "${COMMON_ARGS[@]}" )
+              args=( --taskName "$run_task" "${COMMON_ARGS[@]}" )
 
               args+=( --news_path "${NEWS_CHOICES[$j]}" )
               if [[ -n "$tpool" ]]; then
@@ -330,13 +317,6 @@ for i in "${!TASK_NAMES[@]}"; do
               args+=( --grad_accum "$grad_acc" )
               args+=( --lr "$lr" )
               args+=( --scheduler "$sch" )
-              if [[ "$LOAD_IN_4BIT" == "1" ]]; then
-                args+=( --load_in_4bit )
-              fi
-              if [[ "$GRADIENT_CHECKPOINTING" == "1" ]]; then
-                args+=( --gradient_checkpointing )
-              fi
-
               if [[ "$run_or_not" == "1" ]]; then
                 echo "==> Running: ${run_task} (base_backbone=${base_backbone})"
                 "$PYTHON_BIN" "$ENTRY" "${args[@]}"

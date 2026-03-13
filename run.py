@@ -5,7 +5,7 @@ from src.base_delta_decoouple_trainer import main as main_train
 # from src.original_residual_trainer import main as main_train
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Cross-domain LLaMA Forecasting with RL')
+    parser = argparse.ArgumentParser(description='Cross-domain Forecasting')
 
     
     parser.add_argument('--rel_lambda', type=float, default=0.3, help='weight for relative loss')
@@ -29,28 +29,12 @@ if __name__ == '__main__':
     parser.add_argument('--delta_clip', type=float, default=3.0, help='tanh clip for delta outputs in z-space (<=0 to disable)')
     parser.add_argument('--delta_news_tail_tokens', type=int, default=160, help='how many tail text tokens to pool as news context')
     parser.add_argument('--delta_rel_floor', type=float, default=0.05, help='minimum multiplicative factor from relevance gate')
-    parser.add_argument('--news_conv_enable', type=int, default=0, choices=[0, 1],
-                        help='enable lightweight auxiliary news TextCNN encoder in DELTA branch')
-    parser.add_argument('--news_conv_max_items', type=int, default=8,
-                        help='max selected news items per sample for auxiliary news CNN')
-    parser.add_argument('--news_conv_text_max_tokens', type=int, default=96,
-                        help='max tokens per selected news item for auxiliary news CNN')
-    parser.add_argument('--news_conv_channels', type=int, default=64,
-                        help='TextCNN channel width for auxiliary news encoder')
-    parser.add_argument('--news_conv_dropout', type=float, default=0.1,
-                        help='dropout for auxiliary news CNN path')
-    parser.add_argument('--news_conv_gate_scale', type=float, default=1.0,
-                        help='scale factor for auxiliary news CNN gate-logit contribution')
-    parser.add_argument('--news_conv_run_ablations', type=int, default=1, choices=[0, 1],
-                        help='run news-conv ablations after DELTA training')
-    parser.add_argument('--news_conv_ablation_split', type=str, default='val', choices=['val', 'test', 'both'],
-                        help='which split to run news-conv ablations on')
-    parser.add_argument('--delta_model_variant', type=str, default='llama', choices=['llama', 'tiny_news_ts'],
-                        help='DELTA model branch: llama (current) or tiny_news_ts (small text model + TS)')
+    parser.add_argument('--delta_model_variant', type=str, default='tiny_news_ts', choices=['tiny_news_ts'],
+                        help='DELTA model branch')
     parser.add_argument('--tiny_news_model', type=str, default='distilbert-base-uncased',
                         help='HF model id/local path for small text encoder in tiny_news_ts branch')
     parser.add_argument('--tiny_news_model_preset', type=str, default='custom',
-                        choices=['custom', 'distilbert', 'gpt2', 'tinyllama'],
+                        choices=['custom', 'distilbert', 'gpt2', 'bert_base', 'roberta_base', 'deberta_v3_base'],
                         help='preset for tiny news encoder model; custom uses tiny_news_model/tiny_news_tokenizer')
     parser.add_argument('--tiny_news_tokenizer', type=str, default='',
                         help='HF tokenizer id for tiny_news_ts branch (default: tiny_news_model)')
@@ -61,6 +45,16 @@ if __name__ == '__main__':
     parser.add_argument('--tiny_news_loader', type=str, default='auto',
                         choices=['auto', 'encoder', 'causal_lm'],
                         help='loader type for tiny news encoder')
+    parser.add_argument('--delta_text_direct_enable', type=int, default=0, choices=[0, 1],
+                        help='enable refined-news text encoder branch directly predicting delta correction')
+    parser.add_argument('--delta_text_fuse_lambda', type=float, default=0.5,
+                        help='global fuse weight for text-direct delta correction branch')
+    parser.add_argument('--delta_text_gate_init_bias', type=float, default=-2.0,
+                        help='init bias for text-direct gate logits (negative keeps branch conservative initially)')
+    parser.add_argument('--delta_text_clip', type=float, default=1.5,
+                        help='tanh clip for text-direct correction branch (<=0 disables)')
+    parser.add_argument('--delta_text_max_len', type=int, default=160,
+                        help='max token length for refined-news text encoder inputs')
 
     parser.add_argument('--cf_pseudo_margin', type=float, default=0.01, help='counterfactual gain margin for pseudo labels')
     parser.add_argument('--cf_pseudo_temp', type=float, default=0.2, help='temperature for soft pseudo labels')
@@ -76,13 +70,18 @@ if __name__ == '__main__':
     parser.add_argument('--delta_curriculum_epochs', type=int, default=3, help='ramp-up epochs for delta constraints')
     parser.add_argument('--delta_grad_clip', type=float, default=1.0, help='grad clip norm for delta stage (<=0 to disable)')
     parser.add_argument('--delta_violation_cap', type=float, default=1.0, help='cap per-sample margin/non-degrade hinge value (>0 to enable)')
-    parser.add_argument('--delta_lora_lr_scale', type=float, default=0.3, help='lr scale for LoRA params in delta stage')
     parser.add_argument('--delta_head_lr_scale', type=float, default=1.0, help='lr scale for delta/rel heads in delta stage')
     parser.add_argument('--delta_other_lr_scale', type=float, default=0.5, help='lr scale for other trainable params in delta stage')
     parser.add_argument('--delta_freeze_feature_modules', type=int, default=0, choices=[0, 1],
                         help='freeze patch/pooling feature modules in delta stage (legacy behavior)')
     parser.add_argument('--delta_target_clip', type=float, default=0.0,
                         help='optional clip for delta_target = target-base_pred in z-space; <=0 disables')
+    parser.add_argument('--delta_residual_mode', type=str, default='additive', choices=['additive', 'relative'],
+                        help='delta branch target/fusion mode: additive residual or relative ratio residual')
+    parser.add_argument('--delta_relative_denom_floor', type=float, default=1.0,
+                        help='minimum absolute denominator (raw scale) when computing relative residual target/prior')
+    parser.add_argument('--delta_relative_ratio_clip', type=float, default=0.0,
+                        help='optional clip for relative ratio residual and fused factor; <=0 disables')
     parser.add_argument('--delta_aux_lambda', type=float, default=0.0,
                         help='weight for auxiliary delta regression loss on delta_pred vs delta_target')
     parser.add_argument('--delta_aux_loss', type=str, default='mae', choices=['mse', 'mae', 'smooth_l1'],
@@ -95,6 +94,14 @@ if __name__ == '__main__':
                         help='counterfactual hinge margin in z-space')
     parser.add_argument('--news_refine_mode', type=str, default='local', choices=['local', 'api'],
                         help='news refinement backend; local is join+truncate fallback')
+    parser.add_argument('--news_refine_cache_enable', type=int, default=1, choices=[0, 1],
+                        help='enable persistent cache for refined news text')
+    parser.add_argument('--news_refine_cache_path', type=str, default='',
+                        help='optional cache file path for refined news; default is checkpoints/<task>/refine_news_cache.json')
+    parser.add_argument('--news_refine_prewarm', type=int, default=1, choices=[0, 1],
+                        help='prewarm refine cache with one train split pass before DELTA training')
+    parser.add_argument('--news_refine_prewarm_max_batches', type=int, default=-1,
+                        help='limit prewarm batches; <=0 means all train batches')
     parser.add_argument('--news_structured_mode', type=str, default='off', choices=['off', 'heuristic', 'api'],
                         help='structured event extraction backend')
     parser.add_argument('--news_api_model', type=str, default='gpt-5.1',
@@ -114,12 +121,20 @@ if __name__ == '__main__':
     parser.add_argument('--case_retrieval_topk', type=int, default=0,
                         help='top-k retrieval candidates for auxiliary retrieval features')
     parser.add_argument('--case_retrieval_mode', type=str, default='price_event',
-                        choices=['off', 'price', 'price_event'],
+                        choices=['off', 'price', 'price_event', 'random'],
                         help='retrieval mode: no retrieval / price-only / price-first+event-rerank')
     parser.add_argument('--case_retrieval_alpha_price', type=float, default=0.85,
                         help='price similarity weight in retrieval rerank')
     parser.add_argument('--case_retrieval_alpha_event', type=float, default=0.15,
                         help='event similarity weight in retrieval rerank')
+    parser.add_argument('--case_retrieval_alpha_text', type=float, default=0.20,
+                        help='text-vector similarity weight in retrieval rerank')
+    parser.add_argument('--case_retrieval_alpha_recency', type=float, default=0.10,
+                        help='recency similarity weight in retrieval rerank')
+    parser.add_argument('--case_retrieval_alpha_regime', type=float, default=0.05,
+                        help='regime-match similarity weight in retrieval rerank')
+    parser.add_argument('--case_retrieval_recency_tau_hours', type=float, default=168.0,
+                        help='recency decay tau in hours for case retrieval rerank')
     parser.add_argument('--case_retrieval_min_top_score', type=float, default=0.12,
                         help='reject retrieval when top final score is below this threshold')
     parser.add_argument('--case_retrieval_min_candidates', type=int, default=2,
@@ -142,6 +157,16 @@ if __name__ == '__main__':
                         help='which split to run retrieval ablations on')
     parser.add_argument('--case_retrieval_strong_news_thresh', type=float, default=0.6,
                         help='strong-news-impact threshold on rel pseudo-label for ablation reporting')
+    parser.add_argument('--case_retrieval_knn_enable', type=int, default=1, choices=[0, 1],
+                        help='enable top-k residual prior from retrieved cases')
+    parser.add_argument('--case_retrieval_knn_alpha', type=float, default=0.35,
+                        help='base blend ratio for retrieved residual prior')
+    parser.add_argument('--case_retrieval_knn_alpha_cap', type=float, default=0.85,
+                        help='max blend ratio for retrieved residual prior')
+    parser.add_argument('--case_retrieval_knn_temperature', type=float, default=0.20,
+                        help='softmax temperature for top-k residual prior weights')
+    parser.add_argument('--case_retrieval_debug_dump', type=int, default=0, choices=[0, 1],
+                        help='dump query/train case records to local jsonl for debugging')
     parser.add_argument('--hard_reflection_mode', type=str, default='off', choices=['off', 'api'],
                         help='optional hard-sample reflection backend (offline utility hook)')
     parser.add_argument('--hard_reflection_topk', type=int, default=8,
@@ -156,7 +181,6 @@ if __name__ == '__main__':
     parser.add_argument("--head_dropout", type=float, default=0.0)
     parser.add_argument("--head_mlp", action="store_true", default=False)
 
-    parser.add_argument("--policy_space", type=list, default=["all"])
     parser.add_argument("--default_policy", type=str, default="smart", help="default news selection policy for training and evaluation")
     parser.add_argument("--smart_rel_weight", type=float, default=0.55, help="weight of semantic relevance in smart news retrieval")
     parser.add_argument("--smart_kw_weight", type=float, default=0.15, help="weight of keyword coverage in smart news retrieval")
@@ -248,7 +272,7 @@ if __name__ == '__main__':
     parser.add_argument('--news_tz', type=str, default='', help='timezone for news timestamps')
     parser.add_argument('--news_window_days', type=int, default=1, help='look-back window (days) before target time')
     parser.add_argument('--news_topM', type=int, default=20, help='candidate news cap per sample')
-    parser.add_argument('--news_topK', type=int, default=5, help='news K after policy/RL')
+    parser.add_argument('--news_topK', type=int, default=5, help='news K after policy')
     
     # ===== News summarization =====
     # News is pre-summarized offline in this workflow, so this option is usually unused.
@@ -265,20 +289,12 @@ if __name__ == '__main__':
     #===== Token budget fractions =====
     parser.add_argument('--token_budget_news_frac', type=float, default=0.9, help='budget frac for news')
 
-    # ===== LLaMA =====
-    parser.add_argument('--base_model', type=str, default='meta-llama/Meta-Llama-3-8B', help='HF model id or local path')
+    # ===== Text Model Tokenizer =====
+    parser.add_argument('--base_model', type=str, default='distilbert-base-uncased', help='HF model id or local path')
     parser.add_argument('--tokenizer', type=str, default='', help='HF tokenizer id (default: same as base_model)')
-    parser.add_argument('--load_in_4bit', action='store_true', help='use 4-bit quantization (QLoRA)')
-    parser.add_argument('--gradient_checkpointing', action='store_true', help='enable gradient checkpointing')
     parser.add_argument('--max_seq_len', type=int, default=768, help='max sequence length')
 
-    # LoRA hyperparameters
-    parser.add_argument('--lora_r', type=int, default=8, help='LoRA rank')
-    parser.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha')
-    parser.add_argument('--lora_dropout', type=float, default=0.05, help='LoRA dropout')
-    parser.add_argument('--target_modules', type=str, default='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',
-                        help='comma-separated target module names for LoRA')
-    parser.add_argument('--lr', type=float, default=5e-6, help='learning rate for LoRA params')
+    parser.add_argument('--lr', type=float, default=5e-6, help='learning rate')
     parser.add_argument('--scheduler', type=int, default=1, help='1 =on; 0 =off for lr scheduler')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='weight decay')
     parser.add_argument('--warmup_ratio', type=float, default=0.03, help='warmup ratio')
@@ -287,34 +303,8 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=3, help='outer epochs over the dataset')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='checkpoint dir')
 
-    # ===== RL / Bandit =====
-    parser.add_argument('--rl_use', type=int, default=0, help='use RL/bandit for news selection? (0/1)')
-    parser.add_argument('--rl_algo', type=str, default='lints', choices=['lints','linucb'], help='bandit algorithm')
-
-    parser.add_argument('--reward_metric', type=str, default='mae', choices=['mse','mae','loss'], help='reward metric')
-    parser.add_argument('--reward_ema', type=float, default=0.3, help='EMA smoothing of reward')
-    parser.add_argument('--domain_reward_norm', action='store_true', help='z-score reward per (domain,horizon) group')
-    parser.add_argument('--ucb_alpha', type=float, default=1.0, help='LinUCB alpha')
-    parser.add_argument('--ts_v', type=float, default=1.0, help='LinTS prior scale v')
-    parser.add_argument('--epsilon', type=float, default=0.05, help='epsilon-greedy fallback')
-    parser.add_argument('--news_rl_enable', type=int, default=0, choices=[0, 1],
-                        help='enable contextual bandit for per-prompt news item selection in delta stage')
-    parser.add_argument('--news_rl_algo', type=str, default='auto', choices=['auto', 'lints', 'linucb'],
-                        help='algo for news bandit; auto follows --rl_algo')
-    parser.add_argument('--news_rl_k_choices', type=str, default='1,2,3,5,7,10',
-                        help='candidate K values for RL to choose per prompt')
-    parser.add_argument('--news_rl_allow_over_topk', type=int, default=0, choices=[0, 1],
-                        help='allow RL-selected K to exceed --news_topK')
-    parser.add_argument('--news_rl_epsilon', type=float, default=0.05,
-                        help='epsilon-greedy exploration for news item/K selection')
-    parser.add_argument('--news_rl_prefilter_mult', type=int, default=4,
-                        help='prefilter pool size multiplier over max(K) before RL item selection')
-    parser.add_argument('--news_rl_pool_cap', type=int, default=128,
-                        help='max candidate pool size for RL item selection')
-    parser.add_argument('--news_rl_reward_clip', type=float, default=3.0,
-                        help='clip absolute reward when updating news bandits')
-    parser.add_argument('--news_rl_recency_tau_hours', type=float, default=24.0,
-                        help='recency decay tau (hours) in news item features for RL')
+    parser.add_argument('--select_metric', type=str, default='mae', choices=['mse','mae','loss'],
+                        help='metric used for model selection and comparisons')
 
     # ===== Eval & Logging =====
     parser.add_argument('--early_stop_patience', type=int, default=4, help='patience in eval rounds')
@@ -332,15 +322,10 @@ if __name__ == '__main__':
 
     # ===== Metadata =====
     parser.add_argument("--description",type=str,default="",help="描述这个 dataset 的用途，例如 '新州电价数据'")
-    parser.add_argument("--select_policy_by",type = str,default = "epoch",choices=["epoch", "batch"], 
-                        help = "Select policy/template by epoch-level or batch-level"
-    )
-
     args = parser.parse_args()
 
     if not args.tokenizer:
         args.tokenizer = args.base_model
-    args.target_modules = [s.strip() for s in args.target_modules.split(',') if s.strip()]
     args.token_budget_news_frac = float(max(0.0, min(1.0, args.token_budget_news_frac)))
 
     main_train(args)

@@ -102,6 +102,50 @@ def _parse_json_list(text: str) -> list:
         return []
 
 
+def _compact_text(text: Any, max_chars: int = 260) -> str:
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    s = re.sub(r"^[-*•\d\.\)\s]+", "", s)
+    if len(s) > int(max(1, max_chars)):
+        s = s[: int(max(1, max_chars))].rstrip(" ,;:")
+    return s
+
+
+def _norm_direction_label(x: Any) -> str:
+    s = str(x or "").strip().lower()
+    if s in {"1", "+1", "up", "rise", "rising", "positive", "bullish", "upward"}:
+        return "upward"
+    if s in {"-1", "down", "fall", "falling", "negative", "bearish", "downward"}:
+        return "downward"
+    if s in {"mixed", "both"}:
+        return "mixed"
+    if s in {"0", "neutral", "uncertain", "flat"}:
+        return "neutral"
+    try:
+        v = float(s)
+        if v > 0.15:
+            return "upward"
+        if v < -0.15:
+            return "downward"
+        return "neutral"
+    except Exception:
+        return "neutral"
+
+
+def _norm_confidence_label(x: Any) -> str:
+    s = str(x or "").strip().lower()
+    if s in {"low", "medium", "high"}:
+        return s
+    try:
+        v = float(s)
+    except Exception:
+        return "medium"
+    if v >= 0.67:
+        return "high"
+    if v <= 0.33:
+        return "low"
+    return "medium"
+
+
 class OpenAINewsApiAdapter:
     def __init__(
         self,
@@ -216,21 +260,56 @@ class OpenAINewsApiAdapter:
         context = context or {}
         region = str(context.get("region", "")).strip()
         target_time = str(context.get("target_time", "")).strip()
+        dataset_desc = str(
+            context.get("description", "")
+            or context.get("dataset_description", "")
+            or ""
+        ).strip()
+        topic = dataset_desc or "the target time-series forecasting task"
         joined = "\n".join([f"{i+1}. {str(x).strip()}" for i, x in enumerate(clean_news) if str(x).strip()])
         if not joined:
             return ""
         system = (
-            "You are a power-market news refiner. "
-            "Compress noisy headlines into concise, factual bullet points for time-series forecasting."
+            "You summarize news for exogenous impact forecasting.\n"
+            "Return JSON only with keys: direction, confidence, summary, key_drivers.\n"
+            "Rules:\n"
+            "- direction in {upward,downward,neutral,mixed}\n"
+            "- confidence in {low,medium,high}\n"
+            "- summary: one short natural-language sentence, <=70 words\n"
+            "- key_drivers: short phrase list, <=25 words\n"
+            "- do not include markdown, bullets, or extra keys."
         )
         user = (
             f"Region: {region}\n"
             f"TargetTime: {target_time}\n"
-            "Task: keep only price-relevant facts, remove fluff/duplicates, preserve direction cues.\n"
-            "Output plain text bullets only.\n\n"
+            f"DatasetTopic: {topic}\n"
+            "Task: compress the raw news into a short, fixed-template impact summary for this dataset topic.\n\n"
             f"News:\n{joined}"
         )
-        return self._chat_text(system, user, max_tokens=500)
+        raw = self._chat_text(system, user, max_tokens=300)
+        obj = _parse_json_obj(raw)
+        if obj:
+            direction = _norm_direction_label(obj.get("direction", "neutral"))
+            confidence = _norm_confidence_label(obj.get("confidence", "medium"))
+            summary = _compact_text(obj.get("summary", ""), max_chars=320)
+            drivers = _compact_text(obj.get("key_drivers", ""), max_chars=180)
+            if not summary:
+                summary = "Recent news contains limited high-confidence directional signals."
+            if not drivers:
+                drivers = "market sentiment, demand-supply conditions"
+            return (
+                f"Near-term impact direction: {direction} ({confidence} confidence). "
+                f"{summary} Key drivers: {drivers}."
+            )
+
+        # Fallback to a short single-paragraph template even when model output is not strict JSON.
+        fallback = _compact_text(raw, max_chars=360)
+        if not fallback:
+            fallback = "Recent news contains limited high-confidence directional signals."
+        return (
+            "Near-term impact direction: neutral (medium confidence). "
+            f"{fallback}"
+        )
 
     def extract_events(self, text: str, context: dict | None = None) -> dict:
         context = context or {}
