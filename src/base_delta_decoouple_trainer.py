@@ -203,11 +203,185 @@ def _refine_cache_key(
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
+def _refine_doc_cache_key(
+    *,
+    raw_news_text: str,
+    context: dict,
+    mode: str,
+    model: str,
+    max_tokens: int,
+) -> str:
+    txt = str(raw_news_text or "").strip()
+    payload = {
+        "kind": "doc",
+        "mode": str(mode or "").lower().strip(),
+        "model": str(model or "").strip(),
+        "max_tokens": int(max(1, max_tokens)),
+        "region": str(context.get("region", "")).strip(),
+        "description": str(context.get("description", "")).strip(),
+        "news": txt,
+    }
+    s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return "doc::" + hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def _truncate_with_tokenizer(text: str, tokenizer, max_tokens: int) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    n = int(max(1, max_tokens))
+    if tokenizer is None:
+        return s[: n * 4]
+    try:
+        enc = tokenizer(
+            s,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=n,
+            return_attention_mask=False,
+        )
+        ids = enc.get("input_ids", []) if isinstance(enc, dict) else []
+        if len(ids) == 0:
+            return s[: n * 4]
+        return tokenizer.decode(ids, skip_special_tokens=True).strip()
+    except Exception:
+        return s[: n * 4]
+
+
+def _stable_refine_cache_tag(args) -> str:
+    news_path = str(getattr(args, "news_path", "") or "").strip()
+    try:
+        news_path = os.path.abspath(news_path) if news_path else ""
+    except Exception:
+        pass
+    payload = {
+        "news_path": news_path,
+        "news_text_col": str(getattr(args, "news_text_col", "content") or "content"),
+        "refine_mode": str(getattr(args, "news_refine_mode", "local") or "local").lower().strip(),
+        "api_model": str(getattr(args, "news_api_model", "") or "").strip(),
+        "region": str(getattr(args, "region", "") or "").strip(),
+        "description": str(getattr(args, "description", "") or "").strip(),
+    }
+    s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
 def _refine_cache_path(args) -> str:
     p = str(getattr(args, "news_refine_cache_path", "") or "").strip()
     if p:
         return p
-    return os.path.join("./checkpoints", str(args.taskName), "refine_news_cache.json")
+    tag = _stable_refine_cache_tag(args)
+    return os.path.join("./checkpoints", "_shared_refine_cache", f"refine_news_cache_{tag}.json")
+
+
+def _resolve_refine_model_name(args, api_adapter) -> str:
+    return str(getattr(api_adapter, "model", getattr(args, "news_api_model", "")))
+
+
+def _doc_refine_context(args) -> dict:
+    return {
+        "target_time": "",
+        "region": str(getattr(args, "region", "")),
+        "description": str(getattr(args, "description", "")),
+    }
+
+
+def _refine_one_news_doc(
+    *,
+    raw_news_text: str,
+    tokenizer,
+    max_tokens: int,
+    args,
+    api_adapter=None,
+):
+    clean = str(raw_news_text or "").strip()
+    if not clean:
+        return ""
+
+    mode = str(getattr(args, "news_refine_mode", "local") or "local").lower().strip()
+    model = _resolve_refine_model_name(args, api_adapter)
+    context = _doc_refine_context(args)
+
+    cache_store = getattr(args, "_refine_cache_store", None)
+    cache_enabled = bool(getattr(args, "_refine_cache_enabled", False))
+    cache_key = ""
+    if cache_enabled and isinstance(cache_store, dict):
+        cache_key = _refine_doc_cache_key(
+            raw_news_text=clean,
+            context=context,
+            mode=mode,
+            model=model,
+            max_tokens=max_tokens,
+        )
+        cached = cache_store.get(cache_key, "")
+        if isinstance(cached, str) and cached.strip():
+            setattr(
+                args,
+                "_refine_cache_hits",
+                int(getattr(args, "_refine_cache_hits", 0)) + 1,
+            )
+            return cached.strip()
+
+    use_api = mode == "api" and api_adapter is not None and hasattr(api_adapter, "refine_news")
+    if use_api:
+        refined = refine_news_text(
+            raw_news_texts=[clean],
+            tokenizer=tokenizer,
+            max_tokens=max_tokens,
+            mode=mode,
+            api_adapter=api_adapter,
+            context=context,
+        )
+    else:
+        refined = _truncate_with_tokenizer(clean, tokenizer, max_tokens=max_tokens)
+    refined = str(refined or "").strip()
+
+    if cache_enabled:
+        setattr(
+            args,
+            "_refine_cache_misses",
+            int(getattr(args, "_refine_cache_misses", 0)) + 1,
+        )
+        if isinstance(cache_store, dict) and cache_key and refined:
+            cache_store[cache_key] = refined
+            setattr(args, "_refine_cache_store", cache_store)
+            setattr(args, "_refine_cache_dirty", True)
+    return refined
+
+
+def _refine_news_from_doc_cache(
+    *,
+    raw_news_texts: list[str],
+    tokenizer,
+    max_tokens: int,
+    args,
+    api_adapter=None,
+) -> str:
+    items = [str(x).strip() for x in raw_news_texts if str(x).strip()]
+    if len(items) == 0:
+        return ""
+
+    snippets = []
+    seen = set()
+    for item in items:
+        refined_item = _refine_one_news_doc(
+            raw_news_text=item,
+            tokenizer=tokenizer,
+            max_tokens=max_tokens,
+            args=args,
+            api_adapter=api_adapter,
+        )
+        if not refined_item:
+            continue
+        if refined_item in seen:
+            continue
+        seen.add(refined_item)
+        snippets.append(refined_item)
+
+    if len(snippets) == 0:
+        return ""
+    merged = "\n".join([f"- {s}" for s in snippets])
+    return _truncate_with_tokenizer(merged, tokenizer, max_tokens=max_tokens)
 
 
 def _init_refine_cache(args, live_logger=None):
@@ -965,32 +1139,17 @@ def build_batch_inputs(
                 "region": str(getattr(args, "region", "")),
                 "description": str(getattr(args, "description", "")),
             }
-            refine_mode = str(getattr(args, "news_refine_mode", "local"))
-            refine_model = str(
-                getattr(api_adapter, "model", getattr(args, "news_api_model", ""))
+            refined_news = _refine_news_from_doc_cache(
+                raw_news_texts=raw_news_texts,
+                tokenizer=tokenizer,
+                max_tokens=news_budget,
+                args=args,
+                api_adapter=api_adapter,
             )
 
-            cache_key = ""
-            cache_store = getattr(args, "_refine_cache_store", None)
-            cache_enabled = bool(getattr(args, "_refine_cache_enabled", False))
-            if cache_enabled and isinstance(cache_store, dict):
-                cache_key = _refine_cache_key(
-                    raw_news_texts=raw_news_texts,
-                    context=refine_context,
-                    mode=refine_mode,
-                    model=refine_model,
-                    max_tokens=news_budget,
-                )
-                cached = cache_store.get(cache_key, "")
-                if isinstance(cached, str) and cached.strip():
-                    refined_news = cached.strip()
-                    setattr(
-                        args,
-                        "_refine_cache_hits",
-                        int(getattr(args, "_refine_cache_hits", 0)) + 1,
-                    )
-
             if not refined_news:
+                # Last fallback keeps legacy behavior if doc-level refine yields empty.
+                refine_mode = str(getattr(args, "news_refine_mode", "local"))
                 refined_news = refine_news_text(
                     raw_news_texts=raw_news_texts,
                     tokenizer=tokenizer,
@@ -999,16 +1158,6 @@ def build_batch_inputs(
                     api_adapter=api_adapter,
                     context=refine_context,
                 )
-                if cache_enabled and isinstance(cache_store, dict) and cache_key and refined_news:
-                    cache_store[cache_key] = str(refined_news)
-                    setattr(args, "_refine_cache_store", cache_store)
-                    setattr(args, "_refine_cache_dirty", True)
-                if cache_enabled:
-                    setattr(
-                        args,
-                        "_refine_cache_misses",
-                        int(getattr(args, "_refine_cache_misses", 0)) + 1,
-                    )
 
             pieces = [refined_news] if refined_news else []
 
@@ -1798,17 +1947,12 @@ def run_retrieval_ablations(
 def _prewarm_refine_cache(
     *,
     args,
-    train_loader,
-    tokenizer,
-    templates,
-    tpl_id: int,
-    global_zstats,
     news_df,
-    policy_name: str,
-    policy_kw,
-    volatility_bin,
+    train_df,
+    val_df,
+    test_df,
+    tokenizer,
     live_logger,
-    case_bank=None,
     api_adapter=None,
 ):
     if not bool(getattr(args, "_refine_cache_enabled", False)):
@@ -1817,39 +1961,93 @@ def _prewarm_refine_cache(
         if live_logger is not None:
             live_logger.info("[NEWS_REFINE_CACHE] prewarm disabled.")
         return
-    if train_loader is None:
+    if news_df is None or len(news_df) == 0:
         return
 
-    max_batches = int(getattr(args, "news_refine_prewarm_max_batches", -1))
+    text_col = str(getattr(args, "news_text_col", "content"))
+    if text_col not in news_df.columns:
+        if live_logger is not None:
+            live_logger.info(f"[NEWS_REFINE_CACHE] prewarm skipped: text_col not found: {text_col}")
+        return
+
+    max_items = int(getattr(args, "news_refine_prewarm_max_batches", -1))
     before_n = len(getattr(args, "_refine_cache_store", {}))
     hit0 = int(getattr(args, "_refine_cache_hits", 0))
     miss0 = int(getattr(args, "_refine_cache_misses", 0))
 
-    pbar = tqdm(train_loader, desc="[DELTA][REFINE_PREWARM]", leave=False)
-    for bidx, batch in enumerate(pbar):
-        if max_batches > 0 and bidx >= max_batches:
-            break
-        _ = build_batch_inputs(
-            batch=batch,
+    time_col = str(getattr(args, "news_time_col", "date"))
+    in_scope = news_df
+    if time_col in news_df.columns:
+        lo = None
+        hi = None
+        for df in [train_df, val_df, test_df]:
+            if isinstance(df, pd.DataFrame) and (args.time_col in df.columns) and len(df) > 0:
+                ts = pd.to_datetime(df[args.time_col], errors="coerce", dayfirst=args.dayFirst)
+                ts = ts.dropna()
+                if len(ts) == 0:
+                    continue
+                cur_lo = ts.min()
+                cur_hi = ts.max()
+                lo = cur_lo if lo is None else min(lo, cur_lo)
+                hi = cur_hi if hi is None else max(hi, cur_hi)
+        if lo is not None and hi is not None:
+            pad_days = float(max(0.0, float(getattr(args, "news_window_days", 1) or 1)))
+            lo = lo - pd.Timedelta(days=pad_days + 1.0)
+            nts = pd.to_datetime(news_df[time_col], errors="coerce", dayfirst=args.dayFirst)
+            mask = nts.ge(lo) & nts.le(hi)
+            in_scope = news_df.loc[mask.fillna(False)].copy()
+
+    raw_texts = in_scope[text_col].fillna("").astype(str).tolist()
+    uniq = []
+    seen = set()
+    for txt in raw_texts:
+        s = str(txt).strip()
+        if not s:
+            continue
+        h = hashlib.sha1(s.encode("utf-8")).hexdigest()
+        if h in seen:
+            continue
+        seen.add(h)
+        uniq.append(s)
+    if max_items > 0:
+        uniq = uniq[:max_items]
+
+    show_progress = int(getattr(args, "news_refine_show_progress", 1)) == 1
+    if live_logger is not None:
+        live_logger.info(
+            "[NEWS_REFINE_CACHE] prewarm start: "
+            f"news_rows={len(news_df)}, in_scope_rows={len(in_scope)}, unique_docs={len(uniq)}, "
+            f"show_progress={int(show_progress)}"
+        )
+
+    pbar = tqdm(
+        uniq,
+        desc="[DELTA][REFINE_PREWARM_NEWS]",
+        leave=show_progress,
+        dynamic_ncols=True,
+        mininterval=0.3,
+        disable=(not show_progress),
+    )
+    news_budget = int(args.token_budget * args.token_budget_news_frac)
+    total_docs = len(uniq)
+    for idx, raw_text in enumerate(pbar, start=1):
+        _ = _refine_one_news_doc(
+            raw_news_text=raw_text,
             tokenizer=tokenizer,
-            templates=templates,
-            tpl_id=tpl_id,
+            max_tokens=news_budget,
             args=args,
-            global_zstats=global_zstats,
-            news_df=news_df,
-            policy_name=policy_name,
-            policy_kw=policy_kw,
-            volatility_bin=volatility_bin,
-            epoch=-1,
-            record_train_prompt=False,
-            testing=False,
-            force_no_news=False,
-            news_dropout=False,
-            prompt_path=None,
-            case_bank=case_bank,
-            query_base_pred=None,
             api_adapter=api_adapter,
         )
+        if show_progress and (idx == 1 or idx % 10 == 0 or idx == total_docs):
+            hit_now = int(getattr(args, "_refine_cache_hits", 0))
+            miss_now = int(getattr(args, "_refine_cache_misses", 0))
+            pbar.set_postfix(
+                {
+                    "cache_hit": max(0, hit_now - hit0),
+                    "refined": max(0, miss_now - miss0),
+                },
+                refresh=False,
+            )
     _save_refine_cache(args, live_logger=live_logger, force=True)
     after_n = len(getattr(args, "_refine_cache_store", {}))
     hit1 = int(getattr(args, "_refine_cache_hits", 0))
@@ -1857,6 +2055,7 @@ def _prewarm_refine_cache(
     if live_logger is not None:
         live_logger.info(
             "[NEWS_REFINE_CACHE] prewarm done: "
+            f"news_rows={len(news_df)}, in_scope_rows={len(in_scope)}, unique_docs={len(uniq)}, "
             f"entries_before={before_n}, entries_after={after_n}, "
             f"hits_delta={hit1 - hit0}, misses_delta={miss1 - miss0}"
         )
@@ -2394,6 +2593,17 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     best_tpl_id = tpl_id
     best_policy_name = policy_name
 
+    _prewarm_refine_cache(
+        args=args,
+        news_df=news_df,
+        train_df=bundle.get("train_df"),
+        val_df=bundle.get("val_df"),
+        test_df=bundle.get("test_df"),
+        tokenizer=tokenizer,
+        live_logger=live_logger,
+        api_adapter=news_api_adapter,
+    )
+
     active_case_bank = None
     retrieval_mode_active = _resolve_retrieval_mode(args)
     if retrieval_mode_active != "off":
@@ -2429,22 +2639,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             live_logger.info(f"[CASE_BANK] saved to {case_bank_path}")
     else:
         live_logger.info("[CASE_BANK] retrieval disabled; skip active case bank build.")
-
-    _prewarm_refine_cache(
-        args=args,
-        train_loader=train_loader,
-        tokenizer=tokenizer,
-        templates=templates,
-        tpl_id=tpl_id,
-        global_zstats=global_zstats,
-        news_df=news_df,
-        policy_name=policy_name,
-        policy_kw=policy_kw,
-        volatility_bin=volatility_bin,
-        live_logger=live_logger,
-        case_bank=active_case_bank,
-        api_adapter=news_api_adapter,
-    )
 
     if math.isfinite(float(best_base_metric)):
         base_ref_metric = float(best_base_metric)

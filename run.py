@@ -97,11 +97,13 @@ if __name__ == '__main__':
     parser.add_argument('--news_refine_cache_enable', type=int, default=1, choices=[0, 1],
                         help='enable persistent cache for refined news text')
     parser.add_argument('--news_refine_cache_path', type=str, default='',
-                        help='optional cache file path for refined news; default is checkpoints/<task>/refine_news_cache.json')
+                        help='optional cache file path for refined news; default is a shared cache under checkpoints/_shared_refine_cache/')
     parser.add_argument('--news_refine_prewarm', type=int, default=1, choices=[0, 1],
                         help='prewarm refine cache with one train split pass before DELTA training')
     parser.add_argument('--news_refine_prewarm_max_batches', type=int, default=-1,
-                        help='limit prewarm batches; <=0 means all train batches')
+                        help='limit prewarm news documents; <=0 means all in-scope news documents')
+    parser.add_argument('--news_refine_show_progress', type=int, default=1, choices=[0, 1],
+                        help='show tqdm progress bar in terminal during refine cache prewarm')
     parser.add_argument('--news_structured_mode', type=str, default='off', choices=['off', 'heuristic', 'api'],
                         help='structured event extraction backend')
     parser.add_argument('--news_api_model', type=str, default='gpt-5.1',

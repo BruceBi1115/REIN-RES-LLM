@@ -87,8 +87,14 @@ TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 # Keep task settings aligned with your existing NSW scripts.
 RESIDUAL_LOSS="smooth_l1"
 SELECT_METRIC="mae"
-STRIDE="48"
-HORIZON="48"
+STRIDE="1"
+HORIZONS=(
+  "48"
+  "96"
+  "192"
+  "336"
+  "720"
+)
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
 STAGE="all"
@@ -138,9 +144,10 @@ else
   NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-heuristic}"   # off | heuristic | api
 fi
 NEWS_REFINE_CACHE_ENABLE="${NEWS_REFINE_CACHE_ENABLE:-1}"
-NEWS_REFINE_CACHE_PATH="${NEWS_REFINE_CACHE_PATH:-}"
+NEWS_REFINE_CACHE_PATH="${NEWS_REFINE_CACHE_PATH:-./checkpoints/_shared_refine_cache/refine_news_cache_nswelecprice_2024.json}"
 NEWS_REFINE_PREWARM="${NEWS_REFINE_PREWARM:-1}"
 NEWS_REFINE_PREWARM_MAX_BATCHES="${NEWS_REFINE_PREWARM_MAX_BATCHES:--1}"
+NEWS_REFINE_SHOW_PROGRESS="${NEWS_REFINE_SHOW_PROGRESS:-1}"
 DELTA_INCLUDE_STRUCTURED_NEWS="${DELTA_INCLUDE_STRUCTURED_NEWS:-1}"  # 1 to append structured fields
 
 CASE_RETRIEVAL_ENABLE="${CASE_RETRIEVAL_ENABLE:-1}"           # default on for case-focused runs
@@ -321,6 +328,7 @@ COMMON_ARGS=(
   --news_refine_cache_path "$NEWS_REFINE_CACHE_PATH"
   --news_refine_prewarm "$NEWS_REFINE_PREWARM"
   --news_refine_prewarm_max_batches "$NEWS_REFINE_PREWARM_MAX_BATCHES"
+  --news_refine_show_progress "$NEWS_REFINE_SHOW_PROGRESS"
   --news_api_model "$NEWS_API_MODEL"
   --news_api_key_path "$NEWS_API_KEY_PATH"
   --news_api_base_url "$NEWS_API_BASE_URL"
@@ -383,40 +391,42 @@ for i in "${!TASK_NAMES[@]}"; do
         for lr in "${LRS[@]}"; do
           for sch in "${SCHEDULERS[@]}"; do
             for grad_acc in "${GRAD_ACCS[@]}"; do
-              run_task="${task}_${base_backbone}"
-              args=( --taskName "$run_task" "${COMMON_ARGS[@]}" )
+              for horizon in "${HORIZONS[@]}"; do
+                run_task="${task}_${base_backbone}_h${horizon}"
+                args=( --taskName "$run_task" "${COMMON_ARGS[@]}" )
 
-              args+=( --news_path "${NEWS_CHOICES[$j]}" )
-              if [[ -n "$tpool" ]]; then
-                args+=( --template_pool "$tpool" )
-              fi
+                args+=( --news_path "${NEWS_CHOICES[$j]}" )
+                if [[ -n "$tpool" ]]; then
+                  args+=( --template_pool "$tpool" )
+                fi
 
-              args+=( --news_window_days "${LOOKBACK_WINDOWS[$k]}" )
-              args+=( --head_mlp )
-              args+=( --patch_dropout "$PATCH_DROPOUT" )
-              args+=( --head_dropout "$HEAD_DROPOUT" )
-              args+=( --stride "$STRIDE" )
-              args+=( --horizon "$HORIZON" )
-              args+=( --base_epochs "$BASE_EPOCHS" )
-              args+=( --delta_epochs "$DELTA_EPOCHS" )
-              args+=( --base_backbone "$base_backbone" )
-              args+=( --base_hidden_dim "$BASE_HIDDEN_DIM" )
-              args+=( --base_moving_avg "$BASE_MOVING_AVG" )
-              args+=( --base_dropout "$BASE_DROPOUT" )
-              args+=( --base_loss "$BASE_LOSS" )
-              args+=( --base_lr "$BASE_LR" )
-              args+=( --base_weight_decay "$BASE_WEIGHT_DECAY" )
-              args+=( --grad_accum "$grad_acc" )
-              args+=( --lr "$lr" )
-              args+=( --scheduler "$sch" )
-              if [[ "$run_or_not" == "1" ]]; then
-                echo "==> Running: ${run_task} (base_backbone=${base_backbone})"
-                "$PYTHON_BIN" "$ENTRY" "${args[@]}"
-              fi
+                args+=( --news_window_days "${LOOKBACK_WINDOWS[$k]}" )
+                args+=( --head_mlp )
+                args+=( --patch_dropout "$PATCH_DROPOUT" )
+                args+=( --head_dropout "$HEAD_DROPOUT" )
+                args+=( --stride "$STRIDE" )
+                args+=( --horizon "$horizon" )
+                args+=( --base_epochs "$BASE_EPOCHS" )
+                args+=( --delta_epochs "$DELTA_EPOCHS" )
+                args+=( --base_backbone "$base_backbone" )
+                args+=( --base_hidden_dim "$BASE_HIDDEN_DIM" )
+                args+=( --base_moving_avg "$BASE_MOVING_AVG" )
+                args+=( --base_dropout "$BASE_DROPOUT" )
+                args+=( --base_loss "$BASE_LOSS" )
+                args+=( --base_lr "$BASE_LR" )
+                args+=( --base_weight_decay "$BASE_WEIGHT_DECAY" )
+                args+=( --grad_accum "$grad_acc" )
+                args+=( --lr "$lr" )
+                args+=( --scheduler "$sch" )
+                if [[ "$run_or_not" == "1" ]]; then
+                  echo "==> Running: ${run_task} (base_backbone=${base_backbone}, horizon=${horizon})"
+                  "$PYTHON_BIN" "$ENTRY" "${args[@]}"
+                fi
 
-              # Optional cleanup for disk space after each run:
-              # rm -rf "checkpoints/${run_task}/best_base_${run_task}"
-              # rm -rf "checkpoints/${run_task}/best_delta_${run_task}"
+                # Optional cleanup for disk space after each run:
+                # rm -rf "checkpoints/${run_task}/best_base_${run_task}"
+                # rm -rf "checkpoints/${run_task}/best_delta_${run_task}"
+              done
             done
           done
         done

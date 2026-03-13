@@ -114,6 +114,152 @@ def _refine_cache_key_for_case(
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
+def _refine_doc_cache_key_for_case(
+    *,
+    raw_news_text: str,
+    context: dict,
+    mode: str,
+    model: str,
+    max_tokens: int,
+) -> str:
+    txt = str(raw_news_text or "").strip()
+    payload = {
+        "kind": "doc",
+        "mode": str(mode or "").lower().strip(),
+        "model": str(model or "").strip(),
+        "max_tokens": int(max(1, max_tokens)),
+        "region": str(context.get("region", "")).strip(),
+        "description": str(context.get("description", "")).strip(),
+        "news": txt,
+    }
+    s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return "doc::" + hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def _truncate_with_tokenizer_case(text: str, tokenizer, max_tokens: int) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    n = int(max(1, max_tokens))
+    if tokenizer is None:
+        return s[: n * 4]
+    try:
+        enc = tokenizer(
+            s,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=n,
+            return_attention_mask=False,
+        )
+        ids = enc.get("input_ids", []) if isinstance(enc, dict) else []
+        if len(ids) == 0:
+            return s[: n * 4]
+        return tokenizer.decode(ids, skip_special_tokens=True).strip()
+    except Exception:
+        return s[: n * 4]
+
+
+def _refine_one_news_doc_for_case(
+    *,
+    raw_news_text: str,
+    tokenizer,
+    max_tokens: int,
+    args,
+    api_adapter=None,
+):
+    clean = str(raw_news_text or "").strip()
+    if not clean:
+        return ""
+
+    mode = str(getattr(args, "news_refine_mode", "local") or "local").lower().strip()
+    model = str(getattr(api_adapter, "model", getattr(args, "news_api_model", "")))
+    context = {
+        "target_time": "",
+        "region": str(getattr(args, "region", "")),
+        "description": str(getattr(args, "description", "")),
+    }
+
+    cache_enabled = bool(getattr(args, "_refine_cache_enabled", False))
+    cache_store = getattr(args, "_refine_cache_store", None)
+    cache_key = ""
+    if cache_enabled and isinstance(cache_store, dict):
+        cache_key = _refine_doc_cache_key_for_case(
+            raw_news_text=clean,
+            context=context,
+            mode=mode,
+            model=model,
+            max_tokens=max_tokens,
+        )
+        cached = cache_store.get(cache_key, "")
+        if isinstance(cached, str) and cached.strip():
+            setattr(
+                args,
+                "_refine_cache_hits",
+                int(getattr(args, "_refine_cache_hits", 0)) + 1,
+            )
+            return cached.strip()
+
+    use_api = mode == "api" and api_adapter is not None and hasattr(api_adapter, "refine_news")
+    if use_api:
+        refined = refine_news_text(
+            raw_news_texts=[clean],
+            tokenizer=tokenizer,
+            max_tokens=max_tokens,
+            mode=mode,
+            api_adapter=api_adapter,
+            context=context,
+        )
+    else:
+        refined = _truncate_with_tokenizer_case(clean, tokenizer, max_tokens=max_tokens)
+    refined = str(refined or "").strip()
+
+    if cache_enabled:
+        setattr(
+            args,
+            "_refine_cache_misses",
+            int(getattr(args, "_refine_cache_misses", 0)) + 1,
+        )
+        if isinstance(cache_store, dict) and cache_key and refined:
+            cache_store[cache_key] = refined
+            setattr(args, "_refine_cache_store", cache_store)
+            setattr(args, "_refine_cache_dirty", True)
+    return refined
+
+
+def _refine_news_from_doc_cache_for_case(
+    *,
+    raw_news_texts: list[str],
+    tokenizer,
+    max_tokens: int,
+    args,
+    api_adapter=None,
+) -> str:
+    items = [str(x).strip() for x in raw_news_texts if str(x).strip()]
+    if len(items) == 0:
+        return ""
+
+    snippets = []
+    seen = set()
+    for item in items:
+        refined_item = _refine_one_news_doc_for_case(
+            raw_news_text=item,
+            tokenizer=tokenizer,
+            max_tokens=max_tokens,
+            args=args,
+            api_adapter=api_adapter,
+        )
+        if not refined_item:
+            continue
+        if refined_item in seen:
+            continue
+        seen.add(refined_item)
+        snippets.append(refined_item)
+    if len(snippets) == 0:
+        return ""
+    merged = "\n".join([f"- {s}" for s in snippets])
+    return _truncate_with_tokenizer_case(merged, tokenizer, max_tokens=max_tokens)
+
+
 def _to_utc_time(ts_like: Any) -> pd.Timestamp | None:
     try:
         ts = pd.to_datetime(ts_like, errors="coerce", utc=True)
@@ -929,30 +1075,16 @@ def _build_news_context_for_case(
         "region": str(getattr(args, "region", "")),
         "description": str(getattr(args, "description", "")),
     }
-    refine_mode = str(getattr(args, "news_refine_mode", "local"))
-    refine_model = str(getattr(api_adapter, "model", getattr(args, "news_api_model", "")))
-    cache_enabled = bool(getattr(args, "_refine_cache_enabled", False))
-    cache_store = getattr(args, "_refine_cache_store", None)
-    cache_key = ""
-    refined_news = ""
-    if cache_enabled and isinstance(cache_store, dict):
-        cache_key = _refine_cache_key_for_case(
-            raw_news_texts=raw_news_texts,
-            context=context,
-            mode=refine_mode,
-            model=refine_model,
-            max_tokens=max_tokens,
-        )
-        cached = cache_store.get(cache_key, "")
-        if isinstance(cached, str) and cached.strip():
-            refined_news = cached.strip()
-            setattr(
-                args,
-                "_refine_cache_hits",
-                int(getattr(args, "_refine_cache_hits", 0)) + 1,
-            )
+    refined_news = _refine_news_from_doc_cache_for_case(
+        raw_news_texts=raw_news_texts,
+        tokenizer=tokenizer,
+        max_tokens=max_tokens,
+        args=args,
+        api_adapter=api_adapter,
+    )
 
     if not refined_news:
+        refine_mode = str(getattr(args, "news_refine_mode", "local"))
         refined_news = refine_news_text(
             raw_news_texts=raw_news_texts,
             tokenizer=tokenizer,
@@ -961,16 +1093,6 @@ def _build_news_context_for_case(
             api_adapter=api_adapter,
             context=context,
         )
-        if cache_enabled and isinstance(cache_store, dict) and cache_key and refined_news:
-            cache_store[cache_key] = str(refined_news)
-            setattr(args, "_refine_cache_store", cache_store)
-            setattr(args, "_refine_cache_dirty", True)
-        if cache_enabled:
-            setattr(
-                args,
-                "_refine_cache_misses",
-                int(getattr(args, "_refine_cache_misses", 0)) + 1,
-            )
 
     if not refined_news:
         return "", {}
