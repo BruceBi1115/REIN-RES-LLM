@@ -53,16 +53,18 @@ from .base_backbone import (
 from .delta_news_hooks import (
     refine_news_text,
     extract_structured_events,
+    merge_structured_events,
     format_structured_events_for_prompt,
     reflect_hard_samples,
     build_news_api_adapter,
 )
-from .delta_case_retrieval import (
-    build_case_bank,
-    build_case_record,
-    build_retrieval_features,
-    retrieve_similar_cases,
-    save_case_bank,
+from .refine_cache_utils import (
+    build_refine_context,
+    make_refine_doc_cache_key,
+    make_refine_news_cache_key,
+    make_structured_doc_cache_key,
+    resolve_refine_cache_path,
+    resolve_structured_cache_path,
 )
 from .utils.residual_utils import split_two_stage_epochs
 
@@ -189,18 +191,13 @@ def _refine_cache_key(
     model: str,
     max_tokens: int,
 ) -> str:
-    clean = [str(x).strip() for x in raw_news_texts if str(x).strip()]
-    payload = {
-        "mode": str(mode or "").lower().strip(),
-        "model": str(model or "").strip(),
-        "max_tokens": int(max(1, max_tokens)),
-        "target_time": str(context.get("target_time", "")).strip(),
-        "region": str(context.get("region", "")).strip(),
-        "description": str(context.get("description", "")).strip(),
-        "news": clean,
-    }
-    s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+    return make_refine_news_cache_key(
+        raw_news_texts=raw_news_texts,
+        context=context,
+        mode=mode,
+        model=model,
+        max_tokens=max_tokens,
+    )
 
 
 def _refine_doc_cache_key(
@@ -211,18 +208,13 @@ def _refine_doc_cache_key(
     model: str,
     max_tokens: int,
 ) -> str:
-    txt = str(raw_news_text or "").strip()
-    payload = {
-        "kind": "doc",
-        "mode": str(mode or "").lower().strip(),
-        "model": str(model or "").strip(),
-        "max_tokens": int(max(1, max_tokens)),
-        "region": str(context.get("region", "")).strip(),
-        "description": str(context.get("description", "")).strip(),
-        "news": txt,
-    }
-    s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return "doc::" + hashlib.sha1(s.encode("utf-8")).hexdigest()
+    return make_refine_doc_cache_key(
+        raw_news_text=raw_news_text,
+        context=context,
+        mode=mode,
+        model=model,
+        max_tokens=max_tokens,
+    )
 
 
 def _truncate_with_tokenizer(text: str, tokenizer, max_tokens: int) -> str:
@@ -248,30 +240,355 @@ def _truncate_with_tokenizer(text: str, tokenizer, max_tokens: int) -> str:
         return s[: n * 4]
 
 
-def _stable_refine_cache_tag(args) -> str:
-    news_path = str(getattr(args, "news_path", "") or "").strip()
-    try:
-        news_path = os.path.abspath(news_path) if news_path else ""
-    except Exception:
-        pass
-    payload = {
-        "news_path": news_path,
-        "news_text_col": str(getattr(args, "news_text_col", "content") or "content"),
-        "refine_mode": str(getattr(args, "news_refine_mode", "local") or "local").lower().strip(),
-        "api_model": str(getattr(args, "news_api_model", "") or "").strip(),
-        "region": str(getattr(args, "region", "") or "").strip(),
-        "description": str(getattr(args, "description", "") or "").strip(),
-    }
-    s = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
-
-
 def _refine_cache_path(args) -> str:
-    p = str(getattr(args, "news_refine_cache_path", "") or "").strip()
-    if p:
-        return p
-    tag = _stable_refine_cache_tag(args)
-    return os.path.join("./checkpoints", "_shared_refine_cache", f"refine_news_cache_{tag}.json")
+    return resolve_refine_cache_path(args)
+
+
+def _parse_refine_cache_read_paths(raw_value) -> list[str]:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return []
+    out = []
+    seen = set()
+    for part in raw.replace("\n", ",").split(","):
+        p = str(part or "").strip()
+        if not p:
+            continue
+        norm = os.path.abspath(p)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(p)
+    return out
+
+
+def _load_refine_cache_file(path: str) -> dict[str, str]:
+    store = {}
+    if not path or (not os.path.exists(path)):
+        return store
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            if isinstance(obj.get("cache_key"), str) and isinstance(obj.get("refined_news"), str):
+                k = str(obj.get("cache_key", "")).strip()
+                v = str(obj.get("refined_news", ""))
+                store = {k: v} if k else {}
+            else:
+                store = {str(k): str(v) for k, v in obj.items() if isinstance(v, str)}
+        elif isinstance(obj, list):
+            parsed = {}
+            for rec in obj:
+                if not isinstance(rec, dict):
+                    continue
+                key = rec.get("cache_key", rec.get("key", rec.get("id", "")))
+                value = rec.get("refined_news", rec.get("value", rec.get("text", "")))
+                if isinstance(key, str) and isinstance(value, str):
+                    k = key.strip()
+                    if k:
+                        parsed[k] = value
+            store = parsed
+    except Exception:
+        parsed = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = str(line or "").strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    key = rec.get("cache_key", rec.get("key", rec.get("id", "")))
+                    value = rec.get("refined_news", rec.get("value", rec.get("text", "")))
+                    if isinstance(key, str) and isinstance(value, str):
+                        k = key.strip()
+                        if k:
+                            parsed[k] = value
+        except Exception:
+            parsed = {}
+        store = parsed
+    return store
+
+
+def _load_structured_cache_file(path: str) -> dict[str, dict]:
+    store = {}
+    if not path or (not os.path.exists(path)):
+        return store
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            if isinstance(obj.get("structured_cache_key"), str) and isinstance(obj.get("structured_events"), dict):
+                kk = str(obj.get("structured_cache_key", "")).strip()
+                if kk:
+                    store[kk] = dict(obj.get("structured_events", {}))
+            else:
+                for k, v in obj.items():
+                    if isinstance(v, dict):
+                        kk = str(k).strip()
+                        if kk:
+                            store[kk] = dict(v)
+        elif isinstance(obj, list):
+            parsed = {}
+            for rec in obj:
+                if not isinstance(rec, dict):
+                    continue
+                key = rec.get("structured_cache_key", rec.get("cache_key", rec.get("key", rec.get("id", ""))))
+                value = rec.get("structured_events", rec.get("value", {}))
+                if isinstance(key, str) and isinstance(value, dict):
+                    k = key.strip()
+                    if k:
+                        parsed[k] = dict(value)
+            store = parsed
+    except Exception:
+        parsed = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = str(line or "").strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    key = rec.get("structured_cache_key", rec.get("cache_key", rec.get("key", rec.get("id", ""))))
+                    value = rec.get("structured_events", rec.get("value", {}))
+                    if isinstance(key, str) and isinstance(value, dict):
+                        k = key.strip()
+                        if k:
+                            parsed[k] = dict(value)
+        except Exception:
+            parsed = {}
+        store = parsed
+    return store
+
+
+def _load_news_doc_cache_file(path: str) -> dict[str, dict]:
+    store = {}
+    if not path or (not os.path.exists(path)):
+        return store
+
+    def _ingest_record(rec: dict):
+        if not isinstance(rec, dict):
+            return
+        norm = _normalize_news_doc_cache_record(rec)
+        primary = str(
+            norm.get(
+                "cache_key",
+                rec.get("doc_cache_key", norm.get("structured_cache_key", rec.get("key", rec.get("id", "")))),
+            )
+        ).strip()
+        if not primary:
+            return
+        store[primary] = norm
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            _ingest_record(obj)
+        elif isinstance(obj, list):
+            for rec in obj:
+                _ingest_record(rec)
+    except Exception:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = str(line or "").strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except Exception:
+                        continue
+                    _ingest_record(rec)
+        except Exception:
+            store = {}
+    return store
+
+
+def _log_news_doc_cache_detection(live_logger, *, tag: str, path: str, object_count: int):
+    if live_logger is None:
+        return
+    clean_path = str(path or "").strip()
+    detected = bool(clean_path) and os.path.exists(clean_path) and int(object_count) > 0
+    if clean_path:
+        live_logger.info(
+            f"[{tag}] cache_detected={int(detected)} file={clean_path} objects={int(object_count)}"
+        )
+    else:
+        live_logger.info(
+            f"[{tag}] cache_detected=0 file=<EMPTY> objects={int(object_count)}"
+        )
+
+
+def _build_news_doc_meta_index(news_df: pd.DataFrame, *, text_col: str, time_col: str) -> dict[str, dict]:
+    idx = {}
+    if text_col not in news_df.columns:
+        return idx
+    title_col = "title" if "title" in news_df.columns else ""
+    url_col = "url" if "url" in news_df.columns else ""
+    for _, row in news_df.iterrows():
+        raw_text = str(row.get(text_col, "") or "").strip()
+        if not raw_text or raw_text in idx:
+            continue
+        ts_value = row.get(time_col, "")
+        if hasattr(ts_value, "isoformat"):
+            ts_value = ts_value.isoformat()
+        meta = {
+            "title": str(row.get(title_col, "") or "").strip() if title_col else "",
+            "date": str(ts_value or "").strip(),
+            "url": str(row.get(url_col, "") or "").strip() if url_col else "",
+        }
+        idx[raw_text] = meta
+    return idx
+
+
+def _lookup_news_doc_meta(args, raw_news_text: str) -> dict:
+    clean = str(raw_news_text or "").strip()
+    if not clean:
+        return {}
+    meta_index = getattr(args, "_news_doc_meta_by_text", None)
+    if not isinstance(meta_index, dict):
+        return {}
+    meta = meta_index.get(clean, {})
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _normalize_news_doc_cache_record(rec: dict | None) -> dict:
+    rec = dict(rec or {})
+    out = {
+        "cache_key": str(rec.get("cache_key", "") or "").strip(),
+        "structured_cache_key": str(rec.get("structured_cache_key", "") or "").strip(),
+        "raw_news_text": str(rec.get("raw_news_text", "") or "").strip(),
+        "title": str(rec.get("title", "") or "").strip(),
+        "date": str(rec.get("date", "") or "").strip(),
+        "url": str(rec.get("url", "") or "").strip(),
+        "refined_news": str(rec.get("refined_news", "") or "").strip(),
+        "structured_events": dict(rec.get("structured_events", {})) if isinstance(rec.get("structured_events", {}), dict) else {},
+        "structured_source_kind": str(rec.get("structured_source_kind", "") or "").strip(),
+        "region": str(rec.get("region", "") or "").strip(),
+        "description": str(rec.get("description", "") or "").strip(),
+        "news_path": str(rec.get("news_path", "") or "").strip(),
+        "api_model": str(rec.get("api_model", "") or "").strip(),
+        "refine_mode": str(rec.get("refine_mode", "") or "").strip(),
+        "structured_mode": str(rec.get("structured_mode", "") or "").strip(),
+        "refine_max_tokens": int(rec.get("refine_max_tokens", 0) or 0),
+    }
+    return out
+
+
+def _upsert_news_doc_cache_record(
+    args,
+    *,
+    refine_cache_key: str = "",
+    structured_cache_key: str = "",
+    raw_news_text: str = "",
+    refined_news: str = "",
+    structured_events: dict | None = None,
+    source_kind: str = "",
+    context: dict | None = None,
+    model: str = "",
+    max_tokens: int | None = None,
+):
+    store = getattr(args, "_news_doc_cache_store", None)
+    pending = getattr(args, "_news_doc_cache_pending", None)
+    structured_index = getattr(args, "_news_doc_cache_structured_index", None)
+    if not isinstance(store, dict) or not isinstance(pending, dict) or not isinstance(structured_index, dict):
+        return
+
+    primary_key = ""
+    if refine_cache_key and refine_cache_key in store:
+        primary_key = refine_cache_key
+    elif structured_cache_key and structured_cache_key in structured_index:
+        primary_key = structured_index.get(structured_cache_key, "")
+    elif refine_cache_key:
+        primary_key = refine_cache_key
+    elif structured_cache_key:
+        primary_key = structured_cache_key
+    else:
+        return
+
+    record = _normalize_news_doc_cache_record(store.get(primary_key, {}))
+    meta = _lookup_news_doc_meta(args, raw_news_text)
+    if refine_cache_key:
+        record["cache_key"] = str(refine_cache_key)
+    if structured_cache_key:
+        record["structured_cache_key"] = str(structured_cache_key)
+        structured_index[str(structured_cache_key)] = primary_key
+    if raw_news_text:
+        record["raw_news_text"] = str(raw_news_text)
+    if refined_news:
+        record["refined_news"] = str(refined_news)
+    if isinstance(structured_events, dict) and len(structured_events) > 0:
+        record["structured_events"] = dict(structured_events)
+    if source_kind:
+        record["structured_source_kind"] = str(source_kind)
+    if meta.get("title"):
+        record["title"] = str(meta.get("title", ""))
+    if meta.get("date"):
+        record["date"] = str(meta.get("date", ""))
+    if meta.get("url"):
+        record["url"] = str(meta.get("url", ""))
+    ctx = dict(context or {})
+    if ctx.get("region"):
+        record["region"] = str(ctx.get("region", ""))
+    if ctx.get("description"):
+        record["description"] = str(ctx.get("description", ""))
+    if model:
+        record["api_model"] = str(model)
+    if max_tokens is not None:
+        record["refine_max_tokens"] = int(max(1, max_tokens))
+    news_path = str(getattr(args, "news_path", "") or "").strip()
+    if news_path:
+        record["news_path"] = news_path
+
+    record = _normalize_news_doc_cache_record(record)
+    store[primary_key] = record
+    pending[primary_key] = dict(record)
+    setattr(args, "_news_doc_cache_store", store)
+    setattr(args, "_news_doc_cache_pending", pending)
+    setattr(args, "_news_doc_cache_structured_index", structured_index)
+
+
+def _save_news_doc_cache(args, live_logger=None, force: bool = False):
+    path = str(getattr(args, "_news_doc_cache_path", "")).strip()
+    store = getattr(args, "_news_doc_cache_store", None)
+    pending = getattr(args, "_news_doc_cache_pending", None)
+    dirty = bool(getattr(args, "_news_doc_cache_dirty", False))
+    if not path or not isinstance(store, dict) or not isinstance(pending, dict):
+        return
+    if (not force) and (not dirty):
+        return
+
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+
+    payload = [
+        _normalize_news_doc_cache_record(v)
+        for _, v in sorted(store.items(), key=lambda x: str(x[0]))
+        if isinstance(v, dict)
+    ]
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+    appended_count = len([1 for _, v in pending.items() if isinstance(v, dict)])
+    setattr(args, "_news_doc_cache_pending", {})
+    setattr(args, "_news_doc_cache_dirty", False)
+    if live_logger is not None:
+        live_logger.info(
+            f"[NEWS_DOC_CACHE] saved entries={len(store)} updated={appended_count} format=json_array"
+        )
 
 
 def _resolve_refine_model_name(args, api_adapter) -> str:
@@ -279,11 +596,7 @@ def _resolve_refine_model_name(args, api_adapter) -> str:
 
 
 def _doc_refine_context(args) -> dict:
-    return {
-        "target_time": "",
-        "region": str(getattr(args, "region", "")),
-        "description": str(getattr(args, "description", "")),
-    }
+    return build_refine_context(args, target_time="")
 
 
 def _refine_one_news_doc(
@@ -344,8 +657,22 @@ def _refine_one_news_doc(
         )
         if isinstance(cache_store, dict) and cache_key and refined:
             cache_store[cache_key] = refined
+            pending_store = getattr(args, "_refine_cache_pending", None)
+            if isinstance(pending_store, dict):
+                pending_store[cache_key] = refined
+                setattr(args, "_refine_cache_pending", pending_store)
             setattr(args, "_refine_cache_store", cache_store)
             setattr(args, "_refine_cache_dirty", True)
+            setattr(args, "_news_doc_cache_dirty", True)
+            _upsert_news_doc_cache_record(
+                args,
+                refine_cache_key=cache_key,
+                raw_news_text=clean,
+                refined_news=refined,
+                context=context,
+                model=model,
+                max_tokens=max_tokens,
+            )
     return refined
 
 
@@ -357,9 +684,39 @@ def _refine_news_from_doc_cache(
     args,
     api_adapter=None,
 ) -> str:
+    snippets = _refine_news_docs_from_doc_cache(
+        raw_news_texts=raw_news_texts,
+        tokenizer=tokenizer,
+        max_tokens=max_tokens,
+        args=args,
+        api_adapter=api_adapter,
+    )
+    return _merge_refined_news_docs(snippets, tokenizer=tokenizer, max_tokens=max_tokens)
+
+
+def _merge_refined_news_docs(
+    snippets: list[str],
+    *,
+    tokenizer,
+    max_tokens: int,
+) -> str:
+    if len(snippets) == 0:
+        return ""
+    merged = "\n".join([f"- {s}" for s in snippets])
+    return _truncate_with_tokenizer(merged, tokenizer, max_tokens=max_tokens)
+
+
+def _refine_news_docs_from_doc_cache(
+    *,
+    raw_news_texts: list[str],
+    tokenizer,
+    max_tokens: int,
+    args,
+    api_adapter=None,
+) -> list[str]:
     items = [str(x).strip() for x in raw_news_texts if str(x).strip()]
     if len(items) == 0:
-        return ""
+        return []
 
     snippets = []
     seen = set()
@@ -377,17 +734,18 @@ def _refine_news_from_doc_cache(
             continue
         seen.add(refined_item)
         snippets.append(refined_item)
-
-    if len(snippets) == 0:
-        return ""
-    merged = "\n".join([f"- {s}" for s in snippets])
-    return _truncate_with_tokenizer(merged, tokenizer, max_tokens=max_tokens)
+    return snippets
 
 
 def _init_refine_cache(args, live_logger=None):
     enabled = int(getattr(args, "news_refine_cache_enable", 1)) == 1
     setattr(args, "_refine_cache_enabled", bool(enabled))
     setattr(args, "_refine_cache_store", {})
+    setattr(args, "_refine_cache_pending", {})
+    setattr(args, "_news_doc_cache_store", {})
+    setattr(args, "_news_doc_cache_pending", {})
+    setattr(args, "_news_doc_cache_structured_index", {})
+    setattr(args, "_news_doc_cache_dirty", False)
     setattr(args, "_refine_cache_dirty", False)
     setattr(args, "_refine_cache_hits", 0)
     setattr(args, "_refine_cache_misses", 0)
@@ -398,35 +756,50 @@ def _init_refine_cache(args, live_logger=None):
 
     path = _refine_cache_path(args)
     setattr(args, "_refine_cache_path", path)
+    setattr(args, "_news_doc_cache_path", path)
+    read_paths = _parse_refine_cache_read_paths(getattr(args, "news_refine_cache_read_path", ""))
+    merged_read_paths = list(read_paths)
+    path_abs = os.path.abspath(path)
+    if path_abs not in {os.path.abspath(p) for p in merged_read_paths}:
+        merged_read_paths.append(path)
+    setattr(args, "_refine_cache_read_paths", merged_read_paths)
     dirpath = os.path.dirname(path)
     if dirpath:
         os.makedirs(dirpath, exist_ok=True)
     store = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            if isinstance(obj, dict):
-                store = {str(k): str(v) for k, v in obj.items() if isinstance(v, str)}
-            elif isinstance(obj, list):
-                parsed = {}
-                for rec in obj:
-                    if not isinstance(rec, dict):
-                        continue
-                    key = rec.get("cache_key", rec.get("key", rec.get("id", "")))
-                    value = rec.get("refined_news", rec.get("value", rec.get("text", "")))
-                    if isinstance(key, str) and isinstance(value, str):
-                        k = key.strip()
-                        if k:
-                            parsed[k] = value
-                store = parsed
-        except Exception:
-            store = {}
+    doc_store = _load_news_doc_cache_file(path)
+    _log_news_doc_cache_detection(
+        live_logger,
+        tag="NEWS_REFINE_CACHE",
+        path=path,
+        object_count=len(doc_store),
+    )
+    structured_index = {}
+    for primary_key, rec in doc_store.items():
+        if not isinstance(rec, dict):
+            continue
+        s_key = str(rec.get("structured_cache_key", "") or "").strip()
+        if s_key:
+            structured_index[s_key] = str(primary_key)
+    source_summaries = []
+    for src in merged_read_paths:
+        loaded = _load_refine_cache_file(src)
+        if loaded:
+            store.update(loaded)
+        source_summaries.append(f"{src}:{len(loaded)}")
     setattr(args, "_refine_cache_store", store)
+    setattr(args, "_news_doc_cache_store", doc_store)
+    setattr(args, "_news_doc_cache_structured_index", structured_index)
     if live_logger is not None:
-        live_logger.info(
-            f"[NEWS_REFINE_CACHE] enabled path={path} entries={len(store)}"
-        )
+        if read_paths:
+            live_logger.info(
+                f"[NEWS_REFINE_CACHE] enabled write_path={path} entries={len(store)} "
+                f"preload_sources={source_summaries}"
+            )
+        else:
+            live_logger.info(
+                f"[NEWS_REFINE_CACHE] enabled path={path} entries={len(store)}"
+            )
 
 
 def _save_refine_cache(args, live_logger=None, force: bool = False):
@@ -437,27 +810,428 @@ def _save_refine_cache(args, live_logger=None, force: bool = False):
         return
     path = str(getattr(args, "_refine_cache_path", "")).strip()
     store = getattr(args, "_refine_cache_store", None)
+    pending_store = getattr(args, "_refine_cache_pending", None)
     if not path or not isinstance(store, dict):
         return
+    if not isinstance(pending_store, dict):
+        pending_store = {}
     dirpath = os.path.dirname(path)
     if dirpath:
         os.makedirs(dirpath, exist_ok=True)
-    tmp = path + ".tmp"
-    payload = [
-        {"cache_key": str(k), "refined_news": str(v)}
-        for k, v in sorted(store.items(), key=lambda x: str(x[0]))
-        if isinstance(v, str)
-    ]
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    setattr(args, "_refine_cache_pending", {})
     setattr(args, "_refine_cache_dirty", False)
+    setattr(args, "_news_doc_cache_dirty", True)
+    _save_news_doc_cache(args, live_logger=live_logger, force=force)
     if live_logger is not None:
         hits = int(getattr(args, "_refine_cache_hits", 0))
         misses = int(getattr(args, "_refine_cache_misses", 0))
+        write_items = [
+            (str(k), str(v))
+            for k, v in sorted(pending_store.items(), key=lambda x: str(x[0]))
+            if isinstance(v, str)
+        ]
         live_logger.info(
-            f"[NEWS_REFINE_CACHE] saved entries={len(store)} hits={hits} misses={misses}"
+            f"[NEWS_REFINE_CACHE] saved entries={len(store)} appended={len(write_items)} "
+            f"path={path} hits={hits} misses={misses}"
         )
+
+
+def _structured_cache_path(args) -> str:
+    return resolve_structured_cache_path(args)
+
+
+def _structured_cache_enabled(args) -> bool:
+    if str(getattr(args, "news_structured_mode", "off")).lower().strip() != "api":
+        return False
+    return int(getattr(args, "news_structured_cache_enable", 1)) == 1
+
+
+def _init_structured_cache(args, live_logger=None):
+    enabled = _structured_cache_enabled(args)
+    setattr(args, "_structured_cache_enabled", bool(enabled))
+    setattr(args, "_structured_cache_store", {})
+    setattr(args, "_structured_cache_dirty", False)
+    setattr(args, "_structured_cache_hits", 0)
+    setattr(args, "_structured_cache_misses", 0)
+    if not enabled:
+        if live_logger is not None:
+            live_logger.info("[NEWS_STRUCTURED_CACHE] disabled.")
+        return
+
+    path = _structured_cache_path(args)
+    setattr(args, "_structured_cache_path", path)
+    setattr(args, "_news_doc_cache_path", path)
+    existing_doc_store = getattr(args, "_news_doc_cache_store", None)
+    loaded_doc_store = _load_news_doc_cache_file(path)
+    _log_news_doc_cache_detection(
+        live_logger,
+        tag="NEWS_STRUCTURED_CACHE",
+        path=path,
+        object_count=len(loaded_doc_store),
+    )
+    if loaded_doc_store or (not isinstance(existing_doc_store, dict)):
+        setattr(args, "_news_doc_cache_store", loaded_doc_store)
+    if not isinstance(getattr(args, "_news_doc_cache_pending", None), dict):
+        setattr(args, "_news_doc_cache_pending", {})
+    if not isinstance(getattr(args, "_news_doc_cache_structured_index", None), dict):
+        setattr(args, "_news_doc_cache_structured_index", {})
+    if not hasattr(args, "_news_doc_cache_dirty"):
+        setattr(args, "_news_doc_cache_dirty", False)
+    read_paths = _parse_refine_cache_read_paths(getattr(args, "news_structured_cache_read_path", ""))
+    merged_read_paths = list(read_paths)
+    path_abs = os.path.abspath(path)
+    if path_abs not in {os.path.abspath(p) for p in merged_read_paths}:
+        merged_read_paths.append(path)
+    setattr(args, "_structured_cache_read_paths", merged_read_paths)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    store = {}
+    source_summaries = []
+    for src in merged_read_paths:
+        loaded = _load_structured_cache_file(src)
+        if loaded:
+            store.update(loaded)
+        source_summaries.append(f"{src}:{len(loaded)}")
+    setattr(args, "_structured_cache_store", store)
+    structured_index = getattr(args, "_news_doc_cache_structured_index", None)
+    if isinstance(structured_index, dict):
+        structured_index.clear()
+        for primary_key, rec in getattr(args, "_news_doc_cache_store", {}).items():
+            if not isinstance(rec, dict):
+                continue
+            s_key = str(rec.get("structured_cache_key", "") or "").strip()
+            if s_key:
+                structured_index[s_key] = str(primary_key)
+        setattr(args, "_news_doc_cache_structured_index", structured_index)
+    if live_logger is not None:
+        if read_paths:
+            live_logger.info(
+                f"[NEWS_STRUCTURED_CACHE] enabled write_path={path} entries={len(store)} "
+                f"preload_sources={source_summaries}"
+            )
+        else:
+            live_logger.info(
+                f"[NEWS_STRUCTURED_CACHE] enabled path={path} entries={len(store)}"
+            )
+        if len(store) == 0:
+            live_logger.info(
+                "[NEWS_STRUCTURED_CACHE] cache is currently empty; "
+                "this is expected before structured prewarm or first structured extraction."
+            )
+
+
+def _save_structured_cache(args, live_logger=None, force: bool = False):
+    if not bool(getattr(args, "_structured_cache_enabled", False)):
+        return
+    dirty = bool(getattr(args, "_structured_cache_dirty", False))
+    if (not force) and (not dirty):
+        return
+    path = str(getattr(args, "_structured_cache_path", "")).strip()
+    store = getattr(args, "_structured_cache_store", None)
+    if not path or not isinstance(store, dict):
+        return
+    setattr(args, "_structured_cache_dirty", False)
+    setattr(args, "_news_doc_cache_dirty", True)
+    _save_news_doc_cache(args, live_logger=live_logger, force=force)
+    if live_logger is not None:
+        hits = int(getattr(args, "_structured_cache_hits", 0))
+        misses = int(getattr(args, "_structured_cache_misses", 0))
+        live_logger.info(
+            f"[NEWS_STRUCTURED_CACHE] saved entries={len(store)} path={path} hits={hits} misses={misses}"
+        )
+
+
+def _structured_doc_source_kind(args) -> str:
+    mode = str(getattr(args, "news_structured_mode", "off") or "off").lower().strip()
+    return "raw" if mode == "api" else "refined"
+
+
+def _extract_structured_event_one_doc(
+    *,
+    news_text: str,
+    args,
+    api_adapter=None,
+    context: dict | None = None,
+    source_kind: str = "refined",
+    raw_news_text: str | None = None,
+    refine_max_tokens: int | None = None,
+) -> dict:
+    clean = str(news_text or "").strip()
+    if not clean:
+        return {}
+
+    mode = str(getattr(args, "news_structured_mode", "off") or "off").lower().strip()
+    use_api = mode == "api" and api_adapter is not None and hasattr(api_adapter, "extract_events")
+    model = _resolve_refine_model_name(args, api_adapter)
+    ctx = dict(context or _doc_refine_context(args))
+
+    cache_store = getattr(args, "_structured_cache_store", None)
+    cache_enabled = bool(getattr(args, "_structured_cache_enabled", False)) and use_api
+    cache_key = ""
+    if cache_enabled and isinstance(cache_store, dict):
+        cache_key = make_structured_doc_cache_key(
+            news_text=clean,
+            context=ctx,
+            mode=mode,
+            model=model,
+            source_kind=source_kind,
+        )
+        cached = cache_store.get(cache_key, None)
+        if isinstance(cached, dict) and len(cached) > 0:
+            setattr(
+                args,
+                "_structured_cache_hits",
+                int(getattr(args, "_structured_cache_hits", 0)) + 1,
+            )
+            return dict(cached)
+
+    events = extract_structured_events(
+        raw_or_refined_news=clean,
+        mode=mode,
+        api_adapter=api_adapter,
+        context=ctx,
+    )
+    events = dict(events) if isinstance(events, dict) else {}
+
+    if cache_enabled:
+        setattr(
+            args,
+            "_structured_cache_misses",
+            int(getattr(args, "_structured_cache_misses", 0)) + 1,
+        )
+        if isinstance(cache_store, dict) and cache_key and events:
+            cache_store[cache_key] = dict(events)
+            setattr(args, "_structured_cache_store", cache_store)
+            setattr(args, "_structured_cache_dirty", True)
+            setattr(args, "_news_doc_cache_dirty", True)
+            raw_clean = str(raw_news_text or clean).strip()
+            refine_cache_key = ""
+            if raw_clean and refine_max_tokens is not None:
+                refine_cache_key = make_refine_doc_cache_key(
+                    raw_news_text=raw_clean,
+                    context=ctx,
+                    mode=str(getattr(args, "news_refine_mode", "local") or "local").lower().strip(),
+                    model=_resolve_refine_model_name(args, api_adapter),
+                    max_tokens=int(max(1, refine_max_tokens)),
+                )
+            _upsert_news_doc_cache_record(
+                args,
+                refine_cache_key=refine_cache_key,
+                structured_cache_key=cache_key,
+                raw_news_text=raw_clean,
+                structured_events=events,
+                source_kind=source_kind,
+                context=ctx,
+                model=model,
+                max_tokens=refine_max_tokens,
+            )
+    return events
+
+
+def _extract_structured_events_from_refined_docs_detailed(
+    *,
+    raw_news_texts: list[str] | None = None,
+    refined_news_texts: list[str],
+    args,
+    api_adapter=None,
+    context: dict | None = None,
+) -> tuple[dict, list[dict]]:
+    source_kind = _structured_doc_source_kind(args)
+    raw_items_all = [str(x).strip() for x in (raw_news_texts or []) if str(x).strip()]
+    refine_max_tokens = int(args.token_budget * args.token_budget_news_frac)
+    if source_kind == "raw":
+        source_items = list(raw_items_all)
+        fallback_items = [str(x).strip() for x in refined_news_texts if str(x).strip()]
+    else:
+        source_items = [str(x).strip() for x in refined_news_texts if str(x).strip()]
+        fallback_items = []
+
+    items = source_items
+    if len(items) == 0:
+        items = fallback_items
+        source_kind = "refined"
+    if len(items) == 0:
+        return {}, []
+
+    seen = set()
+    merged_event_items = []
+    doc_records = []
+    local_cache = {}
+    for idx, item in enumerate(items):
+        dedup_reused = item in local_cache
+        if dedup_reused:
+            ev = dict(local_cache[item])
+        else:
+            raw_item = item if source_kind == "raw" else (raw_items_all[idx] if idx < len(raw_items_all) else item)
+            ev = _extract_structured_event_one_doc(
+                news_text=item,
+                args=args,
+                api_adapter=api_adapter,
+                context=context,
+                source_kind=source_kind,
+                raw_news_text=raw_item,
+                refine_max_tokens=refine_max_tokens,
+            )
+            ev = dict(ev) if isinstance(ev, dict) else {}
+            local_cache[item] = dict(ev)
+        if item not in seen:
+            seen.add(item)
+            if len(ev) > 0:
+                merged_event_items.append(dict(ev))
+        doc_records.append(
+            {
+                "doc_index": int(idx),
+                "source_kind": str(source_kind),
+                "news_text": str(item),
+                "events": dict(ev),
+                "has_events": bool(len(ev) > 0),
+                "dedup_reused": bool(dedup_reused),
+            }
+        )
+    return merge_structured_events(merged_event_items), doc_records
+
+
+def _extract_structured_events_from_refined_docs(
+    *,
+    raw_news_texts: list[str] | None = None,
+    refined_news_texts: list[str],
+    args,
+    api_adapter=None,
+    context: dict | None = None,
+) -> dict:
+    merged, _doc_records = _extract_structured_events_from_refined_docs_detailed(
+        raw_news_texts=raw_news_texts,
+        refined_news_texts=refined_news_texts,
+        args=args,
+        api_adapter=api_adapter,
+        context=context,
+    )
+    return merged
+
+
+STRUCTURED_EVENT_TYPE_ORDER = [
+    "outage",
+    "weather",
+    "policy",
+    "transmission",
+    "fuel",
+    "demand",
+    "other",
+]
+
+STRUCTURED_EVENT_TYPE_BUCKETS = {
+    "outage": {"outage", "trip", "plant_outage", "generator_outage"},
+    "weather": {"weather", "storm", "temperature", "rain", "heat", "cold"},
+    "policy": {"policy", "regulation", "government", "rule"},
+    "transmission": {"transmission", "interconnector", "network", "line"},
+    "fuel": {"fuel", "gas", "coal", "oil"},
+    "demand": {"demand", "load", "consumption"},
+}
+
+
+def _safe_structured_float(x, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return float(default)
+    if not math.isfinite(v):
+        return float(default)
+    return float(v)
+
+
+def _structured_event_type_bucket(event_type) -> str:
+    t = str(event_type or "").strip().lower()
+    if not t:
+        return "other"
+    for bucket, terms in STRUCTURED_EVENT_TYPE_BUCKETS.items():
+        if t == bucket or t in terms:
+            return bucket
+        for term in terms:
+            if term in t:
+                return bucket
+    if t in {"mixed", "general"}:
+        return "mixed"
+    return "other"
+
+
+def _structured_bucket_level(v, low: float, high: float, names: tuple[str, str, str]) -> str:
+    x = _safe_structured_float(v, default=0.0)
+    if x < low:
+        return names[0]
+    if x < high:
+        return names[1]
+    return names[2]
+
+
+def _normalize_structured_events(events: dict | None) -> dict:
+    if not isinstance(events, dict) or len(events) == 0:
+        return {}
+    direction_raw = events.get("direction", 0)
+    try:
+        direction_f = float(direction_raw)
+    except Exception:
+        direction_f = 0.0
+    if direction_f > 0.15:
+        direction = "up"
+    elif direction_f < -0.15:
+        direction = "down"
+    else:
+        direction = "uncertain"
+
+    strength_f = _safe_structured_float(events.get("strength", 0.0), default=0.0)
+    persistence_f = _safe_structured_float(events.get("persistence", 0.0), default=0.0)
+    confidence_f = _safe_structured_float(events.get("confidence", 0.0), default=0.0)
+
+    return {
+        "event_type": _structured_event_type_bucket(events.get("event_type", "other")),
+        "direction": direction,
+        "strength": _structured_bucket_level(strength_f, 0.33, 0.66, ("weak", "medium", "strong")),
+        "persistence": _structured_bucket_level(persistence_f, 0.33, 0.66, ("short", "medium", "long")),
+        "confidence": _structured_bucket_level(confidence_f, 0.33, 0.66, ("low", "medium", "high")),
+        "strength_value": float(max(0.0, min(1.0, strength_f))),
+        "persistence_value": float(max(0.0, min(1.0, persistence_f))),
+        "confidence_value": float(max(0.0, min(1.0, confidence_f))),
+    }
+
+
+def _structured_events_to_feature_vec(events: dict | None, dim: int = 12) -> np.ndarray:
+    d = int(max(1, dim))
+    vec = np.zeros((d,), dtype=np.float32)
+    if not isinstance(events, dict) or len(events) == 0:
+        return vec
+
+    norm = _normalize_structured_events(events)
+    if not norm:
+        return vec
+
+    relevance = float(max(0.0, min(1.0, float(events.get("relevance", 0.0) or 0.0))))
+    direction_label = str(norm.get("direction", "uncertain"))
+    if direction_label == "up":
+        direction_value = 1.0
+    elif direction_label == "down":
+        direction_value = -1.0
+    else:
+        direction_value = 0.0
+    strength = float(max(0.0, min(1.0, float(norm.get("strength_value", 0.0) or 0.0))))
+    persistence = float(max(0.0, min(1.0, float(norm.get("persistence_value", 0.0) or 0.0))))
+    confidence = float(max(0.0, min(1.0, float(norm.get("confidence_value", 0.0) or 0.0))))
+
+    base_feats = [relevance, direction_value, strength, persistence, confidence]
+    for idx, v in enumerate(base_feats[:d]):
+        vec[idx] = float(v)
+
+    event_type = str(norm.get("event_type", "other") or "other").strip().lower()
+    type_offset = len(base_feats)
+    if type_offset < d:
+        try:
+            type_idx = STRUCTURED_EVENT_TYPE_ORDER.index(event_type)
+        except ValueError:
+            type_idx = len(STRUCTURED_EVENT_TYPE_ORDER) - 1
+        one_hot_width = min(len(STRUCTURED_EVENT_TYPE_ORDER), d - type_offset)
+        if type_idx < one_hot_width:
+            vec[type_offset + type_idx] = 1.0
+    return vec
 
 
 def _bounded_sigmoid_gate(logits: torch.Tensor, args) -> torch.Tensor:
@@ -470,6 +1244,50 @@ def _bounded_sigmoid_gate(logits: torch.Tensor, args) -> torch.Tensor:
     floor = max(0.0, min(1.0, floor))
     gate = torch.sigmoid(logits / temperature)
     return floor + (1.0 - floor) * gate
+
+
+def _match_gate_shape(gate: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    g = gate.to(torch.float32)
+    if reference.ndim != 2:
+        return g
+    horizon = int(reference.size(1))
+    if g.ndim == 1:
+        return g.unsqueeze(1).expand(-1, horizon)
+    if g.ndim == 2:
+        if g.size(1) == horizon:
+            return g
+        if g.size(1) == 1:
+            return g.expand(-1, horizon)
+        if g.size(1) > horizon:
+            return g[:, :horizon]
+        pad = g[:, -1:].expand(-1, horizon - g.size(1))
+        return torch.cat([g, pad], dim=1)
+    return g.reshape(g.size(0), -1)
+
+
+def _build_horizon_gate_targets(
+    *,
+    pred_real_z: torch.Tensor,
+    pred_null_z: torch.Tensor,
+    targets_z: torch.Tensor,
+    args,
+) -> torch.Tensor:
+    err_real_h = torch.abs(pred_real_z.to(torch.float32) - targets_z.to(torch.float32))
+    err_null_h = torch.abs(pred_null_z.to(torch.float32) - targets_z.to(torch.float32))
+    margin = float(getattr(args, "cf_pseudo_margin", 0.01) or 0.0)
+    temp = max(1e-6, float(getattr(args, "cf_pseudo_temp", 0.2) or 0.2))
+    gain = err_null_h - err_real_h - margin
+    if int(getattr(args, "cf_pseudo_hard", 0)) == 1:
+        return (gain > 0).to(dtype=torch.float32)
+    return torch.sigmoid(gain / temp).to(dtype=torch.float32)
+
+
+def _all_gates_disabled(args) -> bool:
+    return int(getattr(args, "disable_all_gates", 0)) == 1
+
+
+def _final_gate_enabled(args) -> bool:
+    return (not _all_gates_disabled(args)) and int(getattr(args, "news_gate_enable", 1)) == 1
 
 
 def _epoch_ramp_scale(epoch_idx: int, warmup_epochs: int, curriculum_epochs: int) -> float:
@@ -616,134 +1434,15 @@ def _select_metric(loss_v: float, mse_v: float, mae_v: float, select_metric: str
     return float(mae_v)
 
 
-def _resolve_retrieval_mode(
-    args,
-    retrieval_enable_override: bool | None = None,
-    retrieval_mode_override: str | None = None,
-) -> str:
-    if retrieval_mode_override is not None:
-        mode = str(retrieval_mode_override).lower().strip()
-    else:
-        mode = str(getattr(args, "case_retrieval_mode", "price_event")).lower().strip()
-    if mode not in {"off", "price", "price_event", "random"}:
-        mode = "price_event"
-
-    if retrieval_enable_override is None:
-        enabled = int(getattr(args, "case_retrieval_enable", 0)) == 1
-    else:
-        enabled = bool(retrieval_enable_override)
-    top_k = int(max(0, getattr(args, "case_retrieval_topk", 0)))
-    if (not enabled) or top_k <= 0:
-        return "off"
-    return mode
-
-
-def _retrieval_feature_dim(args) -> int:
-    return int(max(8, getattr(args, "case_retrieval_feature_dim", 12)))
-
-
-def _blend_with_retrieval_knn_prior(
-    *,
-    delta_pred: torch.Tensor,
-    retrieval_feats: torch.Tensor | None,
-    retrieval_delta_prior: torch.Tensor | None,
-    args,
-    enabled: bool = True,
-) -> torch.Tensor:
-    if (not enabled) or int(getattr(args, "case_retrieval_knn_enable", 1)) != 1:
-        return delta_pred
-    if retrieval_delta_prior is None:
-        return delta_pred
-    if delta_pred.ndim != 2:
-        return delta_pred
-    alpha_base = float(getattr(args, "case_retrieval_knn_alpha", 0.35))
-    alpha_cap = float(getattr(args, "case_retrieval_knn_alpha_cap", 0.85))
-    if alpha_base <= 0.0:
-        return delta_pred
-
-    prior = retrieval_delta_prior.to(device=delta_pred.device, dtype=delta_pred.dtype)
-    if prior.ndim == 1:
-        prior = prior.unsqueeze(0)
-    if prior.size(0) != delta_pred.size(0):
-        if prior.size(0) == 1:
-            prior = prior.expand(delta_pred.size(0), -1)
-        else:
-            return delta_pred
-    if prior.size(1) != delta_pred.size(1):
-        h = int(delta_pred.size(1))
-        if prior.size(1) > h:
-            prior = prior[:, :h]
-        else:
-            pad = prior.new_zeros((prior.size(0), h - prior.size(1)))
-            prior = torch.cat([prior, pad], dim=1)
-
-    if retrieval_feats is not None and retrieval_feats.ndim == 2 and retrieval_feats.size(0) == delta_pred.size(0):
-        rf = retrieval_feats.to(device=delta_pred.device, dtype=delta_pred.dtype)
-        soft = rf[:, 0].clamp(0.0, 1.0) if rf.size(1) >= 1 else torch.ones((rf.size(0),), device=rf.device, dtype=rf.dtype)
-        conf = rf[:, 1].clamp(0.0, 1.0) if rf.size(1) >= 2 else torch.ones((rf.size(0),), device=rf.device, dtype=rf.dtype)
-        alpha = (soft * conf * float(alpha_base)).clamp(0.0, float(max(0.0, alpha_cap)))
-    else:
-        alpha = delta_pred.new_full((delta_pred.size(0),), float(alpha_base))
-        alpha = alpha.clamp(0.0, float(max(0.0, alpha_cap)))
-
-    return (1.0 - alpha.unsqueeze(1)) * delta_pred + alpha.unsqueeze(1) * prior
-
-
-def _summarize_retrieval_stats(
-    *,
-    sample_mae: list[float],
-    rel_labels: list[float],
-    retrieval_meta: list[dict],
-    strong_news_thresh: float,
-) -> dict:
-    if len(sample_mae) == 0:
-        return {
-            "coverage_rate": 0.0,
-            "mae_valid": float("nan"),
-            "mae_rejected": float("nan"),
-            "mae_gap_valid_minus_rejected": float("nan"),
-            "mae_strong_news_valid": float("nan"),
-            "mae_strong_news_rejected": float("nan"),
-            "n_samples": 0,
-        }
-    mae_arr = np.asarray(sample_mae, dtype=np.float32)
-    rel_arr = np.asarray(rel_labels, dtype=np.float32)
-    soft_weights = np.asarray(
-        [
-            float(
-                m.get(
-                    "retrieval_soft_weight",
-                    1.0 if bool(m.get("retrieval_valid", False)) else 0.0,
-                )
-            )
-            for m in retrieval_meta
-        ],
-        dtype=np.float32,
-    )
-    valid_mask = soft_weights > 0.05
-    strong_mask = rel_arr >= float(strong_news_thresh)
-
-    def _masked_mean(arr: np.ndarray, mask: np.ndarray) -> float:
-        if arr.size == 0 or mask.size != arr.size or not bool(mask.any()):
-            return float("nan")
-        return float(arr[mask].mean())
-
-    mae_valid = _masked_mean(mae_arr, valid_mask)
-    mae_rej = _masked_mean(mae_arr, ~valid_mask)
-    mae_strong_valid = _masked_mean(mae_arr, valid_mask & strong_mask)
-    mae_strong_rej = _masked_mean(mae_arr, (~valid_mask) & strong_mask)
-    gap = float(mae_valid - mae_rej) if np.isfinite(mae_valid) and np.isfinite(mae_rej) else float("nan")
-
-    return {
-        "coverage_rate": float(valid_mask.mean()),
-        "effective_coverage": float(np.clip(soft_weights, 0.0, 1.0).mean()),
-        "mae_valid": mae_valid,
-        "mae_rejected": mae_rej,
-        "mae_gap_valid_minus_rejected": gap,
-        "mae_strong_news_valid": mae_strong_valid,
-        "mae_strong_news_rejected": mae_strong_rej,
-        "n_samples": int(mae_arr.size),
-    }
+def _log_prompt_stats_if_available(live_logger, data_statistic, title: str, skip_msg: str) -> None:
+    if live_logger is None:
+        return
+    if int(max(0, getattr(data_statistic, "prompt_num", 0))) <= 0:
+        live_logger.info(skip_msg)
+        return
+    live_logger.info(title)
+    print_prompt_stats(live_logger, data_statistic)
+    live_logger.info("-----------------------------------------------------")
 
 
 def _mask_sensitive_arg(key: str, value):
@@ -792,19 +1491,25 @@ def _log_enabled_mechanisms(args, live_logger, stage: str):
         return
     stage_norm = str(stage or "").lower().strip()
     delta_active = stage_norm in {"delta", "all"}
+    if _all_gates_disabled(args):
+        live_logger.info(
+            "[MECH][GATE] disabled: internal delta gate, final fusion gate, and text gate are all bypassed."
+        )
+    elif int(getattr(args, "news_gate_enable", 1)) != 1:
+        live_logger.info(
+            "[MECH][FINAL_GATE] disabled: final fusion gate is bypassed; internal delta gate/text gate remain active."
+        )
+    elif delta_active:
+        live_logger.info(
+            "[MECH][FINAL_GATE] enabled: final fusion gate is horizon-aware and trained against "
+            "news-vs-null pseudo targets."
+        )
 
-    retrieval_mode = _resolve_retrieval_mode(args)
-    if retrieval_mode != "off":
-        if delta_active:
-            live_logger.info(
-                "[MECH][CASE_RETRIEVAL] enabled: retrieve similar historical cases and build "
-                "auxiliary retrieval features for DELTA correction/gating/relevance."
-            )
-        else:
-            live_logger.info(
-                "[MECH][CASE_RETRIEVAL] enabled in args, but current stage is BASE-only; "
-                "it will not be executed in this run."
-            )
+    if delta_active:
+        live_logger.info(
+            "[MECH][DELTA_PROMPT] skipped in DELTA model path: template prompt tokens are not "
+            "consumed by tiny_news_ts; news enters through structured and direct text/doc branches."
+        )
     if int(getattr(args, "delta_text_direct_enable", 0)) == 1:
         if delta_active:
             live_logger.info(
@@ -813,6 +1518,17 @@ def _log_enabled_mechanisms(args, live_logger, stage: str):
         else:
             live_logger.info(
                 "[MECH][TEXT_DIRECT] enabled in args, but current stage is BASE-only; "
+                "it will not be executed in this run."
+            )
+    if int(getattr(args, "delta_doc_direct_enable", 0)) == 1:
+        if delta_active:
+            live_logger.info(
+                "[MECH][DOC_DIRECT] enabled: article-level refined-news documents are encoded individually "
+                "and attention-pooled into an extra DELTA correction branch."
+            )
+        else:
+            live_logger.info(
+                "[MECH][DOC_DIRECT] enabled in args, but current stage is BASE-only; "
                 "it will not be executed in this run."
             )
 
@@ -834,9 +1550,10 @@ def _build_delta_optimizer(delta_model, args):
             or lname.startswith("delta_fuse")
             or lname.startswith("delta_text_ln")
             or lname.startswith("delta_log_scale")
+            or lname.startswith("delta_rel_head")
             or lname.startswith("text_")
+            or lname.startswith("doc_")
             or lname.startswith("rel_head")
-            or lname.startswith("retrieval_")
         ):
             head_params.append(p)
         else:
@@ -981,6 +1698,29 @@ def _pad_2d_int(seqs: list[list[int]], pad_id: int) -> tuple[torch.Tensor, torch
     return input_ids, attn
 
 
+def _pad_3d_int(seqs_3d: list[list[list[int]]], pad_id: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    B = len(seqs_3d)
+    max_docs = max((len(docs) for docs in seqs_3d), default=0)
+    max_len = 0
+    for docs in seqs_3d:
+        for seq in docs:
+            max_len = max(max_len, len(seq))
+    max_docs = max(1, max_docs)
+    max_len = max(1, max_len)
+    input_ids = torch.full((B, max_docs, max_len), pad_id, dtype=torch.long)
+    attn = torch.zeros((B, max_docs, max_len), dtype=torch.long)
+    doc_mask = torch.zeros((B, max_docs), dtype=torch.long)
+    for i, docs in enumerate(seqs_3d):
+        for j, seq in enumerate(docs[:max_docs]):
+            t = len(seq)
+            if t == 0:
+                continue
+            input_ids[i, j, :t] = torch.tensor(seq, dtype=torch.long)
+            attn[i, j, :t] = 1
+            doc_mask[i, j] = 1
+    return input_ids, attn, doc_mask
+
+
 def _pad_patches(
     patches_list: list[np.ndarray], mask_list: list[np.ndarray], patch_len: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1016,11 +1756,8 @@ def build_batch_inputs(
     force_no_news: bool = False,
     news_dropout: bool = False,
     prompt_path: str = None,
-    case_bank=None,
-    query_base_pred=None,
-    retrieval_enable_override: bool | None = None,
-    retrieval_mode_override: str | None = None,
     api_adapter=None,
+    build_prompt_inputs: bool = True,
 ):
     """
     Returns:
@@ -1038,6 +1775,7 @@ def build_batch_inputs(
 
     patch_len = int(getattr(args, "patch_len", 4))
     patch_stride = int(getattr(args, "patch_stride", patch_len))
+    need_prompt_context = bool(build_prompt_inputs or record_train_prompt)
 
     tpl_text = templates[tpl_id]["text"]
     B = len(batch["history_value"])
@@ -1050,6 +1788,10 @@ def build_batch_inputs(
     hist_strs = []
     news_str_list = []
     refined_news_list = []
+    refined_news_docs_list = []
+    structured_events_list = []
+    structured_doc_events_list = []
+    structured_feature_list = []
     rel_labels_list = []
 
     start_dates = []
@@ -1058,40 +1800,14 @@ def build_batch_inputs(
     pred_ends = []
 
     len_selected_news = []
-    retrieval_feature_list = []
-    retrieval_delta_prior_list = []
-    retrieval_meta_list = []
-
-    retrieval_feat_dim = _retrieval_feature_dim(args)
-    retrieval_mode = _resolve_retrieval_mode(
-        args,
-        retrieval_enable_override=retrieval_enable_override,
-        retrieval_mode_override=retrieval_mode_override,
-    )
-    if force_no_news:
-        retrieval_mode = "off"
-    top_k = int(max(1, getattr(args, "case_retrieval_topk", 5)))
-
-    if isinstance(query_base_pred, torch.Tensor):
-        query_base_pred_arr = query_base_pred.detach().to(torch.float32).cpu().numpy()
-    elif query_base_pred is None:
-        query_base_pred_arr = None
-    else:
-        query_base_pred_arr = np.asarray(query_base_pred, dtype=np.float32)
 
     for i in range(B):
         history = batch["history_value"][i].tolist()
         target = batch["target_value"][i].tolist()
         t_target = batch["target_time"][i]
-        series_id = str(batch.get("series_id", ["Not Specified"] * B)[i])
 
         history_z = _zscore(history, mu_global, sigma_global)
         target_z = _zscore(target, mu_global, sigma_global)
-        if query_base_pred_arr is not None and i < len(query_base_pred_arr):
-            base_pred_query = np.asarray(query_base_pred_arr[i], dtype=np.float32).reshape(-1)
-        else:
-            base_pred_query = np.zeros((H,), dtype=np.float32)
-
 
         p, pm = _make_patches(history_z, patch_len=patch_len, stride=patch_stride)
         news_text_col = args.news_text_col
@@ -1131,20 +1847,23 @@ def build_batch_inputs(
 
         news_str = ""
         refined_news = ""
+        refined_news_docs = []
         structured_events = {}
+        structured_doc_events = []
         if (not force_no_news) and len(selected) > 0:
             raw_news_texts = selected[news_text_col].fillna("").astype(str).tolist()
-            refine_context = {
-                "target_time": str(t_target),
-                "region": str(getattr(args, "region", "")),
-                "description": str(getattr(args, "description", "")),
-            }
-            refined_news = _refine_news_from_doc_cache(
+            refine_context = build_refine_context(args, target_time=t_target)
+            refined_news_docs = _refine_news_docs_from_doc_cache(
                 raw_news_texts=raw_news_texts,
                 tokenizer=tokenizer,
                 max_tokens=news_budget,
                 args=args,
                 api_adapter=api_adapter,
+            )
+            refined_news = _merge_refined_news_docs(
+                refined_news_docs,
+                tokenizer=tokenizer,
+                max_tokens=news_budget,
             )
 
             if not refined_news:
@@ -1158,97 +1877,57 @@ def build_batch_inputs(
                     api_adapter=api_adapter,
                     context=refine_context,
                 )
+            refined_news_docs = [str(x or "").strip() for x in refined_news_docs if str(x or "").strip()]
+            doc_cap = int(max(1, getattr(args, "delta_doc_max_docs", 4)))
+            if doc_cap > 0:
+                refined_news_docs = refined_news_docs[:doc_cap]
 
-            pieces = [refined_news] if refined_news else []
+            pieces = [refined_news] if need_prompt_context and refined_news else []
 
-            need_structured_for_prompt = int(getattr(args, "delta_include_structured_news", 0)) == 1
-            need_structured_for_retrieval = retrieval_mode != "off"
-            if need_structured_for_prompt or need_structured_for_retrieval:
-                structured_events = extract_structured_events(
-                    raw_or_refined_news=refined_news,
-                    mode=str(getattr(args, "news_structured_mode", "off")),
+            need_structured_for_prompt = need_prompt_context and int(getattr(args, "delta_include_structured_news", 0)) == 1
+            need_structured_for_delta = int(getattr(args, "delta_structured_enable", 0)) == 1
+            if need_structured_for_prompt or need_structured_for_delta:
+                structured_events, structured_doc_events = _extract_structured_events_from_refined_docs_detailed(
+                    raw_news_texts=raw_news_texts,
+                    refined_news_texts=refined_news_docs,
+                    args=args,
                     api_adapter=api_adapter,
                     context=refine_context,
                 )
+                if (not structured_events) and refined_news:
+                    structured_events = extract_structured_events(
+                        raw_or_refined_news=refined_news,
+                        mode=str(getattr(args, "news_structured_mode", "off")),
+                        api_adapter=api_adapter,
+                        context=refine_context,
+                    )
+                    if len(structured_events) > 0:
+                        structured_doc_events = [
+                            {
+                                "doc_index": 0,
+                                "source_kind": "merged_fallback",
+                                "news_text": str(refined_news),
+                                "events": dict(structured_events),
+                                "has_events": True,
+                                "dedup_reused": False,
+                            }
+                        ]
             if need_structured_for_prompt:
                 structured_text = format_structured_events_for_prompt(structured_events)
                 if structured_text:
                     pieces.append(structured_text)
 
-            news_str = "\n\n".join([p for p in pieces if str(p).strip()])
-            if news_dropout:
-                news_str = _maybe_news_dropout(news_str, args)
+            if need_prompt_context:
+                news_str = "\n\n".join([p for p in pieces if str(p).strip()])
+                if news_dropout:
+                    news_str = _maybe_news_dropout(news_str, args)
 
-        retrieval_feat = np.zeros((retrieval_feat_dim,), dtype=np.float32)
-        retrieval_delta_prior = np.zeros((H,), dtype=np.float32)
-        retrieval_meta = {
-            "retrieval_valid": False,
-            "retrieval_confidence": 0.0,
-            "retrieval_soft_weight": 0.0,
-            "retrieval_mode": "off",
-            "reject_reason": "disabled",
-            "direction_agreement": 0.0,
-            "event_mismatch_rate": 1.0,
-            "topk": 0,
-        }
-        if retrieval_mode != "off" and isinstance(case_bank, dict) and len(case_bank.get("cases", [])) > 0:
-            sample_id = f"{series_id}::{str(t_target)}"
-            query_case = build_case_record(
-                sample_id=sample_id,
-                split="query",
-                target_time=str(t_target),
-                history_z=history_z,
-                base_pred_z=base_pred_query,
-                target_z=None,
-                refined_news=refined_news,
-                structured_events=structured_events,
-                metadata={"series_id": series_id},
+        structured_feature_list.append(
+            _structured_events_to_feature_vec(
+                structured_events,
+                dim=int(max(1, getattr(args, "delta_structured_feature_dim", 12))),
             )
-            # with open("query_case_dump.json", "a", encoding="utf-8") as _f:
-            #     _f.write(json.dumps(query_case, ensure_ascii=False) + "\n")
-            retrieval_out = retrieve_similar_cases(
-                query_case=query_case,
-                case_bank=case_bank,
-                top_n=top_k,
-                mode=retrieval_mode,
-                alpha_price=float(getattr(args, "case_retrieval_alpha_price", 0.85)),
-                alpha_event=float(getattr(args, "case_retrieval_alpha_event", 0.15)),
-                alpha_text=float(getattr(args, "case_retrieval_alpha_text", 0.20)),
-                alpha_recency=float(getattr(args, "case_retrieval_alpha_recency", 0.10)),
-                alpha_regime=float(getattr(args, "case_retrieval_alpha_regime", 0.05)),
-                recency_tau_hours=float(getattr(args, "case_retrieval_recency_tau_hours", 168.0)),
-                min_top_score=float(getattr(args, "case_retrieval_min_top_score", 0.12)),
-                min_candidates=int(max(1, getattr(args, "case_retrieval_min_candidates", 2))),
-                min_direction_agreement=float(getattr(args, "case_retrieval_min_dir_agree", 0.45)),
-                max_event_mismatch=float(getattr(args, "case_retrieval_max_event_mismatch", 0.8)),
-                knn_temperature=float(getattr(args, "case_retrieval_knn_temperature", 0.20)),
-                knn_horizon=int(H),
-            )
-            retrieval_feat, retrieval_meta = build_retrieval_features(
-                query_case=query_case,
-                retrieval_output=retrieval_out,
-                feature_dim=retrieval_feat_dim,
-            )
-            prior_arr = np.asarray(
-                retrieval_meta.get("knn_delta_prior_z", []), dtype=np.float32
-            ).reshape(-1)
-            if prior_arr.size > H:
-                prior_arr = prior_arr[:H]
-            elif prior_arr.size < H:
-                pad = np.zeros((H - prior_arr.size,), dtype=np.float32)
-                prior_arr = np.concatenate([prior_arr, pad], axis=0)
-            if _resolve_delta_residual_mode(args) == "relative":
-                prior_arr = _convert_knn_prior_z_to_relative_np(
-                    prior_z=prior_arr,
-                    base_pred_z=base_pred_query,
-                    args=args,
-                    mu_global=mu_global,
-                    sigma_global=sigma_global,
-                )
-            retrieval_delta_prior = prior_arr.astype(np.float32, copy=False)
-        retrieval_feature_list.append(np.asarray(retrieval_feat, dtype=np.float32))
-        retrieval_delta_prior_list.append(np.asarray(retrieval_delta_prior, dtype=np.float32))
-        retrieval_meta_list.append(dict(retrieval_meta))
+        )
 
 
         rel = float(avg_rate) if np.isfinite(avg_rate) else 0.0
@@ -1276,72 +1955,81 @@ def build_batch_inputs(
             }
         )
 
-        hist_strs.append(history_text(history_z, mu_global, sigma_global))
-        news_str_list.append(news_str)
+        if need_prompt_context:
+            hist_strs.append(history_text(history_z, mu_global, sigma_global))
+            news_str_list.append(news_str)
         refined_news_list.append(str(refined_news or ""))
+        refined_news_docs_list.append(list(refined_news_docs))
+        structured_events_list.append(dict(structured_events) if isinstance(structured_events, dict) else {})
+        structured_doc_events_list.append(list(structured_doc_events))
 
-        start_dates.append(start_date)
-        end_dates.append(end_date)
-        pred_starts.append(prediction_start)
-        pred_ends.append(prediction_end)
+        if need_prompt_context:
+            start_dates.append(start_date)
+            end_dates.append(end_date)
+            pred_starts.append(prediction_start)
+            pred_ends.append(prediction_end)
 
     # tokenize prompts
-    ids_list = []
+    ids_list = [[] for _ in range(B)]
     prompt_texts = []
 
-    for i in range(B):
-        prompt = build_prompt(
-            tpl_text,
-            L,
-            H,
-            args.unit,
-            args.description,
-            hist_strs[i],
-            news_str_list[i],
-            start_date=start_dates[i],
-            end_date=end_dates[i],
-            freq=args.freq_min,
-            value_col=args.value_col,
-            pred_end=pred_ends[i],
-            pred_start=pred_starts[i],
-            region=args.region,
-        )
-        prompt = prompt + "\n\n[Output]\n" + f"Predict the next {H} steps (internally as z-values).\n"
+    if need_prompt_context:
+        for i in range(B):
+            prompt = build_prompt(
+                tpl_text,
+                L,
+                H,
+                args.unit,
+                args.description,
+                hist_strs[i],
+                news_str_list[i],
+                start_date=start_dates[i],
+                end_date=end_dates[i],
+                freq=args.freq_min,
+                value_col=args.value_col,
+                pred_end=pred_ends[i],
+                pred_start=pred_starts[i],
+                region=args.region,
+            )
+            prompt = prompt + "\n\n[Output]\n" + f"Predict the next {H} steps (internally as z-values).\n"
 
-        dataStatistic.news_num_stats_update(len_selected_news[i], prompt=prompt)
+            dataStatistic.news_num_stats_update(len_selected_news[i], prompt=prompt)
 
-        enc = tokenizer(
-            prompt,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=int(args.max_seq_len),
-            return_attention_mask=False,
-        )
-        ids_list.append(enc["input_ids"])
-        prompt_texts.append(prompt)
+            if build_prompt_inputs:
+                enc = tokenizer(
+                    prompt,
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=int(args.max_seq_len),
+                    return_attention_mask=False,
+                )
+                ids_list[i] = enc["input_ids"]
+            prompt_texts.append(prompt)
 
-        if record_train_prompt and epoch == 0:
-            ckpt_dir = os.path.join("./checkpoints", args.taskName)
-            os.makedirs(ckpt_dir, exist_ok=True)
+            if record_train_prompt and epoch == 0:
+                ckpt_dir = os.path.join("./checkpoints", args.taskName)
+                os.makedirs(ckpt_dir, exist_ok=True)
 
-            rec = {
-                "batch_idx": i,
-                "epoch_num": epoch + 1,
-                "template_id": int(tpl_id),
-                "policy": str(policy_name),
-                "force_no_news": bool(force_no_news),
-                "prompt": prompt,
-                "mu_global": float(metas[i]["mu_global"]),
-                "sigma_global": float(metas[i]["sigma_global"]),
-                "mu": float(metas[i]["mu"]),
-                "sigma": float(metas[i]["sigma"]),
-            }
-            with open(prompt_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
+                rec = {
+                    "batch_idx": i,
+                    "epoch_num": epoch + 1,
+                    "template_id": int(tpl_id),
+                    "policy": str(policy_name),
+                    "force_no_news": bool(force_no_news),
+                    "prompt": prompt,
+                    "mu_global": float(metas[i]["mu_global"]),
+                    "sigma_global": float(metas[i]["sigma_global"]),
+                    "mu": float(metas[i]["mu"]),
+                    "sigma": float(metas[i]["sigma"]),
+                }
+                with open(prompt_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     input_ids, attn = _pad_2d_int(ids_list, pad_id=tokenizer.pad_token_id)
     refined_ids_list = []
+    refined_doc_ids_list = []
     refined_max_len = int(max(1, getattr(args, "delta_text_max_len", 160)))
+    refined_doc_max_len = int(max(1, getattr(args, "delta_doc_max_len", 96)))
+    refined_doc_max_docs = int(max(1, getattr(args, "delta_doc_max_docs", 4)))
     for refined_txt in refined_news_list:
         txt = str(refined_txt or "").strip()
         if not txt:
@@ -1355,14 +2043,33 @@ def build_batch_inputs(
             return_attention_mask=False,
         )
         refined_ids_list.append(enc["input_ids"])
+    for refined_docs in refined_news_docs_list:
+        doc_ids = []
+        docs_trim = list(refined_docs[:refined_doc_max_docs])
+        for doc_txt in docs_trim:
+            txt = str(doc_txt or "").strip()
+            if not txt:
+                continue
+            enc = tokenizer(
+                txt,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=refined_doc_max_len,
+                return_attention_mask=False,
+            )
+            doc_ids.append(enc["input_ids"])
+        refined_doc_ids_list.append(doc_ids)
     refined_news_ids, refined_news_attn = _pad_2d_int(refined_ids_list, pad_id=tokenizer.pad_token_id)
+    refined_news_doc_ids, refined_news_doc_attn, refined_news_doc_mask = _pad_3d_int(
+        refined_doc_ids_list,
+        pad_id=tokenizer.pad_token_id,
+    )
     ts_patches, ts_patch_mask = _pad_patches(patches_list, patchmask_list, patch_len=patch_len)
     targets_z = torch.stack([torch.tensor(t, dtype=torch.float32) for t in targets_z_list], dim=0)
     # print("max = ", len_selected_news)
     rel_labels = torch.tensor(rel_labels_list, dtype=torch.float32)
     news_counts = torch.tensor(len_selected_news, dtype=torch.float32)
-    retrieval_feats = torch.tensor(np.stack(retrieval_feature_list, axis=0), dtype=torch.float32)
-    retrieval_delta_prior = torch.tensor(np.stack(retrieval_delta_prior_list, axis=0), dtype=torch.float32)
+    structured_feats = torch.tensor(np.stack(structured_feature_list, axis=0), dtype=torch.float32)
     return (
         input_ids,
         attn,
@@ -1373,12 +2080,87 @@ def build_batch_inputs(
         prompt_texts,
         rel_labels,
         news_counts,
-        retrieval_feats,
-        retrieval_delta_prior,
-        retrieval_meta_list,
+        structured_events_list,
+        structured_doc_events_list,
+        structured_feats,
         refined_news_ids,
         refined_news_attn,
+        refined_news_doc_ids,
+        refined_news_doc_attn,
+        refined_news_doc_mask,
     )
+
+
+def build_delta_batch_inputs(
+    *,
+    batch,
+    tokenizer,
+    templates,
+    tpl_id,
+    args,
+    global_zstats,
+    news_df,
+    policy_name,
+    policy_kw,
+    volatility_bin,
+    testing: bool = False,
+    force_no_news: bool = False,
+    news_dropout: bool = False,
+    api_adapter=None,
+):
+    (
+        _input_ids,
+        _attn,
+        ts_patches,
+        ts_patch_mask,
+        targets_z,
+        _metas,
+        prompt_texts,
+        rel_labels,
+        news_counts,
+        structured_events_list,
+        structured_doc_events_list,
+        structured_feats,
+        refined_news_ids,
+        refined_news_attn,
+        refined_news_doc_ids,
+        refined_news_doc_attn,
+        refined_news_doc_mask,
+    ) = build_batch_inputs(
+        batch=batch,
+        tokenizer=tokenizer,
+        templates=templates,
+        tpl_id=tpl_id,
+        args=args,
+        global_zstats=global_zstats,
+        news_df=news_df,
+        policy_name=policy_name,
+        policy_kw=policy_kw,
+        volatility_bin=volatility_bin,
+        epoch=-1,
+        record_train_prompt=False,
+        testing=testing,
+        force_no_news=force_no_news,
+        news_dropout=news_dropout,
+        api_adapter=api_adapter,
+        build_prompt_inputs=False,
+    )
+    return {
+        "ts_patches": ts_patches,
+        "ts_patch_mask": ts_patch_mask,
+        "targets_z": targets_z,
+        "prompt_texts": prompt_texts,
+        "rel_labels": rel_labels,
+        "news_counts": news_counts,
+        "structured_events": structured_events_list,
+        "structured_doc_events": structured_doc_events_list,
+        "structured_feats": structured_feats,
+        "refined_news_ids": refined_news_ids,
+        "refined_news_attn": refined_news_attn,
+        "refined_news_doc_ids": refined_news_doc_ids,
+        "refined_news_doc_attn": refined_news_doc_attn,
+        "refined_news_doc_mask": refined_news_doc_mask,
+    }
 
 # ----------------------------
 # eval
@@ -1437,11 +2219,14 @@ def evaluate_metrics_single(
             prompt_texts,
             rel_labels,
             n_selected,
-            _retrieval_feats,
-            _retrieval_delta_prior,
-            _retrieval_meta,
+            _structured_events,
+            _structured_doc_events,
+            _structured_feats,
             _refined_news_ids,
             _refined_news_attn,
+            _refined_news_doc_ids,
+            _refined_news_doc_attn,
+            _refined_news_doc_mask,
         ) = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
@@ -1626,11 +2411,6 @@ def evaluate_metrics_residual(
     true_pred_csv_path: str | None = None,
     news_dropout: bool = False,
     filename: str = None,
-    case_bank=None,
-    retrieval_mode_override: str | None = None,
-    retrieval_enable_override: bool | None = None,
-    retrieval_gate_only_override: bool | None = None,
-    return_retrieval_stats: bool = False,
     api_adapter=None,
 ):
     """
@@ -1653,20 +2433,11 @@ def evaluate_metrics_residual(
     base_loss_sum = 0.0
     se_sum, ae_sum, n_elems = 0.0, 0.0, 0
     base_se_sum, base_ae_sum = 0.0, 0.0
-    sample_mae = []
-    sample_rel_labels = []
-    sample_retrieval_meta = []
 
     if testing:
         ckpt_dir = os.path.join("./checkpoints", args.taskName)
         os.makedirs(ckpt_dir, exist_ok=True)
         ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
-
-    retrieval_gate_only = (
-        bool(int(getattr(args, "case_retrieval_gate_only", 0)))
-        if retrieval_gate_only_override is None
-        else bool(retrieval_gate_only_override)
-    )
     eval_desc = "[EVAL][RESIDUAL][TEST]" if testing else "[EVAL][RESIDUAL][VAL]"
     eval_loader, use_pbar = _eval_iter(data_loader, args, desc=eval_desc)
     for _, batch in enumerate(eval_loader):
@@ -1676,22 +2447,7 @@ def evaluate_metrics_residual(
         base_pred_cpu = base_pred.detach().cpu()
 
         # build delta (with news)
-        (
-            ids_d,
-            attn_d,
-            ts_p,
-            ts_pm,
-            targets_z,
-            metas,
-            prompt_texts,
-            rel_labels_d,
-            news_counts,
-            retrieval_feats_d,
-            retrieval_delta_prior_d,
-            retrieval_meta_d,
-            refined_news_ids_d,
-            refined_news_attn_d,
-        ) = build_batch_inputs(
+        delta_inputs = build_delta_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
             templates=templates,
@@ -1702,64 +2458,64 @@ def evaluate_metrics_residual(
             policy_name=policy_name,
             policy_kw=policy_kw,
             volatility_bin=volatility_bin,
-            epoch=-1,
-            record_train_prompt=False,
             testing=testing,
             force_no_news=False,
             news_dropout=news_dropout,
-            case_bank=case_bank,
-            query_base_pred=base_pred_cpu,
-            retrieval_enable_override=retrieval_enable_override,
-            retrieval_mode_override=retrieval_mode_override,
             api_adapter=api_adapter,
         )
+        ts_p = delta_inputs["ts_patches"]
+        ts_pm = delta_inputs["ts_patch_mask"]
+        targets_z = delta_inputs["targets_z"]
+        rel_labels_d = delta_inputs["rel_labels"]
+        news_counts_d = delta_inputs["news_counts"]
+        structured_events_d = delta_inputs["structured_events"]
+        structured_doc_events_d = delta_inputs["structured_doc_events"]
+        structured_feats_d = delta_inputs["structured_feats"]
+        refined_news_ids_d = delta_inputs["refined_news_ids"]
+        refined_news_attn_d = delta_inputs["refined_news_attn"]
+        refined_news_doc_ids_d = delta_inputs["refined_news_doc_ids"]
+        refined_news_doc_attn_d = delta_inputs["refined_news_doc_attn"]
+        refined_news_doc_mask_d = delta_inputs["refined_news_doc_mask"]
 
-        ids_d = ids_d.to(device)
-        attn_d = attn_d.to(device)
         ts_p = ts_p.to(device)
         ts_pm = ts_pm.to(device)
         targets_z = targets_z.to(device)
-        retrieval_feats_d = retrieval_feats_d.to(device=device, dtype=torch.float32)
-        retrieval_delta_prior_d = retrieval_delta_prior_d.to(device=device, dtype=torch.float32)
+        structured_feats_d = structured_feats_d.to(device=device, dtype=torch.float32)
         refined_news_ids_d = refined_news_ids_d.to(device)
         refined_news_attn_d = refined_news_attn_d.to(device)
+        refined_news_doc_ids_d = refined_news_doc_ids_d.to(device)
+        refined_news_doc_attn_d = refined_news_doc_attn_d.to(device)
+        refined_news_doc_mask_d = refined_news_doc_mask_d.to(device)
 
         # delta pred: adapter on + with news
         out_delta = delta_model(
-            input_ids=ids_d,
-            attention_mask=attn_d,
             ts_patches=ts_p,
             ts_patch_mask=ts_pm,
             refined_news_input_ids=refined_news_ids_d,
             refined_news_attention_mask=refined_news_attn_d,
+            refined_news_doc_input_ids=refined_news_doc_ids_d,
+            refined_news_doc_attention_mask=refined_news_doc_attn_d,
+            refined_news_doc_mask=refined_news_doc_mask_d,
             targets=None,
             head_mode="delta",
             rel_targets=None,
             rel_lambda=0.0,
-            retrieval_feats=retrieval_feats_d,
-            retrieval_gate_only=retrieval_gate_only,
+            structured_feats=structured_feats_d,
         )
         delta_corr = out_delta["pred"].to(torch.float32)
-        delta_corr = _blend_with_retrieval_knn_prior(
-            delta_pred=delta_corr,
-            retrieval_feats=retrieval_feats_d,
-            retrieval_delta_prior=retrieval_delta_prior_d,
-            args=args,
-            enabled=True,
-        )
         rel_logits = out_delta["rel_logits"].to(torch.float32)
-        if int(getattr(args, "news_gate_enable", 1)) == 1:
+        if _final_gate_enabled(args):
             gate = _bounded_sigmoid_gate(rel_logits, args)
         else:
             gate = torch.ones_like(rel_logits)
 
         targets_cpu = batch["target_value"].detach().cpu().numpy()  # raw
 
-        bs = ids_d.size(0)
+        bs = ts_p.size(0)
         targets_z_f = targets_z.to(torch.float32)
         base_pred_f = base_pred.to(torch.float32)
         delta_corr_f = delta_corr.to(torch.float32)
-        gate_f = gate.to(torch.float32).unsqueeze(1)
+        gate_f = _match_gate_shape(gate.to(torch.float32), delta_corr_f)
         pred_z = _fuse_base_and_delta(
             base_pred_z=base_pred_f,
             delta_pred=delta_corr_f,
@@ -1788,9 +2544,6 @@ def evaluate_metrics_residual(
             pred = np.asarray(pred_denorm, dtype=np.float32)
             base_only = np.asarray(base_denorm, dtype=np.float32)
             true = np.asarray(true_vals, dtype=np.float32)
-            sample_mae.append(float(np.abs(pred - true).mean()))
-            sample_rel_labels.append(float(rel_labels_d[i].detach().cpu()))
-            sample_retrieval_meta.append(dict(retrieval_meta_d[i]))
 
             se_sum += float(((pred - true) ** 2).sum())
             ae_sum += float(np.abs(pred - true).sum())
@@ -1804,14 +2557,30 @@ def evaluate_metrics_residual(
                     writer.writerows(zip(pred_denorm, true_vals))
 
             if testing:
+                structured_merged = (
+                    dict(structured_events_d[i])
+                    if i < len(structured_events_d) and isinstance(structured_events_d[i], dict)
+                    else {}
+                )
+                structured_docs = (
+                    list(structured_doc_events_d[i])
+                    if i < len(structured_doc_events_d) and isinstance(structured_doc_events_d[i], list)
+                    else []
+                )
                 record = {
-                    "test_prompt": prompt_texts[i],
                     "pred_z": [float(x) for x in pred_z_cpu[i].tolist()],
                     "base_pred_z": [float(x) for x in base_pred_cpu[i].tolist()],
                     "pred": [float(x) for x in pred_denorm],
                     "base_pred": [float(x) for x in base_denorm],
                     "true": [float(x) for x in true_vals],
                     "gate_mean": float(gate_cpu[i].mean()),
+                    "news_count": int(float(news_counts_d[i])) if i < len(news_counts_d) else 0,
+                    "structured_events": structured_merged,
+                    "structured_events_per_doc": structured_docs,
+                    "structured_doc_count": int(len(structured_docs)),
+                    "structured_doc_nonempty": int(
+                        sum(1 for rec in structured_docs if isinstance(rec, dict) and bool(rec.get("has_events", False)))
+                    ),
                     "mu_global": mu_global,
                     "sigma_global": sigma_global,
                     "mu": mu_global,
@@ -1828,119 +2597,7 @@ def evaluate_metrics_residual(
     base_loss_avg = base_loss_sum / max(1, n_samples)
     base_mse_avg = base_se_sum / max(1, n_elems) if n_elems > 0 else float("inf")
     base_mae_avg = base_ae_sum / max(1, n_elems) if n_elems > 0 else float("inf")
-    if return_retrieval_stats:
-        retrieval_stats = _summarize_retrieval_stats(
-            sample_mae=sample_mae,
-            rel_labels=sample_rel_labels,
-            retrieval_meta=sample_retrieval_meta,
-            strong_news_thresh=float(getattr(args, "case_retrieval_strong_news_thresh", 0.6)),
-        )
-        return (
-            loss_avg,
-            mse_avg,
-            mae_avg,
-            base_loss_avg,
-            base_mse_avg,
-            base_mae_avg,
-            retrieval_stats,
-        )
     return loss_avg, mse_avg, mae_avg, base_loss_avg, base_mse_avg, base_mae_avg
-
-
-@torch.no_grad()
-def run_retrieval_ablations(
-    *,
-    base_model,
-    delta_model,
-    tokenizer,
-    data_loader,
-    split_name: str,
-    templates,
-    tpl_id,
-    args,
-    global_zstats,
-    news_df,
-    policy_name,
-    policy_kw,
-    device,
-    volatility_bin,
-    case_bank,
-    live_logger,
-    api_adapter=None,
-):
-    if case_bank is None or len(case_bank.get("cases", [])) == 0:
-        if live_logger is not None:
-            live_logger.info(f"[ABLATION][{split_name}] skip: no active case bank.")
-        return {}
-
-    plans = [
-        {"name": "no_retrieval", "enable": False, "mode": "off", "gate_only": False},
-        {"name": "price_only", "enable": True, "mode": "price", "gate_only": False},
-        {"name": "price_event", "enable": True, "mode": "price_event", "gate_only": False},
-        {"name": "random_retrieval", "enable": True, "mode": "random", "gate_only": False},
-        {"name": "gate_only", "enable": True, "mode": "price_event", "gate_only": True},
-    ]
-    results = {}
-    for p in plans:
-        (
-            loss_v,
-            mse_v,
-            mae_v,
-            _base_loss_v,
-            _base_mse_v,
-            _base_mae_v,
-            retrieval_stats,
-        ) = evaluate_metrics_residual(
-            base_model=base_model,
-            delta_model=delta_model,
-            tokenizer=tokenizer,
-            data_loader=data_loader,
-            templates=templates,
-            tpl_id=tpl_id,
-            args=args,
-            global_zstats=global_zstats,
-            news_df=news_df,
-            policy_name=policy_name,
-            policy_kw=policy_kw,
-            device=device,
-            volatility_bin=volatility_bin,
-            testing=False,
-            true_pred_csv_path=None,
-            news_dropout=False,
-            filename=None,
-            case_bank=case_bank,
-            retrieval_mode_override=p["mode"],
-            retrieval_enable_override=p["enable"],
-            retrieval_gate_only_override=p["gate_only"],
-            return_retrieval_stats=True,
-            api_adapter=api_adapter,
-        )
-        metric = _select_metric(loss_v, mse_v, mae_v, args.select_metric)
-        results[p["name"]] = {
-            "loss": float(loss_v),
-            "mse": float(mse_v),
-            "mae": float(mae_v),
-            "metric": float(metric),
-            "retrieval": retrieval_stats,
-        }
-
-    base_metric = float(results["no_retrieval"]["metric"])
-    if live_logger is not None:
-        live_logger.info(f"[ABLATION][{split_name}] metric={str(args.select_metric).lower()}")
-        for name in ["no_retrieval", "price_only", "price_event", "random_retrieval", "gate_only"]:
-            rec = results[name]
-            delta = rec["metric"] - base_metric
-            rs = rec["retrieval"]
-            live_logger.info(
-                f"[ABLATION][{split_name}] {name} "
-                f"metric={rec['metric']:.6f} delta_vs_no={delta:+.6f} "
-                f"coverage={float(rs.get('coverage_rate', 0.0)):.3f} "
-                f"mae_valid={float(rs.get('mae_valid', float('nan'))):.6f} "
-                f"mae_rejected={float(rs.get('mae_rejected', float('nan'))):.6f} "
-                f"strong_valid={float(rs.get('mae_strong_news_valid', float('nan'))):.6f} "
-                f"strong_rej={float(rs.get('mae_strong_news_rejected', float('nan'))):.6f}"
-            )
-    return results
 
 
 @torch.no_grad()
@@ -1955,11 +2612,19 @@ def _prewarm_refine_cache(
     live_logger,
     api_adapter=None,
 ):
-    if not bool(getattr(args, "_refine_cache_enabled", False)):
-        return
-    if int(getattr(args, "news_refine_prewarm", 1)) != 1:
+    refine_cache_enabled = bool(getattr(args, "_refine_cache_enabled", False))
+    refine_prewarm_enabled = int(getattr(args, "news_refine_prewarm", 1)) == 1
+    structured_mode = str(getattr(args, "news_structured_mode", "off")).lower().strip()
+    structured_cache_enabled = bool(getattr(args, "_structured_cache_enabled", False))
+    structured_prewarm_enabled = int(getattr(args, "news_structured_prewarm", 1)) == 1
+    run_refine = bool(refine_cache_enabled and refine_prewarm_enabled)
+    run_structured = bool(structured_mode != "off" and structured_cache_enabled and structured_prewarm_enabled)
+    if (not run_refine) and (not run_structured):
         if live_logger is not None:
-            live_logger.info("[NEWS_REFINE_CACHE] prewarm disabled.")
+            live_logger.info(
+                "[NEWS_PREPROCESS_CACHE] prewarm skipped: "
+                f"refine_enabled={int(run_refine)} structured_enabled={int(run_structured)}"
+            )
         return
     if news_df is None or len(news_df) == 0:
         return
@@ -1967,22 +2632,42 @@ def _prewarm_refine_cache(
     text_col = str(getattr(args, "news_text_col", "content"))
     if text_col not in news_df.columns:
         if live_logger is not None:
-            live_logger.info(f"[NEWS_REFINE_CACHE] prewarm skipped: text_col not found: {text_col}")
+            live_logger.info(f"[NEWS_PREPROCESS_CACHE] prewarm skipped: text_col not found: {text_col}")
         return
 
     max_items = int(getattr(args, "news_refine_prewarm_max_batches", -1))
     before_n = len(getattr(args, "_refine_cache_store", {}))
     hit0 = int(getattr(args, "_refine_cache_hits", 0))
     miss0 = int(getattr(args, "_refine_cache_misses", 0))
+    structured_before_n = len(getattr(args, "_structured_cache_store", {}))
+    structured_hit0 = int(getattr(args, "_structured_cache_hits", 0))
+    structured_miss0 = int(getattr(args, "_structured_cache_misses", 0))
 
     time_col = str(getattr(args, "news_time_col", "date"))
     in_scope = news_df
     if time_col in news_df.columns:
+        news_ts = pd.to_datetime(
+            news_df[time_col], errors="coerce", dayfirst=args.dayFirst
+        )
+        news_tz = getattr(news_ts.dt, "tz", None)
+
+        def _align_series_to_news_tz(series_like):
+            ts = pd.to_datetime(series_like, errors="coerce", dayfirst=args.dayFirst)
+            cur_tz = getattr(ts.dt, "tz", None)
+            if news_tz is not None:
+                if cur_tz is None:
+                    ts = ts.dt.tz_localize(news_tz)
+                else:
+                    ts = ts.dt.tz_convert(news_tz)
+            elif cur_tz is not None:
+                ts = ts.dt.tz_localize(None)
+            return ts
+
         lo = None
         hi = None
         for df in [train_df, val_df, test_df]:
             if isinstance(df, pd.DataFrame) and (args.time_col in df.columns) and len(df) > 0:
-                ts = pd.to_datetime(df[args.time_col], errors="coerce", dayfirst=args.dayFirst)
+                ts = _align_series_to_news_tz(df[args.time_col])
                 ts = ts.dropna()
                 if len(ts) == 0:
                     continue
@@ -1993,7 +2678,7 @@ def _prewarm_refine_cache(
         if lo is not None and hi is not None:
             pad_days = float(max(0.0, float(getattr(args, "news_window_days", 1) or 1)))
             lo = lo - pd.Timedelta(days=pad_days + 1.0)
-            nts = pd.to_datetime(news_df[time_col], errors="coerce", dayfirst=args.dayFirst)
+            nts = news_ts
             mask = nts.ge(lo) & nts.le(hi)
             in_scope = news_df.loc[mask.fillna(False)].copy()
 
@@ -2012,17 +2697,33 @@ def _prewarm_refine_cache(
     if max_items > 0:
         uniq = uniq[:max_items]
 
-    show_progress = int(getattr(args, "news_refine_show_progress", 1)) == 1
+    show_progress = (
+        int(getattr(args, "news_refine_show_progress", 1)) == 1
+        or int(getattr(args, "news_structured_show_progress", 1)) == 1
+    )
     if live_logger is not None:
+        doc_cache_path = str(getattr(args, "_news_doc_cache_path", "") or "").strip()
+        doc_cache_objects = len(getattr(args, "_news_doc_cache_store", {}) or {})
         live_logger.info(
-            "[NEWS_REFINE_CACHE] prewarm start: "
+            "[NEWS_PREPROCESS_CACHE] start: "
+            f"news_file={str(getattr(args, 'news_path', '') or '').strip() or '<NONE>'}, "
             f"news_rows={len(news_df)}, in_scope_rows={len(in_scope)}, unique_docs={len(uniq)}, "
-            f"show_progress={int(show_progress)}"
+            f"refine_enabled={int(run_refine)} structured_enabled={int(run_structured)} "
+            f"refine_write_path={str(getattr(args, '_refine_cache_path', '')).strip() or '<DISABLED>'} "
+            f"structured_write_path={str(getattr(args, '_structured_cache_path', '')).strip() or '<DISABLED>'} "
+            f"doc_cache_detected={int(bool(doc_cache_path) and os.path.exists(doc_cache_path) and doc_cache_objects > 0)} "
+            f"doc_cache_file={doc_cache_path or '<DISABLED>'} "
+            f"doc_cache_objects={doc_cache_objects}"
+        )
+        live_logger.info(
+            "[NEWS_PREPROCESS_CACHE] sources: "
+            f"refine_reads={list(getattr(args, '_refine_cache_read_paths', []))} "
+            f"structured_reads={list(getattr(args, '_structured_cache_read_paths', []))}"
         )
 
     pbar = tqdm(
         uniq,
-        desc="[DELTA][REFINE_PREWARM_NEWS]",
+        desc="[DELTA][NEWS_API_PREPROCESS]",
         leave=show_progress,
         dynamic_ncols=True,
         mininterval=0.3,
@@ -2030,21 +2731,43 @@ def _prewarm_refine_cache(
     )
     news_budget = int(args.token_budget * args.token_budget_news_frac)
     total_docs = len(uniq)
+    structured_context = _doc_refine_context(args)
+    structured_source_kind = _structured_doc_source_kind(args)
     for idx, raw_text in enumerate(pbar, start=1):
-        _ = _refine_one_news_doc(
-            raw_news_text=raw_text,
-            tokenizer=tokenizer,
-            max_tokens=news_budget,
-            args=args,
-            api_adapter=api_adapter,
-        )
+        refined_doc = ""
+        if run_refine:
+            refined_doc = _refine_one_news_doc(
+                raw_news_text=raw_text,
+                tokenizer=tokenizer,
+                max_tokens=news_budget,
+                args=args,
+                api_adapter=api_adapter,
+            )
+        if run_structured:
+            structured_input = raw_text if structured_source_kind == "raw" else refined_doc
+            if (not structured_input) and refined_doc:
+                structured_input = refined_doc
+            if structured_input:
+                _ = _extract_structured_event_one_doc(
+                    news_text=structured_input,
+                    args=args,
+                    api_adapter=api_adapter,
+                    context=structured_context,
+                    source_kind=("raw" if structured_input == raw_text else "refined"),
+                    raw_news_text=raw_text,
+                    refine_max_tokens=news_budget,
+                )
         if show_progress and (idx == 1 or idx % 10 == 0 or idx == total_docs):
             hit_now = int(getattr(args, "_refine_cache_hits", 0))
             miss_now = int(getattr(args, "_refine_cache_misses", 0))
+            structured_hit_now = int(getattr(args, "_structured_cache_hits", 0))
+            structured_miss_now = int(getattr(args, "_structured_cache_misses", 0))
             pbar.set_postfix(
                 {
-                    "cache_hit": max(0, hit_now - hit0),
-                    "refined": max(0, miss_now - miss0),
+                    "ref_hit": max(0, hit_now - hit0),
+                    "ref_new": max(0, miss_now - miss0),
+                    "str_hit": max(0, structured_hit_now - structured_hit0),
+                    "str_new": max(0, structured_miss_now - structured_miss0),
                 },
                 refresh=False,
             )
@@ -2052,12 +2775,19 @@ def _prewarm_refine_cache(
     after_n = len(getattr(args, "_refine_cache_store", {}))
     hit1 = int(getattr(args, "_refine_cache_hits", 0))
     miss1 = int(getattr(args, "_refine_cache_misses", 0))
+    _save_structured_cache(args, live_logger=live_logger, force=True)
+    structured_after_n = len(getattr(args, "_structured_cache_store", {}))
+    structured_hit1 = int(getattr(args, "_structured_cache_hits", 0))
+    structured_miss1 = int(getattr(args, "_structured_cache_misses", 0))
     if live_logger is not None:
         live_logger.info(
-            "[NEWS_REFINE_CACHE] prewarm done: "
-            f"news_rows={len(news_df)}, in_scope_rows={len(in_scope)}, unique_docs={len(uniq)}, "
-            f"entries_before={before_n}, entries_after={after_n}, "
-            f"hits_delta={hit1 - hit0}, misses_delta={miss1 - miss0}"
+            "[NEWS_PREPROCESS_CACHE] done: "
+            f"unique_docs={len(uniq)} "
+            f"refine_entries_before={before_n} refine_entries_after={after_n} "
+            f"refine_hits_delta={hit1 - hit0} refine_misses_delta={miss1 - miss0} "
+            f"structured_entries_before={structured_before_n} structured_entries_after={structured_after_n} "
+            f"structured_hits_delta={structured_hit1 - structured_hit0} "
+            f"structured_misses_delta={structured_miss1 - structured_miss0}"
         )
 
 
@@ -2167,6 +2897,15 @@ def setup_env_and_data(args):
             news_df[col].fillna("").astype(str).str.strip().ne("")
         ].reset_index(drop=True)
         print(len(news_df))
+    setattr(
+        args,
+        "_news_doc_meta_by_text",
+        _build_news_doc_meta_index(
+            news_df,
+            text_col=str(getattr(args, "news_text_col", "content")),
+            time_col=str(getattr(args, "news_time_col", "date")),
+        ),
+    )
 
     templates = load_templates(args.template_pool)
 
@@ -2424,6 +3163,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     global_zstats_bundle = _coerce_global_zstats(bundle.get("global_zstats", None), args, required=True)
     news_api_adapter = bundle.get("news_api_adapter", None)
     _init_refine_cache(args, live_logger=live_logger)
+    _init_structured_cache(args, live_logger=live_logger)
     
 
     train_cfg = {}
@@ -2484,11 +3224,16 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         head_mlp=args.head_mlp,
         delta_gate_init_bias=float(getattr(args, "delta_gate_init_bias", 0.0)),
         delta_head_init_std=float(getattr(args, "delta_head_init_std", 0.01)),
-        delta_internal_gate=bool(int(getattr(args, "delta_internal_gate", 1))),
+        delta_internal_gate=bool(int(getattr(args, "delta_internal_gate", 1))) and (not _all_gates_disabled(args)),
+        disable_all_gates=_all_gates_disabled(args),
         delta_clip=float(getattr(args, "delta_clip", 3.0)),
         delta_news_tail_tokens=int(getattr(args, "delta_news_tail_tokens", 160)),
         delta_rel_floor=float(getattr(args, "delta_rel_floor", 0.05)),
-        retrieval_feat_dim=int(getattr(args, "case_retrieval_feature_dim", 12)),
+        delta_structured_feature_dim=(
+            int(getattr(args, "delta_structured_feature_dim", 12))
+            if int(getattr(args, "delta_structured_enable", 0)) == 1
+            else 0
+        ),
         delta_model_variant=str(getattr(args, "delta_model_variant", "tiny_news_ts")),
         tiny_news_model_preset=str(getattr(args, "tiny_news_model_preset", "custom")),
         tiny_news_model=str(getattr(args, "tiny_news_model", "")),
@@ -2501,6 +3246,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         delta_text_gate_init_bias=float(getattr(args, "delta_text_gate_init_bias", -2.0)),
         delta_text_clip=float(getattr(args, "delta_text_clip", 1.5)),
         delta_text_max_len=int(getattr(args, "delta_text_max_len", 160)),
+        delta_doc_direct_enable=bool(int(getattr(args, "delta_doc_direct_enable", 0))),
+        delta_doc_fuse_lambda=float(getattr(args, "delta_doc_fuse_lambda", 0.75)),
+        delta_doc_gate_init_bias=float(getattr(args, "delta_doc_gate_init_bias", -2.0)),
+        delta_doc_clip=float(getattr(args, "delta_doc_clip", 1.0)),
+        delta_doc_max_len=int(getattr(args, "delta_doc_max_len", 96)),
+        delta_doc_max_docs=int(getattr(args, "delta_doc_max_docs", 4)),
     )
     delta_model.to(device)
     live_logger.info(
@@ -2551,9 +3302,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         "text_delta_head",
         "text_gate",
         "rel_head",
-        "retrieval_proj",
-        "retrieval_gate_bias",
-        "retrieval_rel_bias",
     ]
     for name in train_modules:
         if hasattr(delta_model, name):
@@ -2604,42 +3352,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         api_adapter=news_api_adapter,
     )
 
-    active_case_bank = None
-    retrieval_mode_active = _resolve_retrieval_mode(args)
-    if retrieval_mode_active != "off":
-        case_loader = make_loader(
-            bundle["train_df"],
-            args.time_col,
-            args.value_col,
-            args.history_len,
-            args.horizon,
-            args.stride,
-            args.batch_size,
-            shuffle=False,
-            id_col=args.id_col,
-            dayFirst=args.dayFirst,
-        )
-        active_case_bank = build_case_bank(
-            train_loader=case_loader,
-            base_model=base_backbone,
-            args=args,
-            global_zstats=global_zstats,
-            news_df=news_df,
-            tokenizer=tokenizer,
-            policy_name=policy_name,
-            policy_kw=policy_kw,
-            live_logger=live_logger,
-            api_adapter=news_api_adapter,
-        )
-        if int(getattr(args, "case_retrieval_save_bank", 1)) == 1:
-            case_bank_path = os.path.join(
-                bundle["ckpt_dir"], f"case_bank_train_{args.taskName}.json"
-            )
-            save_case_bank(case_bank_path, active_case_bank)
-            live_logger.info(f"[CASE_BANK] saved to {case_bank_path}")
-    else:
-        live_logger.info("[CASE_BANK] retrieval disabled; skip active case bank build.")
-
     if math.isfinite(float(best_base_metric)):
         base_ref_metric = float(best_base_metric)
         live_logger.info(
@@ -2677,7 +3389,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     best_delta_alpha = 1.0
     early_stop_patience = max(0, int(getattr(args, "early_stop_patience", 0))) if delta_val_mode == "each_epoch" else 0
     best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
-    retrieval_gate_only = bool(int(getattr(args, "case_retrieval_gate_only", 0)))
     delta_warmup_epochs = int(max(0, getattr(args, "delta_warmup_epochs", 0)))
     delta_curriculum_epochs = int(max(1, getattr(args, "delta_curriculum_epochs", 1)))
     delta_null_warmup_steps = int(max(0, getattr(args, "delta_null_warmup_steps", 0)))
@@ -2720,6 +3431,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 "delta_text_gate_init_bias": float(getattr(args, "delta_text_gate_init_bias", -2.0)),
                 "delta_text_clip": float(getattr(args, "delta_text_clip", 1.5)),
                 "delta_text_max_len": int(getattr(args, "delta_text_max_len", 160)),
+                "delta_doc_direct_enable": int(getattr(args, "delta_doc_direct_enable", 0)),
+                "delta_doc_fuse_lambda": float(getattr(args, "delta_doc_fuse_lambda", 0.75)),
+                "delta_doc_gate_init_bias": float(getattr(args, "delta_doc_gate_init_bias", -2.0)),
+                "delta_doc_clip": float(getattr(args, "delta_doc_clip", 1.0)),
+                "delta_doc_max_len": int(getattr(args, "delta_doc_max_len", 96)),
+                "delta_doc_max_docs": int(getattr(args, "delta_doc_max_docs", 4)),
             },
         )
 
@@ -2755,25 +3472,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 history_z, _, _ = _z_batch_tensors(batch, args, global_zstats=global_zstats)
                 history_z = history_z.to(device)
                 base_pred = base_backbone(history_z).to(torch.float32)
-                base_pred_cpu = base_pred.detach().cpu()
 
             # build delta inputs (with news)
-            (
-                ids_d,
-                attn_d,
-                ts_p,
-                ts_pm,
-                targets_z,
-                metas,
-                prompt_texts_d,
-                _rel_labels_d,
-                news_counts_d,
-                retrieval_feats_d,
-                retrieval_delta_prior_d,
-                retrieval_meta_d,
-                refined_news_ids_d,
-                refined_news_attn_d,
-            ) = build_batch_inputs(
+            delta_inputs = build_delta_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
@@ -2784,33 +3485,24 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 policy_name=policy_name,
                 policy_kw=policy_kw,
                 volatility_bin=volatility_bin,
-                epoch=epoch,
-                record_train_prompt=True,
                 testing=False,
                 force_no_news=False,
                 news_dropout=True,
-                prompt_path=bundle["prompt_path"],
-                case_bank=active_case_bank,
-                query_base_pred=base_pred_cpu,
                 api_adapter=news_api_adapter,
             )
+            ts_p = delta_inputs["ts_patches"]
+            ts_pm = delta_inputs["ts_patch_mask"]
+            targets_z = delta_inputs["targets_z"]
+            prompt_texts_d = delta_inputs["prompt_texts"]
+            news_counts_d = delta_inputs["news_counts"]
+            structured_feats_d = delta_inputs["structured_feats"]
+            refined_news_ids_d = delta_inputs["refined_news_ids"]
+            refined_news_attn_d = delta_inputs["refined_news_attn"]
+            refined_news_doc_ids_d = delta_inputs["refined_news_doc_ids"]
+            refined_news_doc_attn_d = delta_inputs["refined_news_doc_attn"]
+            refined_news_doc_mask_d = delta_inputs["refined_news_doc_mask"]
             # build base text inputs (no news)
-            (
-                ids_b,
-                attn_b,
-                _ts_b,
-                _ts_pm_b,
-                _targets_b,
-                _metas_b,
-                _prompt_b,
-                _rel_b,
-                _news_counts_b,
-                retrieval_feats_b,
-                retrieval_delta_prior_b,
-                _retrieval_meta_b,
-                refined_news_ids_b,
-                refined_news_attn_b,
-            ) = build_batch_inputs(
+            delta_null_inputs = build_delta_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
                 templates=templates,
@@ -2821,34 +3513,34 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 policy_name=policy_name,
                 policy_kw=policy_kw,
                 volatility_bin=volatility_bin,
-                epoch=epoch,
-                record_train_prompt=False,
                 testing=False,
                 force_no_news=True,
                 news_dropout=False,
-                case_bank=active_case_bank,
-                query_base_pred=base_pred_cpu,
-                retrieval_enable_override=False,
                 api_adapter=news_api_adapter,
             )
-
-            ids_d = ids_d.to(device)
-            attn_d = attn_d.to(device)
-            ids_b = ids_b.to(device)
-            attn_b = attn_b.to(device)
+            structured_feats_b = delta_null_inputs["structured_feats"]
+            refined_news_ids_b = delta_null_inputs["refined_news_ids"]
+            refined_news_attn_b = delta_null_inputs["refined_news_attn"]
+            refined_news_doc_ids_b = delta_null_inputs["refined_news_doc_ids"]
+            refined_news_doc_attn_b = delta_null_inputs["refined_news_doc_attn"]
+            refined_news_doc_mask_b = delta_null_inputs["refined_news_doc_mask"]
 
             ts_p = ts_p.to(device)
             ts_pm = ts_pm.to(device)
             targets_z = targets_z.to(device)
             news_counts_d = news_counts_d.to(device=device, dtype=torch.float32)
-            retrieval_feats_d = retrieval_feats_d.to(device=device, dtype=torch.float32)
-            retrieval_delta_prior_d = retrieval_delta_prior_d.to(device=device, dtype=torch.float32)
-            retrieval_feats_b = retrieval_feats_b.to(device=device, dtype=torch.float32)
-            retrieval_delta_prior_b = retrieval_delta_prior_b.to(device=device, dtype=torch.float32)
+            structured_feats_d = structured_feats_d.to(device=device, dtype=torch.float32)
+            structured_feats_b = structured_feats_b.to(device=device, dtype=torch.float32)
             refined_news_ids_d = refined_news_ids_d.to(device)
             refined_news_attn_d = refined_news_attn_d.to(device)
             refined_news_ids_b = refined_news_ids_b.to(device)
             refined_news_attn_b = refined_news_attn_b.to(device)
+            refined_news_doc_ids_d = refined_news_doc_ids_d.to(device)
+            refined_news_doc_attn_d = refined_news_doc_attn_d.to(device)
+            refined_news_doc_mask_d = refined_news_doc_mask_d.to(device)
+            refined_news_doc_ids_b = refined_news_doc_ids_b.to(device)
+            refined_news_doc_attn_b = refined_news_doc_attn_b.to(device)
+            refined_news_doc_mask_b = refined_news_doc_mask_b.to(device)
             has_news = (news_counts_d > 0).to(dtype=torch.float32)
 
             delta_model.train()
@@ -2862,34 +3554,27 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             )
 
             out_delta = delta_model(
-                input_ids=ids_d,
-                attention_mask=attn_d,
                 ts_patches=ts_p,
                 ts_patch_mask=ts_pm,
                 refined_news_input_ids=refined_news_ids_d,
                 refined_news_attention_mask=refined_news_attn_d,
+                refined_news_doc_input_ids=refined_news_doc_ids_d,
+                refined_news_doc_attention_mask=refined_news_doc_attn_d,
+                refined_news_doc_mask=refined_news_doc_mask_d,
                 targets=None,
                 head_mode="delta",
                 rel_targets=None,
                 rel_lambda=0.0,
-                retrieval_feats=retrieval_feats_d,
-                retrieval_gate_only=retrieval_gate_only,
+                structured_feats=structured_feats_d,
             )
             delta_pred_real = out_delta["pred"].to(torch.float32)
-            delta_pred_real = _blend_with_retrieval_knn_prior(
-                delta_pred=delta_pred_real,
-                retrieval_feats=retrieval_feats_d,
-                retrieval_delta_prior=retrieval_delta_prior_d,
-                args=args,
-                enabled=True,
-            )
             rel_logits_real = out_delta["rel_logits"].to(torch.float32)
 
-            if int(getattr(args, "news_gate_enable", 1)) == 1:
+            if _final_gate_enabled(args):
                 gate_real = _bounded_sigmoid_gate(rel_logits_real, args)
             else:
                 gate_real = torch.ones_like(rel_logits_real)
-            gate_real_h = gate_real.unsqueeze(1)
+            gate_real_h = _match_gate_shape(gate_real, delta_pred_real)
 
             pred_real_z = _fuse_base_and_delta(
                 base_pred_z=base_pred,
@@ -2903,6 +3588,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
             residual_mode = str(getattr(args, "residual_loss", "mae")).lower()
             loss_final = _point_loss(pred_real_z, targets_z_typed, mode=residual_mode)
+            err_real = torch.abs(pred_real_z - targets_z_typed).mean(dim=1)
+            err_base = torch.abs(base_pred.to(torch.float32) - targets_z_typed).mean(dim=1)
 
             delta_aux_lambda = float(getattr(args, "delta_aux_lambda", 0.0))
             if delta_aux_lambda > 0.0:
@@ -2911,8 +3598,35 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             else:
                 loss_delta_aux = torch.zeros((), device=device, dtype=torch.float32)
 
+            delta_sign_lambda = float(getattr(args, "delta_sign_lambda", 0.0))
+            delta_sign_margin = float(getattr(args, "delta_sign_margin", 0.0))
+            delta_sign_eps = float(getattr(args, "delta_sign_eps", 0.0))
+            if delta_sign_lambda > 0.0:
+                target_sign = torch.sign(delta_targets).to(torch.float32)
+                sign_mask = (delta_targets.abs() > delta_sign_eps).to(torch.float32)
+                if float(sign_mask.sum().detach().cpu()) > 0.0:
+                    signed_projection = delta_pred_real.to(torch.float32) * target_sign
+                    sign_violation = torch.relu(delta_sign_margin - signed_projection)
+                    denom = sign_mask.sum().clamp_min(1.0)
+                    loss_delta_sign = (sign_violation * sign_mask).sum() / denom
+                else:
+                    loss_delta_sign = torch.zeros((), device=device, dtype=torch.float32)
+            else:
+                loss_delta_sign = torch.zeros((), device=device, dtype=torch.float32)
+
+            delta_non_degrade_lambda = float(getattr(args, "delta_non_degrade_lambda", 0.0))
+            delta_non_degrade_margin = float(getattr(args, "delta_non_degrade_margin", 0.0))
+            if delta_non_degrade_lambda > 0.0:
+                loss_non_degrade = torch.relu(err_real - err_base + delta_non_degrade_margin).mean()
+            else:
+                loss_non_degrade = torch.zeros((), device=device, dtype=torch.float32)
+
             gate_reg_lambda = float(getattr(args, "delta_gate_reg_lambda", getattr(args, "gate_lambda", 0.0)))
+            if _all_gates_disabled(args) or (not _final_gate_enabled(args)):
+                gate_reg_lambda = 0.0
             loss_gate_reg = gate_real.mean()
+            rel_supervise_lambda = float(getattr(args, "rel_supervise_lambda", 0.0))
+            gate_null_lambda = float(getattr(args, "gate_null_lambda", 0.0))
 
             delta_cf_lambda = float(getattr(args, "delta_cf_lambda", 0.0))
             delta_cf_margin = float(getattr(args, "delta_cf_margin", 0.0))
@@ -2923,40 +3637,47 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 ramp_steps=delta_null_ramp_steps,
             )
             gate_reg_lambda_eff = gate_reg_lambda * epoch_reg_scale
+            rel_supervise_lambda_eff = rel_supervise_lambda * epoch_reg_scale
+            gate_null_lambda_eff = gate_null_lambda * epoch_reg_scale
             delta_cf_lambda_eff = delta_cf_lambda * epoch_reg_scale
             delta_null_lambda_eff = delta_null_lambda * epoch_reg_scale * null_step_scale
+            if _all_gates_disabled(args) or (not _final_gate_enabled(args)):
+                rel_supervise_lambda_eff = 0.0
+                gate_null_lambda_eff = 0.0
+            if _all_gates_disabled(args):
+                delta_null_lambda_eff = 0.0
             loss_cf = torch.zeros((), device=device, dtype=torch.float32)
             loss_null = torch.zeros((), device=device, dtype=torch.float32)
+            loss_gate_sup = torch.zeros((), device=device, dtype=torch.float32)
+            loss_gate_null = torch.zeros((), device=device, dtype=torch.float32)
 
-            if delta_cf_lambda_eff > 0.0 or delta_null_lambda_eff > 0.0:
+            if (
+                delta_cf_lambda_eff > 0.0
+                or delta_null_lambda_eff > 0.0
+                or rel_supervise_lambda_eff > 0.0
+                or gate_null_lambda_eff > 0.0
+            ):
                 out_null = delta_model(
-                    input_ids=ids_b,
-                    attention_mask=attn_b,
                     ts_patches=ts_p,
                     ts_patch_mask=ts_pm,
                     refined_news_input_ids=refined_news_ids_b,
                     refined_news_attention_mask=refined_news_attn_b,
+                    refined_news_doc_input_ids=refined_news_doc_ids_b,
+                    refined_news_doc_attention_mask=refined_news_doc_attn_b,
+                    refined_news_doc_mask=refined_news_doc_mask_b,
                     targets=None,
                     head_mode="delta",
                     rel_targets=None,
                     rel_lambda=0.0,
-                    retrieval_feats=retrieval_feats_b,
-                    retrieval_gate_only=retrieval_gate_only,
+                    structured_feats=structured_feats_b,
                 )
                 delta_pred_null = out_null["pred"].to(torch.float32)
-                delta_pred_null = _blend_with_retrieval_knn_prior(
-                    delta_pred=delta_pred_null,
-                    retrieval_feats=retrieval_feats_b,
-                    retrieval_delta_prior=retrieval_delta_prior_b,
-                    args=args,
-                    enabled=True,
-                )
                 rel_logits_null = out_null["rel_logits"].to(torch.float32)
-                if int(getattr(args, "news_gate_enable", 1)) == 1:
+                if _final_gate_enabled(args):
                     gate_null = _bounded_sigmoid_gate(rel_logits_null, args)
                 else:
                     gate_null = torch.ones_like(rel_logits_null)
-                gate_null_h = gate_null.unsqueeze(1)
+                gate_null_h = _match_gate_shape(gate_null, delta_pred_null)
                 pred_null_z = _fuse_base_and_delta(
                     base_pred_z=base_pred,
                     delta_pred=delta_pred_null,
@@ -2966,15 +3687,40 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     sigma_global=float(global_zstats["sigma_global"]),
                 )
 
-                err_real = torch.abs(pred_real_z - targets_z_typed).mean(dim=1)
                 err_null = torch.abs(pred_null_z - targets_z_typed).mean(dim=1)
                 loss_cf = torch.relu(delta_cf_margin + err_real - err_null).mean()
                 loss_null = (gate_null_h * delta_pred_null).pow(2).mean()
+                if rel_supervise_lambda_eff > 0.0:
+                    gate_targets = _build_horizon_gate_targets(
+                        pred_real_z=pred_real_z.detach(),
+                        pred_null_z=pred_null_z.detach(),
+                        targets_z=targets_z_typed.detach(),
+                        args=args,
+                    )
+                    gate_mask = has_news.unsqueeze(1).expand_as(gate_targets)
+                    gate_bce = F.binary_cross_entropy_with_logits(
+                        rel_logits_real,
+                        gate_targets,
+                        reduction="none",
+                    )
+                    denom = gate_mask.sum().clamp_min(1.0)
+                    loss_gate_sup = (gate_bce * gate_mask).sum() / denom
+                if gate_null_lambda_eff > 0.0:
+                    null_targets = torch.zeros_like(rel_logits_null, dtype=torch.float32)
+                    loss_gate_null = F.binary_cross_entropy_with_logits(
+                        rel_logits_null,
+                        null_targets,
+                        reduction="mean",
+                    )
 
             loss_total = (
                 loss_final
                 + delta_aux_lambda * loss_delta_aux
+                + delta_sign_lambda * loss_delta_sign
+                + delta_non_degrade_lambda * loss_non_degrade
                 + gate_reg_lambda_eff * loss_gate_reg
+                + rel_supervise_lambda_eff * loss_gate_sup
+                + gate_null_lambda_eff * loss_gate_null
                 + delta_cf_lambda_eff * loss_cf
                 + delta_null_lambda_eff * loss_null
             )
@@ -3000,23 +3746,16 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             loss_window.append(float(loss.detach().cpu()))
             if global_step % 10 == 0:
                 avg_train_loss = sum(loss_window) / len(loss_window)
-                retr_cov = 0.0
-                retr_conf = 0.0
-                if len(retrieval_meta_d) > 0:
-                    retr_cov = float(
-                        np.mean([1.0 if bool(m.get("retrieval_valid", False)) else 0.0 for m in retrieval_meta_d])
-                    )
-                    retr_conf = float(
-                        np.mean([float(m.get("retrieval_confidence", 0.0)) for m in retrieval_meta_d])
-                    )
                 pbar.set_postfix(
                     train_loss=f"{avg_train_loss:.6f}",
                     gate=float(gate_real.mean().detach().cpu()),
                     final=float(loss_final.detach().cpu()),
                     aux=float(loss_delta_aux.detach().cpu()),
+                    sgn=float(loss_delta_sign.detach().cpu()),
+                    ndg=float(loss_non_degrade.detach().cpu()),
+                    gsup=float(loss_gate_sup.detach().cpu()),
+                    gnull=float(loss_gate_null.detach().cpu()),
                     cf=float(loss_cf.detach().cpu()),
-                    rcov=float(retr_cov),
-                    rconf=float(retr_conf),
                 )
                 if global_step % 100 == 0:
                     dh_grad = 0.0
@@ -3029,12 +3768,17 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     if dh_grad_terms:
                         dh_grad = float(np.sqrt(sum(dh_grad_terms)))
                     live_logger.info(
-                            f"[GRAD] step={global_step} delta_head_grad={dh_grad:.6f} "
-                            f"delta_scale={float(delta_model.delta_log_scale.exp().detach().cpu()):.4f} "
-                            f"reg={epoch_reg_scale:.3f} null={null_step_scale:.3f} "
-                            f"lam(g/c/n)=("
-                            f"{gate_reg_lambda_eff:.4f}/{delta_cf_lambda_eff:.4f}/{delta_null_lambda_eff:.4f})"
-                        )
+                        f"[GRAD] step={global_step} delta_head_grad={dh_grad:.6f} "
+                        f"delta_scale={float(delta_model.delta_log_scale.exp().detach().cpu()):.4f} "
+                        f"reg={epoch_reg_scale:.3f} null={null_step_scale:.3f} "
+                        f"sgn={float(loss_delta_sign.detach().cpu()):.6f} "
+                        f"ndg={float(loss_non_degrade.detach().cpu()):.6f} "
+                        f"lam(g/reg_sup/g0/c/n/nd/sgn)=("
+                        f"{gate_reg_lambda_eff:.4f}/{rel_supervise_lambda_eff:.4f}/"
+                        f"{gate_null_lambda_eff:.4f}/{delta_cf_lambda_eff:.4f}/"
+                        f"{delta_null_lambda_eff:.4f}/{delta_non_degrade_lambda:.4f}/"
+                        f"{delta_sign_lambda:.4f})"
+                    )
 
             if (global_step + 1) % args.grad_accum == 0:
                 grad_clip = float(getattr(args, "delta_grad_clip", 0.0))
@@ -3066,7 +3810,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 testing=False,
                 true_pred_csv_path=None,
                 news_dropout=False,
-                case_bank=active_case_bank,
                 api_adapter=news_api_adapter,
             )
             val_loss_per_epoch.append(val_loss)
@@ -3138,11 +3881,15 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             )
 
         _save_refine_cache(args, live_logger=live_logger, force=False)
+        _save_structured_cache(args, live_logger=live_logger, force=False)
 
         if epoch == 0:
-            live_logger.info("---------------------trainset and valset prompt statistics--------------------------------")
-            print_prompt_stats(live_logger, dataStatistic)
-            live_logger.info("-----------------------------------------------------")
+            _log_prompt_stats_if_available(
+                live_logger,
+                dataStatistic,
+                "---------------------trainset and valset prompt statistics--------------------------------",
+                "[DELTA][PROMPT_STATS] skipped: DELTA prompt path is disabled in this stage.",
+            )
 
     if not has_saved_delta:
         final_epoch = max(0, int(delta_epochs) - 1)
@@ -3164,7 +3911,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 testing=False,
                 true_pred_csv_path=None,
                 news_dropout=False,
-                case_bank=active_case_bank,
                 api_adapter=news_api_adapter,
             )
             metric_now = _select_metric(val_loss, val_mse, val_mae, args.select_metric)
@@ -3224,7 +3970,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 testing=False,
                 true_pred_csv_path=None,
                 news_dropout=False,
-                case_bank=active_case_bank,
                 api_adapter=news_api_adapter,
             )
             metric_now = _select_metric(val_loss, val_mse, val_mae, args.select_metric)
@@ -3249,6 +3994,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
     dataStatistic.clear()
     _save_refine_cache(args, live_logger=live_logger, force=True)
+    _save_structured_cache(args, live_logger=live_logger, force=True)
 
     # TEST (combined with best delta; base computed via adapter_off)
     if test_loader is not None:
@@ -3282,6 +4028,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             record_test_results_csv(args, live_logger, test_mse, test_mae)
             draw_pred_true(live_logger, args, true_pred_csv_path)
             _save_refine_cache(args, live_logger=live_logger, force=True)
+            _save_structured_cache(args, live_logger=live_logger, force=True)
             return {
                 "test_loader": test_loader,
                 "device": device,
@@ -3337,49 +4084,14 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
 
         tpl_for_test = tpl_id
         pol_for_test = policy_name
-        if int(getattr(args, "case_retrieval_run_ablations", 1)) == 1:
-            ablation_split = str(getattr(args, "case_retrieval_ablation_split", "val")).lower().strip()
-            if ablation_split in {"val", "both"}:
-                run_retrieval_ablations(
-                    base_model=base_backbone,
-                    delta_model=model_best,
-                    tokenizer=tokenizer,
-                    data_loader=val_loader,
-                    split_name="VAL",
-                    templates=templates,
-                    tpl_id=tpl_for_test,
-                    args=args,
-                    global_zstats=global_zstats_eval,
-                    news_df=news_df,
-                    policy_name=pol_for_test,
-                    policy_kw=policy_kw,
-                    device=device,
-                    volatility_bin=volatility_bin_val,
-                    case_bank=active_case_bank,
-                    live_logger=live_logger,
-                    api_adapter=news_api_adapter,
-                )
-            if ablation_split in {"test", "both"}:
-                run_retrieval_ablations(
-                    base_model=base_backbone,
-                    delta_model=model_best,
-                    tokenizer=tokenizer,
-                    data_loader=test_loader,
-                    split_name="TEST",
-                    templates=templates,
-                    tpl_id=tpl_for_test,
-                    args=args,
-                    global_zstats=global_zstats_eval,
-                    news_df=news_df,
-                    policy_name=pol_for_test,
-                    policy_kw=policy_kw,
-                    device=device,
-                    volatility_bin=volatility_bin_test,
-                    case_bank=active_case_bank,
-                    live_logger=live_logger,
-                    api_adapter=news_api_adapter,
-                )
-        test_loss, test_mse, test_mae, base_test_loss, base_test_mse, base_test_mae = evaluate_metrics_residual(
+        (
+            test_loss,
+            test_mse,
+            test_mae,
+            base_test_loss,
+            base_test_mse,
+            base_test_mae,
+        ) = evaluate_metrics_residual(
             base_model=base_backbone,
             delta_model=model_best,
             tokenizer=tokenizer,
@@ -3397,13 +4109,15 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             true_pred_csv_path=true_pred_csv_path,
             news_dropout=False,
             filename=bundle["test_filename"],
-            case_bank=active_case_bank,
             api_adapter=news_api_adapter,
         )
 
-        live_logger.info("---------------------testset prompt statistics--------------------------------")
-        print_prompt_stats(live_logger, dataStatistic)
-        live_logger.info("-----------------------------------------------------")
+        _log_prompt_stats_if_available(
+            live_logger,
+            dataStatistic,
+            "---------------------testset prompt statistics--------------------------------",
+            "[DELTA][PROMPT_STATS] skipped: DELTA test path did not build model-consumed prompts.",
+        )
 
         tqdm.write(
             f"[TEST][FINAL] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}"
@@ -3419,6 +4133,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         record_test_results_csv(args, live_logger, test_mse, test_mae)
         draw_pred_true(live_logger, args, true_pred_csv_path)
         _save_refine_cache(args, live_logger=live_logger, force=True)
+        _save_structured_cache(args, live_logger=live_logger, force=True)
 
     return {
         "test_loader":test_loader,
@@ -3471,9 +4186,12 @@ def testing_base(test_loader, args, device, live_logger, templates, volatility_b
             filename=getattr(args, "taskName", "base_only"),
         )
 
-        live_logger.info("---------------------testset prompt statistics--------------------------------")
-        print_prompt_stats(live_logger, dataStatistic)
-        live_logger.info("-----------------------------------------------------")
+        _log_prompt_stats_if_available(
+            live_logger,
+            dataStatistic,
+            "---------------------testset prompt statistics--------------------------------",
+            "[BASE][PROMPT_STATS] skipped: no prompts were recorded in this test stage.",
+        )
 
         tqdm.write(f"[TEST][FINAL] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}")
         live_logger.info(f"[TEST][FINAL] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}")

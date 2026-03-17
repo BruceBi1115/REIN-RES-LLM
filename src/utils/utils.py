@@ -69,15 +69,43 @@ def record_test_results_csv(args, live_logger, mse, mae):
         p = f"./results"
         os.makedirs(p, exist_ok=True)
         csv_path = os.path.join(p, f"test_results.csv")
-        task = f"{args.taskName}_{args.stage}_s{args.stride}_h{args.horizon}_news_{args.news_path}_sel{args.select_metric}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}_{args.delta_null_lambda}_{args.delta_cf_lambda}_{args.delta_cf_margin}_base_{args.base_epochs}_delta_{args.delta_epochs}_lr_{args.lr}_gradacc_{args.grad_accum}_sche_{args.scheduler}_lookback_{args.news_window_days}_topK_{args.news_topK}"
-        if not os.path.exists(csv_path):
-            with open(csv_path, "w", newline="") as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(["Task", "MSE", "MAE"])
-        with open(csv_path, "a", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow([task, mse, mae])
-        live_logger.info(f"Saved test results to {csv_path}")
+        task = (
+            f"{args.taskName}_{args.stage}_s{args.stride}_h{args.horizon}_news_{args.news_path}"
+            f"_sel{args.select_metric}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}"
+            f"_{args.delta_null_lambda}_{args.delta_cf_lambda}_{args.delta_cf_margin}"
+            f"_base_{args.base_epochs}_delta_{args.delta_epochs}_lr_{args.lr}"
+            f"_gradacc_{args.grad_accum}_sche_{args.scheduler}"
+            f"_lookback_{args.news_window_days}_topK_{args.news_topK}"
+            f"_frz_{int(getattr(args, 'delta_freeze_feature_modules', 0))}"
+            f"_ndl_{float(getattr(args, 'delta_non_degrade_lambda', 0.0))}"
+            f"_ndm_{float(getattr(args, 'delta_non_degrade_margin', 0.0))}"
+            f"_dgib_{float(getattr(args, 'delta_gate_init_bias', 0.0))}"
+        )
+        new_row = pd.DataFrame([{"Task": task, "MSE": float(mse), "MAE": float(mae)}])
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            rename_map = {}
+            for col in df.columns:
+                c = str(col).strip().lower()
+                if c == "task":
+                    rename_map[col] = "Task"
+                elif c == "mse":
+                    rename_map[col] = "MSE"
+                elif c == "mae":
+                    rename_map[col] = "MAE"
+            if rename_map:
+                df = df.rename(columns=rename_map)
+            if set(["Task", "MSE", "MAE"]).issubset(df.columns):
+                df = df[["Task", "MSE", "MAE"]]
+                # Keep only the latest row for each experiment signature.
+                df = df[df["Task"] != task]
+                out_df = pd.concat([df, new_row], ignore_index=True)
+            else:
+                out_df = new_row
+        else:
+            out_df = new_row
+        out_df.to_csv(csv_path, index=False)
+        live_logger.info(f"Saved test results to {csv_path} (upsert by Task)")
     except Exception as e:
         live_logger.error(f"Failed to save test results to CSV: {e}")
 

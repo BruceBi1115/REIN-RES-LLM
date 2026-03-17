@@ -6,6 +6,8 @@ import re
 import time
 from typing import Any
 
+import numpy as np
+
 
 def _truncate_with_tokenizer(text: str, tokenizer, max_tokens: int) -> str:
     if not text:
@@ -154,6 +156,7 @@ class OpenAINewsApiAdapter:
         base_url: str | None = None,
         timeout_sec: float = 30.0,
         max_retries: int = 2,
+        live_logger: Any = None,
     ):
         from openai import OpenAI
 
@@ -164,6 +167,24 @@ class OpenAINewsApiAdapter:
         self.model = str(model or "gpt-5.1").strip() or "gpt-5.1"
         self.timeout_sec = float(max(1.0, timeout_sec))
         self.max_retries = int(max(0, max_retries))
+        self.live_logger = live_logger
+        self._refine_example_logged = False
+
+    def _log_refine_example(self, system_prompt: str, user_prompt: str, raw_output: str, clean_news: list[str]):
+        if self.live_logger is None or self._refine_example_logged:
+            return
+        self.live_logger.info(
+            "[NEWS_API][REFINE_EXAMPLE] "
+            f"model={self.model} "
+            f"news_items={len(clean_news)}\n"
+            "[SYSTEM]\n"
+            f"{system_prompt}\n"
+            "[USER]\n"
+            f"{user_prompt}\n"
+            "[OUTPUT]\n"
+            f"{str(raw_output or '').strip() or '<EMPTY>'}"
+        )
+        self._refine_example_logged = True
 
     @staticmethod
     def _extract_text_from_responses(resp) -> str:
@@ -259,7 +280,6 @@ class OpenAINewsApiAdapter:
     def refine_news(self, clean_news: list[str], context: dict | None = None) -> str:
         context = context or {}
         region = str(context.get("region", "")).strip()
-        target_time = str(context.get("target_time", "")).strip()
         dataset_desc = str(
             context.get("description", "")
             or context.get("dataset_description", "")
@@ -281,12 +301,12 @@ class OpenAINewsApiAdapter:
         )
         user = (
             f"Region: {region}\n"
-            f"TargetTime: {target_time}\n"
             f"DatasetTopic: {topic}\n"
             "Task: compress the raw news into a short, fixed-template impact summary for this dataset topic.\n\n"
             f"News:\n{joined}"
         )
         raw = self._chat_text(system, user, max_tokens=300)
+        self._log_refine_example(system, user, raw, clean_news)
         obj = _parse_json_obj(raw)
         if obj:
             direction = _norm_direction_label(obj.get("direction", "neutral"))
@@ -304,6 +324,7 @@ class OpenAINewsApiAdapter:
 
         # Fallback to a short single-paragraph template even when model output is not strict JSON.
         fallback = _compact_text(raw, max_chars=360)
+        
         if not fallback:
             fallback = "Recent news contains limited high-confidence directional signals."
         return (
@@ -314,18 +335,24 @@ class OpenAINewsApiAdapter:
     def extract_events(self, text: str, context: dict | None = None) -> dict:
         context = context or {}
         region = str(context.get("region", "")).strip()
-        target_time = str(context.get("target_time", "")).strip()
+        dataset_desc = str(
+            context.get("description", "")
+            or context.get("dataset_description", "")
+            or ""
+        ).strip()
+        topic = dataset_desc or "the target time-series forecasting task"
         system = (
-            "You extract structured power-market event signals. "
+            "You extract structured event signals for exogenous impact forecasting. "
             "Return JSON only with keys: relevance,direction,strength,persistence,confidence,event_type."
         )
         user = (
             f"Region: {region}\n"
-            f"TargetTime: {target_time}\n"
+            f"DatasetTopic: {topic}\n"
             "Schema constraints:\n"
             "- relevance/strength/persistence/confidence in [0,1]\n"
             "- direction in {-1,0,1} (or up/down/uncertain)\n"
-            "- event_type short string\n\n"
+            "- event_type short domain-appropriate string\n\n"
+            "Task: extract structured event labels that describe how this text may affect the dataset topic.\n\n"
             f"Text:\n{text}\n\n"
             "Return JSON only."
         )
@@ -433,6 +460,7 @@ def build_news_api_adapter(args, live_logger=None):
             base_url=base_url,
             timeout_sec=timeout_sec,
             max_retries=max_retries,
+            live_logger=live_logger,
         )
     except Exception:
         if live_logger is not None:
@@ -496,6 +524,71 @@ def extract_structured_events(
         "strength": float(strength),
         "persistence": float(persistence),
         "confidence": float(confidence),
+        "event_type": event_type,
+    }
+
+
+def merge_structured_events(events_list: list[dict] | None) -> dict:
+    items = [x for x in (events_list or []) if isinstance(x, dict) and len(x) > 0]
+    if len(items) == 0:
+        return {}
+    if len(items) == 1:
+        return dict(items[0])
+
+    weights = []
+    relevance_vals = []
+    strength_vals = []
+    persistence_vals = []
+    confidence_vals = []
+    direction_num = 0.0
+    direction_den = 0.0
+    event_type_scores = {}
+
+    for ev in items:
+        relevance = _clamp01(ev.get("relevance", 0.0), default=0.0)
+        strength = _clamp01(ev.get("strength", 0.0), default=0.0)
+        persistence = _clamp01(ev.get("persistence", 0.5), default=0.5)
+        confidence = _clamp01(ev.get("confidence", 0.5), default=0.5)
+        direction_raw = ev.get("direction", 0)
+        try:
+            direction = float(direction_raw)
+        except Exception:
+            direction = 0.0
+        if direction > 0.15:
+            direction = 1.0
+        elif direction < -0.15:
+            direction = -1.0
+        else:
+            direction = 0.0
+
+        w = max(1e-6, relevance * (0.5 + 0.5 * confidence))
+        direction_w = w * max(0.25, strength)
+        weights.append(w)
+        relevance_vals.append(relevance)
+        strength_vals.append(strength)
+        persistence_vals.append(persistence)
+        confidence_vals.append(confidence)
+        direction_num += direction_w * direction
+        direction_den += direction_w
+
+        event_type = str(ev.get("event_type", "general")).strip().lower() or "general"
+        event_type_scores[event_type] = float(event_type_scores.get(event_type, 0.0)) + w
+
+    w_arr = np.asarray(weights, dtype=np.float32)
+    w_sum = float(w_arr.sum())
+    if w_sum <= 1e-8:
+        return {}
+
+    direction_score = float(direction_num / max(direction_den, 1e-6))
+    direction = 1 if direction_score > 0.15 else (-1 if direction_score < -0.15 else 0)
+    event_type = max(event_type_scores.items(), key=lambda kv: float(kv[1]))[0] if event_type_scores else "general"
+
+    return {
+        "relevance": float(max(relevance_vals) if relevance_vals else 0.0),
+        "direction": int(direction),
+        "strength": float(np.average(np.asarray(strength_vals, dtype=np.float32), weights=w_arr)),
+        "persistence": float(np.average(np.asarray(persistence_vals, dtype=np.float32), weights=w_arr)),
+        "confidence": float(np.average(np.asarray(confidence_vals, dtype=np.float32), weights=w_arr)),
         "event_type": event_type,
     }
 

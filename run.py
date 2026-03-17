@@ -16,8 +16,16 @@ if __name__ == '__main__':
     parser.add_argument('--delta_adv_margin', type=float, default=0.02, help='margin in z-space: err_null >= err_real + margin')
     parser.add_argument('--delta_non_degrade_lambda', type=float, default=1.0, help='weight for non-degradation guard vs base')
     parser.add_argument('--delta_non_degrade_margin', type=float, default=0.0, help='margin in z-space: err_real <= err_base - margin')
+    parser.add_argument('--delta_sign_lambda', type=float, default=0.0,
+                        help='weight for explicit delta sign-consistency loss against signed residual target')
+    parser.add_argument('--delta_sign_margin', type=float, default=0.0,
+                        help='hinge margin for signed delta supervision; positive requires a small same-sign output')
+    parser.add_argument('--delta_sign_eps', type=float, default=0.0,
+                        help='ignore sign supervision where |delta_target| <= eps')
 
     parser.add_argument('--news_gate_enable', type=int, default=1, choices=[0, 1], help='enable sample-wise news gate')
+    parser.add_argument('--disable_all_gates', type=int, default=0, choices=[0, 1],
+                        help='disable all gate effects at once: internal delta gate, final fusion gate, and text gate')
     parser.add_argument('--news_gate_temperature', type=float, default=1.0, help='temperature for sigmoid news gate')
     parser.add_argument('--news_gate_floor', type=float, default=0.0, help='lower bound for gate value to avoid over-shrink')
     parser.add_argument('--gate_lambda', type=float, default=0.2, help='weight for gate pseudo-label BCE loss')
@@ -55,6 +63,18 @@ if __name__ == '__main__':
                         help='tanh clip for text-direct correction branch (<=0 disables)')
     parser.add_argument('--delta_text_max_len', type=int, default=160,
                         help='max token length for refined-news text encoder inputs')
+    parser.add_argument('--delta_doc_direct_enable', type=int, default=0, choices=[0, 1],
+                        help='enable article-level refined-news branch with doc-aware aggregation')
+    parser.add_argument('--delta_doc_fuse_lambda', type=float, default=0.75,
+                        help='global fuse weight for article-level news correction branch')
+    parser.add_argument('--delta_doc_gate_init_bias', type=float, default=-2.0,
+                        help='init bias for article-level gate logits (negative keeps branch conservative initially)')
+    parser.add_argument('--delta_doc_clip', type=float, default=1.0,
+                        help='tanh clip for article-level correction branch (<=0 disables)')
+    parser.add_argument('--delta_doc_max_len', type=int, default=96,
+                        help='max token length for each refined-news document in article-level branch')
+    parser.add_argument('--delta_doc_max_docs', type=int, default=4,
+                        help='max number of refined-news documents kept per sample for article-level branch')
 
     parser.add_argument('--cf_pseudo_margin', type=float, default=0.01, help='counterfactual gain margin for pseudo labels')
     parser.add_argument('--cf_pseudo_temp', type=float, default=0.2, help='temperature for soft pseudo labels')
@@ -98,14 +118,30 @@ if __name__ == '__main__':
                         help='enable persistent cache for refined news text')
     parser.add_argument('--news_refine_cache_path', type=str, default='',
                         help='optional cache file path for refined news; default is a shared cache under checkpoints/_shared_refine_cache/')
+    parser.add_argument('--news_refine_cache_read_path', type=str, default='',
+                        help='optional existing refined-news cache path(s) to preload before this run; supports comma-separated paths')
+    parser.add_argument('--news_structured_cache_enable', type=int, default=1, choices=[0, 1],
+                        help='enable persistent cache for structured news labels')
+    parser.add_argument('--news_structured_cache_path', type=str, default='',
+                        help='optional cache file path for structured news labels; default is auto-generated from news filename')
+    parser.add_argument('--news_structured_cache_read_path', type=str, default='',
+                        help='optional existing structured-news cache path(s) to preload before this run; supports comma-separated paths')
     parser.add_argument('--news_refine_prewarm', type=int, default=1, choices=[0, 1],
                         help='prewarm refine cache with one train split pass before DELTA training')
     parser.add_argument('--news_refine_prewarm_max_batches', type=int, default=-1,
                         help='limit prewarm news documents; <=0 means all in-scope news documents')
     parser.add_argument('--news_refine_show_progress', type=int, default=1, choices=[0, 1],
                         help='show tqdm progress bar in terminal during refine cache prewarm')
+    parser.add_argument('--news_structured_prewarm', type=int, default=1, choices=[0, 1],
+                        help='prewarm structured cache alongside refine preprocessing before DELTA training')
+    parser.add_argument('--news_structured_show_progress', type=int, default=1, choices=[0, 1],
+                        help='show tqdm progress bar in terminal during structured cache prewarm')
     parser.add_argument('--news_structured_mode', type=str, default='off', choices=['off', 'heuristic', 'api'],
                         help='structured event extraction backend')
+    parser.add_argument('--delta_structured_enable', type=int, default=0, choices=[0, 1],
+                        help='allow DELTA to consume structured event features directly')
+    parser.add_argument('--delta_structured_feature_dim', type=int, default=12,
+                        help='feature dimension for structured event vector injected into DELTA')
     parser.add_argument('--news_api_model', type=str, default='gpt-5.1',
                         help='OpenAI model name used by API adapter when news_*_mode=api')
     parser.add_argument('--news_api_key_path', type=str, default='api_key.txt',
@@ -118,57 +154,6 @@ if __name__ == '__main__':
                         help='max retries for one API request')
     parser.add_argument('--delta_include_structured_news', type=int, default=0, choices=[0, 1],
                         help='append structured event fields to delta prompt news context')
-    parser.add_argument('--case_retrieval_enable', type=int, default=0, choices=[0, 1],
-                        help='enable case retrieval hook for delta input')
-    parser.add_argument('--case_retrieval_topk', type=int, default=0,
-                        help='top-k retrieval candidates for auxiliary retrieval features')
-    parser.add_argument('--case_retrieval_mode', type=str, default='price_event',
-                        choices=['off', 'price', 'price_event', 'random'],
-                        help='retrieval mode: no retrieval / price-only / price-first+event-rerank')
-    parser.add_argument('--case_retrieval_alpha_price', type=float, default=0.85,
-                        help='price similarity weight in retrieval rerank')
-    parser.add_argument('--case_retrieval_alpha_event', type=float, default=0.15,
-                        help='event similarity weight in retrieval rerank')
-    parser.add_argument('--case_retrieval_alpha_text', type=float, default=0.20,
-                        help='text-vector similarity weight in retrieval rerank')
-    parser.add_argument('--case_retrieval_alpha_recency', type=float, default=0.10,
-                        help='recency similarity weight in retrieval rerank')
-    parser.add_argument('--case_retrieval_alpha_regime', type=float, default=0.05,
-                        help='regime-match similarity weight in retrieval rerank')
-    parser.add_argument('--case_retrieval_recency_tau_hours', type=float, default=168.0,
-                        help='recency decay tau in hours for case retrieval rerank')
-    parser.add_argument('--case_retrieval_min_top_score', type=float, default=0.12,
-                        help='reject retrieval when top final score is below this threshold')
-    parser.add_argument('--case_retrieval_min_candidates', type=int, default=2,
-                        help='minimum reliable candidates required for retrieval validity')
-    parser.add_argument('--case_retrieval_min_dir_agree', type=float, default=0.45,
-                        help='reject retrieval when residual direction agreement is too low')
-    parser.add_argument('--case_retrieval_max_event_mismatch', type=float, default=0.80,
-                        help='reject retrieval when event mismatch rate is too high')
-    parser.add_argument('--case_retrieval_feature_dim', type=int, default=12,
-                        help='dimension of compact retrieval features passed to DELTA model')
-    parser.add_argument('--case_retrieval_gate_only', type=int, default=0, choices=[0, 1],
-                        help='use retrieval features only for gate/confidence branch')
-    parser.add_argument('--case_retrieval_bank_max', type=int, default=0,
-                        help='optional max number of train cases in case bank; <=0 means all')
-    parser.add_argument('--case_retrieval_save_bank', type=int, default=1, choices=[0, 1],
-                        help='save built train-only case bank under checkpoint directory')
-    parser.add_argument('--case_retrieval_run_ablations', type=int, default=1, choices=[0, 1],
-                        help='run retrieval ablations after DELTA training')
-    parser.add_argument('--case_retrieval_ablation_split', type=str, default='val', choices=['val', 'test', 'both'],
-                        help='which split to run retrieval ablations on')
-    parser.add_argument('--case_retrieval_strong_news_thresh', type=float, default=0.6,
-                        help='strong-news-impact threshold on rel pseudo-label for ablation reporting')
-    parser.add_argument('--case_retrieval_knn_enable', type=int, default=1, choices=[0, 1],
-                        help='enable top-k residual prior from retrieved cases')
-    parser.add_argument('--case_retrieval_knn_alpha', type=float, default=0.35,
-                        help='base blend ratio for retrieved residual prior')
-    parser.add_argument('--case_retrieval_knn_alpha_cap', type=float, default=0.85,
-                        help='max blend ratio for retrieved residual prior')
-    parser.add_argument('--case_retrieval_knn_temperature', type=float, default=0.20,
-                        help='softmax temperature for top-k residual prior weights')
-    parser.add_argument('--case_retrieval_debug_dump', type=int, default=0, choices=[0, 1],
-                        help='dump query/train case records to local jsonl for debugging')
     parser.add_argument('--hard_reflection_mode', type=str, default='off', choices=['off', 'api'],
                         help='optional hard-sample reflection backend (offline utility hook)')
     parser.add_argument('--hard_reflection_topk', type=int, default=8,
@@ -309,7 +294,7 @@ if __name__ == '__main__':
                         help='metric used for model selection and comparisons')
 
     # ===== Eval & Logging =====
-    parser.add_argument('--early_stop_patience', type=int, default=4, help='patience in eval rounds')
+    parser.add_argument('--early_stop_patience', type=int, default=5, help='patience in eval rounds')
     parser.add_argument(
         '--delta_val_mode',
         type=str,

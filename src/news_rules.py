@@ -26,13 +26,16 @@ def load_news(path: str, time_col: str, tz: str) -> pd.DataFrame:
     if time_col not in df.columns:
         raise KeyError(f"time_col '{time_col}' not found in JSON file.")
 
-    # Parse as UTC-aware then convert to target timezone
-    df[time_col] = pd.to_datetime(df[time_col], dayfirst=True, errors="coerce", utc=True)
-    # print(df)
+    # Parse using the input data's own time basis; only localize/convert if the caller
+    # explicitly provides a timezone.
+    df[time_col] = pd.to_datetime(df[time_col], dayfirst=True, errors="coerce")
     df = df.dropna(subset=[time_col])
 
     if tz:
-        df[time_col] = df[time_col].dt.tz_convert(tz)
+        if getattr(df[time_col].dt, "tz", None) is None:
+            df[time_col] = df[time_col].dt.tz_localize(tz)
+        else:
+            df[time_col] = df[time_col].dt.tz_convert(tz)
     
 
     # print(df.sort_values(time_col).reset_index(drop=True))
@@ -59,7 +62,7 @@ def _align_ts_to_series_tz(ts, ref_series: pd.Series) -> pd.Timestamp:
     else:
         # ref 是 tz-naive
         if ts.tzinfo:
-            ts = ts.tz_convert("UTC").tz_localize(None)  # 统一转成 naive
+            ts = ts.tz_localize(None)  # 保留输入数据的本地时间，不强制转 UTC
     return ts
 
 def get_num_news_between(news_df, time_col, target_time, window_days):
