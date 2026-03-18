@@ -50,6 +50,8 @@ class SlidingDataset(Dataset):
         tz: str = False,                   # 例如 "Australia/Sydney"；不传则不处理时区
         drop_na_time: bool = True,        # 解析失败的 NaT 是否丢弃
         return_time_iso: bool = True,     # __getitem__ 中是否将 target_time 转为 ISO 字符串
+        min_target_time = None,           # 仅保留 first target time >= 该阈值的样本
+        min_target_time_by_id = None,     # 多序列时可为每个 series_id 指定 target 下界
     ):
         """
         df 至少包含时间列与目标值列；可选序列ID列。
@@ -61,6 +63,13 @@ class SlidingDataset(Dataset):
         self.id_col = id_col if id_col else None
         self.L, self.H, self.stride = L, H, stride
         self.return_time_iso = return_time_iso
+        self.min_target_time = pd.to_datetime(min_target_time, errors="coerce")
+        self.min_target_time_by_id = {}
+        if isinstance(min_target_time_by_id, dict):
+            for gid, ts in min_target_time_by_id.items():
+                parsed = pd.to_datetime(ts, errors="coerce")
+                if not pd.isna(parsed):
+                    self.min_target_time_by_id[gid] = parsed
 
         # === 1) 统一解析时间列（单列，day-first） ===
         if parse_time:
@@ -102,9 +111,18 @@ class SlidingDataset(Dataset):
         self.index = []
         for gi, (_, g) in enumerate(self.groups):
             n = len(g)
+            gid = self.groups[gi][0]
+            group_min_target_time = self.min_target_time_by_id.get(gid, self.min_target_time)
             #print("n:", n, "L:", L, "H:", H, "stride:", stride)
             # 能切出的起点 s: 0..n-(L+H)
             for s in range(0, max(0, n - (L + H)) + 1, stride):
+                if group_min_target_time is not None and not pd.isna(group_min_target_time):
+                    target_idx = s + self.L
+                    if target_idx >= n:
+                        continue
+                    target_time = pd.to_datetime(g.iloc[target_idx][time_col], errors="coerce")
+                    if pd.isna(target_time) or target_time < group_min_target_time:
+                        continue
                 self.index.append((gi, s))
         #print("index:", self.index)
         # print("g:",g)

@@ -43,6 +43,13 @@ class TinyNewsTSRegressor(nn.Module):
         doc_fuse_lambda: float = 0.75,
         doc_gate_init_bias: float = -2.0,
         doc_clip: float = 1.0,
+        delta_alpha_scale: float = 0.75,
+        delta_patch_prototypes: int = 0,
+        delta_patch_proto_temp: float = 1.0,
+        delta_sign_tau: float = 1.0,
+        delta_sign_mode: str = "signnet_binary",
+        delta_mag_max: float = 0.0,
+        doc_candidate_mode: str = "beta_only",
     ):
         super().__init__()
         self.model_variant = "tiny_news_ts"
@@ -63,14 +70,29 @@ class TinyNewsTSRegressor(nn.Module):
         )
         self.patch_drop = nn.Dropout(float(patch_dropout))
         self.ts_ln = nn.LayerNorm(self.hidden_size)
+        self.delta_patch_prototypes = int(max(0, delta_patch_prototypes))
+        self.delta_patch_proto_temp = float(max(1e-6, delta_patch_proto_temp))
+        if self.delta_patch_prototypes > 0:
+            self.patch_proto_router = nn.Linear(self.hidden_size, self.delta_patch_prototypes)
+            self.patch_prototypes = nn.Parameter(torch.randn(self.delta_patch_prototypes, self.hidden_size) * 0.02)
+            nn.init.zeros_(self.patch_proto_router.weight)
+            nn.init.zeros_(self.patch_proto_router.bias)
+        else:
+            self.patch_proto_router = None
+            self.patch_prototypes = None
 
         self.head_drop = nn.Dropout(float(head_dropout))
         self.base_head = nn.Linear(self.hidden_size, self.horizon)
 
         self.delta_head_drop = nn.Dropout(float(head_dropout))
+        # Kept under the existing name for checkpoint compatibility; used as the sign head.
         self.delta_head = nn.Linear(self.hidden_size, self.horizon)
         nn.init.normal_(self.delta_head.weight, mean=0.0, std=float(delta_head_init_std))
         nn.init.zeros_(self.delta_head.bias)
+        sign_mode = str(delta_sign_mode or "signnet_binary").lower().strip()
+        if sign_mode != "signnet_binary":
+            sign_mode = "signnet_binary"
+        self.delta_sign_mode = sign_mode
 
         self.delta_gate = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
@@ -88,22 +110,50 @@ class TinyNewsTSRegressor(nn.Module):
         self.delta_internal_gate = bool(delta_internal_gate)
         self.disable_all_gates = bool(disable_all_gates)
         self.delta_clip = float(delta_clip)
+        self.delta_alpha_scale = float(max(0.0, delta_alpha_scale))
+        self.delta_sign_tau = float(max(1e-6, delta_sign_tau))
+        self.delta_mag_max = float(max(0.0, delta_mag_max))
+        self.doc_candidate_mode = str(doc_candidate_mode or "beta_only")
+        self.delta_fuse = nn.Sequential(
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(self.hidden_size),
+        )
+        self.delta_mag_head = nn.Linear(self.hidden_size, self.horizon)
+        nn.init.normal_(self.delta_mag_head.weight, mean=0.0, std=float(delta_head_init_std))
+        nn.init.constant_(self.delta_mag_head.bias, -2.0)
 
         self.structured_feat_dim = int(max(0, structured_feat_dim))
         if self.structured_feat_dim > 0:
             self.structured_proj = nn.Linear(self.structured_feat_dim, self.hidden_size)
             self.structured_gate_bias = nn.Linear(self.structured_feat_dim, self.horizon)
             self.structured_rel_bias = nn.Linear(self.structured_feat_dim, self.horizon)
+            self.structured_sign_head = nn.Linear(self.structured_feat_dim, self.horizon)
+            self.structured_scale_head = nn.Linear(self.structured_feat_dim, self.horizon)
+            self.structured_decay_head = nn.Linear(self.structured_feat_dim, 1)
+            self.structured_mask_head = nn.Linear(self.structured_feat_dim, self.horizon)
             nn.init.zeros_(self.structured_proj.weight)
             nn.init.zeros_(self.structured_proj.bias)
             nn.init.zeros_(self.structured_gate_bias.weight)
             nn.init.zeros_(self.structured_gate_bias.bias)
             nn.init.zeros_(self.structured_rel_bias.weight)
             nn.init.zeros_(self.structured_rel_bias.bias)
+            nn.init.zeros_(self.structured_sign_head.weight)
+            nn.init.zeros_(self.structured_sign_head.bias)
+            nn.init.zeros_(self.structured_scale_head.weight)
+            nn.init.zeros_(self.structured_scale_head.bias)
+            nn.init.zeros_(self.structured_decay_head.weight)
+            nn.init.zeros_(self.structured_decay_head.bias)
+            nn.init.zeros_(self.structured_mask_head.weight)
+            nn.init.zeros_(self.structured_mask_head.bias)
         else:
             self.structured_proj = None
             self.structured_gate_bias = None
             self.structured_rel_bias = None
+            self.structured_sign_head = None
+            self.structured_scale_head = None
+            self.structured_decay_head = None
+            self.structured_mask_head = None
 
         self.text_direct_enable = bool(text_direct_enable)
         self.text_fuse_lambda = float(text_fuse_lambda)
@@ -172,6 +222,19 @@ class TinyNewsTSRegressor(nn.Module):
             self.text_direct_enable = False
             self.doc_direct_enable = False
 
+        self.news_fuse = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
+        self.news_fuse_ln = nn.LayerNorm(self.hidden_size)
+        self.alpha_head = nn.Linear(self.hidden_size, self.horizon)
+        self.beta_head = nn.Linear(self.hidden_size, self.horizon)
+        nn.init.zeros_(self.alpha_head.weight)
+        nn.init.zeros_(self.alpha_head.bias)
+        nn.init.zeros_(self.beta_head.weight)
+        nn.init.zeros_(self.beta_head.bias)
+
         self.huber_beta = float(huber_beta)
         self.use_horizon_weight = bool(use_horizon_weight)
         self.horizon_weight_end = float(horizon_weight_end)
@@ -216,8 +279,6 @@ class TinyNewsTSRegressor(nn.Module):
             (not self.text_direct_enable)
             or self.text_encoder is None
             or self.text_proj is None
-            or self.text_delta_head is None
-            or self.text_gate is None
             or refined_ids is None
             or refined_attn is None
             or refined_ids.ndim != 2
@@ -240,23 +301,7 @@ class TinyNewsTSRegressor(nn.Module):
         denom = mask.sum(dim=1).clamp_min(1.0)
         pooled = (hidden * mask).sum(dim=1) / denom
         text_feat = self.text_proj(pooled)
-        text_raw = self.text_delta_head(self.delta_head_drop(text_feat))
-        if self.disable_all_gates:
-            text_gate = torch.ones(
-                text_feat.size(0),
-                self.horizon,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            text_gate = torch.sigmoid(self.text_gate(text_feat))
-        text_scale = torch.exp(self.text_log_scale).to(device=device, dtype=dtype).clamp(max=5.0)
-        text_delta = text_raw * text_gate * text_scale
-        text_delta = text_delta * valid
-        if self.text_clip > 0:
-            c = torch.tensor(self.text_clip, device=device, dtype=dtype)
-            text_delta = c * torch.tanh(text_delta / c)
-        return text_delta, text_gate * valid
+        return text_feat * valid, valid
 
     def _encode_refined_doc_set(
         self,
@@ -266,14 +311,12 @@ class TinyNewsTSRegressor(nn.Module):
         ts_context: torch.Tensor,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         if (
             (not self.doc_direct_enable)
             or self.text_encoder is None
             or self.doc_proj is None
             or self.doc_query is None
-            or self.doc_delta_head is None
-            or self.doc_gate is None
             or refined_doc_ids is None
             or refined_doc_attn is None
             or refined_doc_mask is None
@@ -283,7 +326,7 @@ class TinyNewsTSRegressor(nn.Module):
             or refined_doc_ids.size(1) <= 0
             or refined_doc_ids.size(2) <= 0
         ):
-            return None, None, None
+            return None, None, None, None
 
         ids = refined_doc_ids.to(device=device, dtype=torch.long)
         attn = refined_doc_attn.to(device=device, dtype=torch.long)
@@ -293,20 +336,20 @@ class TinyNewsTSRegressor(nn.Module):
         flat_attn = attn.reshape(B * D, T)
         hidden = self._run_text_encoder(flat_ids, flat_attn)
         if hidden is None:
-            return None, None, None
+            return None, None, None, None
 
         hidden = hidden.to(device=device, dtype=dtype)
         flat_mask = flat_attn.to(device=device, dtype=dtype).unsqueeze(-1)
         flat_valid = (flat_mask.sum(dim=1) > 0).to(dtype=dtype)
         if float(flat_valid.sum().item()) <= 0.0:
-            return None, None, None
+            return None, None, None, None
 
         denom = flat_mask.sum(dim=1).clamp_min(1.0)
         pooled = (hidden * flat_mask).sum(dim=1) / denom
         doc_feat = self.doc_proj(pooled).reshape(B, D, -1)
         doc_valid = (doc_mask > 0).to(dtype=dtype)
         if float(doc_valid.sum().item()) <= 0.0:
-            return None, None, None
+            return None, None, None, None
 
         query = self.doc_query(ts_context.to(device=device, dtype=dtype)).unsqueeze(1)
         attn_logits = (doc_feat * query).sum(dim=-1) / math.sqrt(float(max(1, self.hidden_size)))
@@ -317,23 +360,13 @@ class TinyNewsTSRegressor(nn.Module):
 
         doc_context = (doc_feat * doc_attn.unsqueeze(-1)).sum(dim=1)
         sample_valid = (doc_valid.sum(dim=1, keepdim=True) > 0).to(dtype=dtype)
-        doc_raw = self.doc_delta_head(self.delta_head_drop(doc_context))
-        if self.disable_all_gates:
-            doc_gate = torch.ones(
-                doc_context.size(0),
-                self.horizon,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            doc_gate = torch.sigmoid(self.doc_gate(doc_context))
-        doc_scale = torch.exp(self.doc_log_scale).to(device=device, dtype=dtype).clamp(max=5.0)
-        doc_delta = doc_raw * doc_gate * doc_scale
-        doc_delta = doc_delta * sample_valid
-        if self.doc_clip > 0:
-            c = torch.tensor(self.doc_clip, device=device, dtype=dtype)
-            doc_delta = c * torch.tanh(doc_delta / c)
-        return doc_delta, doc_gate * sample_valid, doc_attn
+        return doc_context * sample_valid, None, doc_attn, sample_valid
+
+    def _clip_delta_tensor(self, x: torch.Tensor, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        if self.delta_clip > 0:
+            c = torch.tensor(self.delta_clip, device=device, dtype=dtype)
+            return c * torch.tanh(x / c)
+        return x
 
     def forward(
         self,
@@ -364,20 +397,25 @@ class TinyNewsTSRegressor(nn.Module):
             ts_feat = ts_feat * keep
 
         pooled = self._pool_ts(ts_feat, ts_patch_mask=ts_patch_mask)
+        if self.delta_patch_prototypes > 0 and self.patch_proto_router is not None and self.patch_prototypes is not None:
+            proto_logits = self.patch_proto_router(ts_feat) / self.delta_patch_proto_temp
+            proto_w = torch.softmax(proto_logits, dim=-1)
+            ts_feat = torch.einsum("bpk,kh->bph", proto_w, self.patch_prototypes.to(device=ts_feat.device, dtype=ts_feat.dtype))
+            pooled = self._pool_ts(ts_feat, ts_patch_mask=ts_patch_mask)
 
         structured_weight = None
-        structured_gate_bias = None
-        structured_rel_bias = None
+        structured_context = None
+        struct_sign_logit = None
+        struct_scale = None
+        struct_decay = None
+        struct_mask_logits = None
 
         if head_mode == "base":
             rel_input = pooled
             pred = self.base_head(self.head_drop(pooled))
         elif head_mode == "delta":
-            delta_feat = pooled
-            rel_input = delta_feat
-
             if self.structured_feat_dim > 0 and structured_feats is not None:
-                sf = structured_feats.to(device=delta_feat.device, dtype=delta_feat.dtype)
+                sf = structured_feats.to(device=pooled.device, dtype=pooled.dtype)
                 if sf.dim() == 1:
                     sf = sf.unsqueeze(0)
                 if sf.size(-1) < self.structured_feat_dim:
@@ -393,85 +431,126 @@ class TinyNewsTSRegressor(nn.Module):
                     (sf.size(0), 1), device=sf.device, dtype=sf.dtype
                 )
                 structured_weight = (relevance * (0.5 + 0.5 * confidence)).clamp(0.0, 1.0)
-                structured_gate_bias = self.structured_gate_bias(sf) * structured_weight
-                structured_rel_bias = self.structured_rel_bias(sf) * structured_weight
-                delta_feat = delta_feat + self.structured_proj(sf) * structured_weight
-
-            raw_delta = self.delta_head(self.delta_head_drop(delta_feat))
-            delta_scale = torch.exp(self.delta_log_scale).to(device=raw_delta.device, dtype=raw_delta.dtype).clamp(max=5.0)
-            if self.disable_all_gates:
-                delta_gate = torch.ones_like(raw_delta)
-                pred = raw_delta * delta_scale
-                if self.delta_clip > 0:
-                    c = torch.tensor(self.delta_clip, device=pred.device, dtype=pred.dtype)
-                pred = c * torch.tanh(pred / c)
+                structured_context = self.structured_proj(sf) * structured_weight
+                struct_sign_logit = self.structured_sign_head(sf)
+                struct_scale = F.softplus(self.structured_scale_head(sf))
+                struct_decay = F.softplus(self.structured_decay_head(sf))
+                struct_mask_logits = self.structured_mask_head(sf)
             else:
-                delta_gate_logits = self.delta_gate(delta_feat)
-                if structured_gate_bias is not None:
-                    delta_gate_logits = delta_gate_logits + structured_gate_bias
-                delta_gate = torch.sigmoid(delta_gate_logits)
-            if (not self.disable_all_gates) and self.delta_internal_gate:
-                pred = raw_delta * delta_gate * delta_scale
-                if self.delta_clip > 0:
-                    c = torch.tensor(self.delta_clip, device=pred.device, dtype=pred.dtype)
-                    pred = c * torch.tanh(pred / c)
-            elif not self.disable_all_gates:
-                pred = raw_delta * delta_scale
+                sf = None
 
-            text_gate = None
-            text_delta = None
-            doc_gate = None
-            doc_delta = None
-            doc_attn = None
-            if self.text_direct_enable and self.text_fuse_lambda != 0.0:
-                text_delta, text_gate = self._encode_refined_text(
+            text_feat = None
+            text_valid = None
+            if self.text_direct_enable:
+                text_feat, text_valid = self._encode_refined_text(
                     refined_ids=refined_news_input_ids,
                     refined_attn=refined_news_attention_mask,
-                    dtype=pred.dtype,
-                    device=pred.device,
+                    dtype=pooled.dtype,
+                    device=pooled.device,
                 )
-                if text_delta is not None:
-                    pred = pred + float(self.text_fuse_lambda) * text_delta
-            if self.doc_direct_enable and self.doc_fuse_lambda != 0.0:
-                doc_delta, doc_gate, doc_attn = self._encode_refined_doc_set(
+
+            doc_context = None
+            doc_attn = None
+            doc_sample_valid = None
+            if self.doc_direct_enable:
+                doc_context, _, doc_attn, doc_sample_valid = self._encode_refined_doc_set(
                     refined_doc_ids=refined_news_doc_input_ids,
                     refined_doc_attn=refined_news_doc_attention_mask,
                     refined_doc_mask=refined_news_doc_mask,
-                    ts_context=delta_feat,
-                    dtype=pred.dtype,
-                    device=pred.device,
+                    ts_context=pooled,
+                    dtype=pooled.dtype,
+                    device=pooled.device,
                 )
-                if doc_delta is not None:
-                    pred = pred + float(self.doc_fuse_lambda) * doc_delta
+
+            news_context_sum = torch.zeros_like(pooled)
+            news_context_weight = torch.zeros(pooled.size(0), 1, device=pooled.device, dtype=pooled.dtype)
+
+            if text_feat is not None:
+                text_weight = text_valid * float(abs(self.text_fuse_lambda) if self.text_fuse_lambda != 0.0 else 0.0)
+                news_context_sum = news_context_sum + text_feat * text_weight
+                news_context_weight = news_context_weight + text_weight
+
+            if doc_context is not None:
+                doc_weight = doc_sample_valid * float(abs(self.doc_fuse_lambda) if self.doc_fuse_lambda != 0.0 else 0.0)
+                news_context_sum = news_context_sum + doc_context * doc_weight
+                news_context_weight = news_context_weight + doc_weight
+
+            if structured_context is not None and structured_weight is not None:
+                news_context_sum = news_context_sum + structured_context
+                news_context_weight = news_context_weight + structured_weight
+
+            if float((news_context_weight > 0).to(dtype=pooled.dtype).sum().item()) > 0.0:
+                fused_news_context = news_context_sum / news_context_weight.clamp_min(1e-6)
+                fused_news_context = self.news_fuse_ln(fused_news_context + self.news_fuse(fused_news_context))
+            else:
+                fused_news_context = torch.zeros_like(pooled)
+
+            news_strength = news_context_weight.clamp(min=0.0, max=1.0)
+            residual_context = self.delta_fuse(torch.cat([pooled, fused_news_context], dim=-1))
+            sign_logits = self.delta_head(self.delta_head_drop(residual_context))
+            sign_soft = torch.tanh(sign_logits / self.delta_sign_tau)
+            magnitude_raw = self.delta_mag_head(self.delta_head_drop(residual_context))
+            magnitude = F.softplus(magnitude_raw)
+            if self.delta_mag_max > 0.0:
+                magnitude = magnitude.clamp(max=self.delta_mag_max)
+
+            gate_logits = self.delta_gate(self.delta_head_drop(residual_context))
+            if self.disable_all_gates or (not self.delta_internal_gate):
+                gate = torch.ones_like(gate_logits)
+            else:
+                gate = torch.sigmoid(gate_logits)
+            gate = gate * news_strength
+
+            delta_init = sign_soft * magnitude
+            pred = gate * delta_init
+            pred = self._clip_delta_tensor(pred, dtype=pred.dtype, device=pred.device)
+            rel_input = residual_context
         else:
             raise ValueError(f"Unknown head_mode={head_mode}")
 
         pred = pred.to(torch.float32)
         if head_mode == "delta":
-            rel_logit = self.delta_rel_head(rel_input).to(torch.float32)
-            if structured_rel_bias is not None:
-                rel_logit = rel_logit + structured_rel_bias.to(torch.float32)
+            rel_logit = gate_logits.to(torch.float32)
         else:
             rel_logit = self.rel_head(rel_input).squeeze(-1).to(torch.float32)
 
         out = {"pred": pred, "rel_logits": rel_logit}
         if head_mode == "delta":
-            rel_gate = torch.ones_like(delta_gate)
-            out["delta_gate_mean"] = delta_gate.mean().detach()
-            out["delta_scale"] = delta_scale.detach()
-            out["delta_rel_gate_mean"] = rel_gate.mean().detach()
+            out["delta_gate_mean"] = gate.mean().detach()
+            out["delta_scale"] = torch.ones((), device=pred.device, dtype=pred.dtype)
+            out["delta_rel_gate_mean"] = gate.mean().detach()
             out["delta_internal_gate"] = int(self.delta_internal_gate)
+            out["delta_init"] = delta_init.to(torch.float32)
+            out["gate"] = gate.to(torch.float32)
+            out["gate_logits"] = gate_logits.to(torch.float32)
+            out["sign_logits"] = sign_logits.to(torch.float32)
+            out["sign_soft"] = sign_soft.to(torch.float32)
+            out["magnitude"] = magnitude.to(torch.float32)
+            out["magnitude_raw"] = magnitude_raw.to(torch.float32)
+            out["delta_sign_mode"] = str(self.delta_sign_mode)
+            out["alpha_news"] = torch.ones_like(pred, dtype=torch.float32)
+            out["beta_news"] = torch.zeros_like(pred, dtype=torch.float32)
+            out["doc_impact"] = torch.zeros_like(pred, dtype=torch.float32)
+            out["struct_impact"] = torch.zeros_like(pred, dtype=torch.float32)
+            out["final_gate"] = gate.detach()
+            out["news_available_mask"] = news_strength.to(torch.float32)
+            out["fused_news_context_norm"] = fused_news_context.norm(dim=1).mean().detach()
             if structured_weight is not None:
                 out["structured_weight_mean"] = structured_weight.mean().detach()
-            if text_delta is not None:
-                out["text_delta_mean_abs"] = text_delta.abs().mean().detach()
-            if text_gate is not None:
-                out["text_gate_mean"] = text_gate.mean().detach()
-            if doc_delta is not None:
-                out["doc_delta_mean_abs"] = doc_delta.abs().mean().detach()
-            if doc_gate is not None:
-                out["doc_gate_mean"] = doc_gate.mean().detach()
+            if struct_sign_logit is not None:
+                out["struct_sign_logit"] = struct_sign_logit.to(torch.float32)
+            if struct_scale is not None:
+                out["struct_scale"] = struct_scale.to(torch.float32)
+            if struct_decay is not None:
+                out["struct_decay"] = struct_decay.to(torch.float32)
+            if struct_mask_logits is not None:
+                out["struct_mask_logits"] = struct_mask_logits.to(torch.float32)
+                out["struct_mask"] = torch.sigmoid(struct_mask_logits).to(torch.float32)
+            out["doc_impact_mean_abs"] = torch.zeros((), device=pred.device, dtype=pred.dtype)
+            out["struct_impact_mean_abs"] = torch.zeros((), device=pred.device, dtype=pred.dtype)
             if doc_attn is not None:
+                out["doc_attn_weights"] = doc_attn.detach()
+                out["doc_attn_max"] = doc_attn.max(dim=1).values.mean().detach()
                 out["doc_attn_entropy"] = (-(doc_attn.clamp_min(1e-6) * doc_attn.clamp_min(1e-6).log()).sum(dim=1).mean()).detach()
 
         loss = None
@@ -567,6 +646,13 @@ def build_delta_model(
     delta_doc_clip: float = 1.0,
     delta_doc_max_len: int = 96,
     delta_doc_max_docs: int = 4,
+    delta_alpha_scale: float = 0.75,
+    delta_patch_prototypes: int = 0,
+    delta_patch_proto_temp: float = 1.0,
+    delta_sign_tau: float = 1.0,
+    delta_sign_mode: str = "signnet_binary",
+    delta_mag_max: float = 0.0,
+    doc_candidate_mode: str = "beta_only",
 ):
     del (
         head_mlp,
@@ -631,6 +717,13 @@ def build_delta_model(
         doc_fuse_lambda=float(delta_doc_fuse_lambda),
         doc_gate_init_bias=float(delta_doc_gate_init_bias),
         doc_clip=float(delta_doc_clip),
+        delta_alpha_scale=float(delta_alpha_scale),
+        delta_patch_prototypes=int(delta_patch_prototypes),
+        delta_patch_proto_temp=float(delta_patch_proto_temp),
+        delta_sign_tau=float(delta_sign_tau),
+        delta_sign_mode=str(delta_sign_mode or "signnet_binary"),
+        delta_mag_max=float(delta_mag_max),
+        doc_candidate_mode=str(doc_candidate_mode or "beta_only"),
     )
     model.tiny_text_model_id = str(model_id)
     model.tiny_text_tokenizer_id = str(tok_id)
@@ -640,6 +733,17 @@ def build_delta_model(
     model.delta_doc_max_docs = int(max(1, delta_doc_max_docs))
     model.delta_doc_gate_init_bias = float(delta_doc_gate_init_bias)
     model.disable_all_gates = bool(disable_all_gates)
+    model.delta_internal_gate_in_model = bool(delta_internal_gate)
+    model.delta_alpha_scale = float(delta_alpha_scale)
+    model.delta_patch_prototypes = int(max(0, delta_patch_prototypes))
+    model.delta_patch_proto_temp = float(max(1e-6, delta_patch_proto_temp))
+    model.delta_sign_tau = float(max(1e-6, delta_sign_tau))
+    delta_sign_mode_norm = str(delta_sign_mode or "signnet_binary").lower().strip()
+    if delta_sign_mode_norm != "signnet_binary":
+        delta_sign_mode_norm = "signnet_binary"
+    model.delta_sign_mode = delta_sign_mode_norm
+    model.delta_mag_max = float(max(0.0, delta_mag_max))
+    model.doc_candidate_mode = str(doc_candidate_mode or "beta_only")
     return tok, model
 
 
@@ -671,6 +775,7 @@ def save_checkpoint(
             "hidden_size": int(model.hidden_size),
             "structured_feat_dim": int(getattr(model, "structured_feat_dim", 0)),
             "delta_internal_gate": int(bool(getattr(model, "delta_internal_gate", True))),
+            "delta_internal_gate_in_model": int(bool(getattr(model, "delta_internal_gate_in_model", getattr(model, "delta_internal_gate", True)))),
             "disable_all_gates": int(bool(getattr(model, "disable_all_gates", False))),
             "delta_clip": float(getattr(model, "delta_clip", 3.0)),
             "huber_beta": float(getattr(model, "huber_beta", 0.5)),
@@ -691,6 +796,13 @@ def save_checkpoint(
             "delta_doc_max_len": int(getattr(model, "delta_doc_max_len", 96)),
             "delta_doc_max_docs": int(getattr(model, "delta_doc_max_docs", 4)),
             "delta_doc_gate_init_bias": float(getattr(model, "delta_doc_gate_init_bias", -2.0)),
+            "delta_alpha_scale": float(getattr(model, "delta_alpha_scale", 0.75)),
+            "delta_patch_prototypes": int(getattr(model, "delta_patch_prototypes", 0)),
+            "delta_patch_proto_temp": float(getattr(model, "delta_patch_proto_temp", 1.0)),
+            "delta_sign_tau": float(getattr(model, "delta_sign_tau", 1.0)),
+            "delta_sign_mode": str(getattr(model, "delta_sign_mode", "signnet_binary")),
+            "delta_mag_max": float(getattr(model, "delta_mag_max", 0.0)),
+            "doc_candidate_mode": str(getattr(model, "doc_candidate_mode", "beta_only")),
         },
         reg_path,
     )
@@ -707,6 +819,7 @@ def save_checkpoint(
         "use_horizon_weight": bool(getattr(model, "use_horizon_weight", True)),
         "horizon_weight_end": float(getattr(model, "horizon_weight_end", 0.5)),
         "delta_internal_gate": int(bool(getattr(model, "delta_internal_gate", True))),
+        "delta_internal_gate_in_model": int(bool(getattr(model, "delta_internal_gate_in_model", getattr(model, "delta_internal_gate", True)))),
         "disable_all_gates": int(bool(getattr(model, "disable_all_gates", False))),
         "delta_clip": float(getattr(model, "delta_clip", 3.0)),
         "structured_feat_dim": int(getattr(model, "structured_feat_dim", 0)),
@@ -725,6 +838,13 @@ def save_checkpoint(
         "delta_doc_max_len": int(getattr(model, "delta_doc_max_len", 96)),
         "delta_doc_max_docs": int(getattr(model, "delta_doc_max_docs", 4)),
         "delta_doc_gate_init_bias": float(getattr(model, "delta_doc_gate_init_bias", -2.0)),
+        "delta_alpha_scale": float(getattr(model, "delta_alpha_scale", 0.75)),
+        "delta_patch_prototypes": int(getattr(model, "delta_patch_prototypes", 0)),
+        "delta_patch_proto_temp": float(getattr(model, "delta_patch_proto_temp", 1.0)),
+        "delta_sign_tau": float(getattr(model, "delta_sign_tau", 1.0)),
+        "delta_sign_mode": str(getattr(model, "delta_sign_mode", "signnet_binary")),
+        "delta_mag_max": float(getattr(model, "delta_mag_max", 0.0)),
+        "doc_candidate_mode": str(getattr(model, "doc_candidate_mode", "beta_only")),
     }
     if isinstance(extra_meta, dict):
         for k, v in extra_meta.items():
@@ -791,7 +911,7 @@ def load_checkpoint(
         hidden_size=int(meta.get("hidden_size", 256)),
         patch_dropout=float(pd),
         head_dropout=float(hd),
-        delta_internal_gate=bool(int(meta.get("delta_internal_gate", 1))),
+        delta_internal_gate=bool(int(meta.get("delta_internal_gate_in_model", meta.get("delta_internal_gate", 1)))),
         disable_all_gates=bool(int(meta.get("disable_all_gates", 0))),
         delta_clip=float(meta.get("delta_clip", 3.0)),
         structured_feat_dim=int(meta.get("structured_feat_dim", 0)),
@@ -809,14 +929,32 @@ def load_checkpoint(
         doc_fuse_lambda=float(meta.get("doc_fuse_lambda", 0.0)),
         doc_gate_init_bias=float(meta.get("delta_doc_gate_init_bias", -2.0)),
         doc_clip=float(meta.get("doc_clip", 1.0)),
+        delta_alpha_scale=float(meta.get("delta_alpha_scale", 0.75)),
+        delta_patch_prototypes=int(meta.get("delta_patch_prototypes", 0) or 0),
+        delta_patch_proto_temp=float(meta.get("delta_patch_proto_temp", 1.0)),
+        delta_sign_tau=float(meta.get("delta_sign_tau", 1.0)),
+        delta_sign_mode=str(meta.get("delta_sign_mode", "signnet_binary")),
+        delta_mag_max=float(meta.get("delta_mag_max", 0.0)),
+        doc_candidate_mode=str(meta.get("doc_candidate_mode", "beta_only")),
     )
     model.tiny_text_model_id = str(meta.get("tiny_text_model_id", ""))
     model.tiny_text_tokenizer_id = str(meta.get("tiny_text_tokenizer_id", ""))
     model.delta_text_max_len = int(max(1, meta.get("delta_text_max_len", 160) or 160))
     model.disable_all_gates = bool(int(meta.get("disable_all_gates", 0)))
+    model.delta_internal_gate_in_model = bool(int(meta.get("delta_internal_gate_in_model", meta.get("delta_internal_gate", 1))))
     model.delta_doc_max_len = int(max(1, meta.get("delta_doc_max_len", 96) or 96))
     model.delta_doc_max_docs = int(max(1, meta.get("delta_doc_max_docs", 4) or 4))
     model.delta_doc_gate_init_bias = float(meta.get("delta_doc_gate_init_bias", -2.0))
+    model.delta_alpha_scale = float(meta.get("delta_alpha_scale", 0.75))
+    model.delta_patch_prototypes = int(max(0, meta.get("delta_patch_prototypes", 0) or 0))
+    model.delta_patch_proto_temp = float(max(1e-6, meta.get("delta_patch_proto_temp", 1.0) or 1.0))
+    model.delta_sign_tau = float(max(1e-6, meta.get("delta_sign_tau", 1.0) or 1.0))
+    delta_sign_mode = str(meta.get("delta_sign_mode", "signnet_binary")).lower().strip()
+    if delta_sign_mode != "signnet_binary":
+        delta_sign_mode = "signnet_binary"
+    model.delta_sign_mode = delta_sign_mode
+    model.delta_mag_max = float(max(0.0, meta.get("delta_mag_max", 0.0) or 0.0))
+    model.doc_candidate_mode = str(meta.get("doc_candidate_mode", "beta_only"))
 
     reg = torch.load(os.path.join(ckpt_dir, "regressor.pt"), map_location="cpu")
     state = reg.get("model_state", reg)

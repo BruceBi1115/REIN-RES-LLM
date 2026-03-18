@@ -20,8 +20,89 @@ if __name__ == '__main__':
                         help='weight for explicit delta sign-consistency loss against signed residual target')
     parser.add_argument('--delta_sign_margin', type=float, default=0.0,
                         help='hinge margin for signed delta supervision; positive requires a small same-sign output')
-    parser.add_argument('--delta_sign_eps', type=float, default=0.0,
+    parser.add_argument('--delta_sign_eps', type=float, default=0.03,
                         help='ignore sign supervision where |delta_target| <= eps')
+    parser.add_argument('--delta_gate_eps', type=float, default=0.05,
+                        help='gate target threshold on true residual magnitude in z-space')
+    parser.add_argument('--delta_sign_tau', type=float, default=1.0,
+                        help='temperature for soft sign = tanh(sign_logits / tau)')
+    parser.add_argument('--delta_sign_mode', type=str, default='signnet_binary', choices=['signnet_binary'],
+                        help='sign mode for DELTA residual direction (external signnet binary classifier only)')
+    parser.add_argument('--delta_sign_external_epochs', type=int, default=60,
+                        help='epochs for external signnet pretraining when delta_sign_mode=signnet_binary')
+    parser.add_argument('--delta_sign_external_hidden', type=int, default=128,
+                        help='hidden size for external signnet')
+    parser.add_argument('--delta_sign_external_dropout', type=float, default=0.2,
+                        help='dropout for external signnet')
+    parser.add_argument('--delta_sign_external_lr', type=float, default=3e-4,
+                        help='learning rate for external signnet pretraining')
+    parser.add_argument('--delta_sign_external_weight_decay', type=float, default=5e-4,
+                        help='weight decay for external signnet pretraining')
+    parser.add_argument('--delta_sign_external_grad_clip', type=float, default=1.0,
+                        help='grad clip for external signnet pretraining')
+    parser.add_argument('--delta_sign_external_patience', type=int, default=10,
+                        help='early-stop patience for external signnet validation')
+    parser.add_argument('--delta_sign_external_select_metric', type=str, default='acc', choices=['acc', 'balanced_acc', 'loss'],
+                        help='model-selection metric for external signnet early stopping')
+    parser.add_argument('--delta_sign_external_min_delta', type=float, default=1e-4,
+                        help='minimum validation loss improvement required to reset early-stop counter')
+    parser.add_argument('--delta_sign_external_lr_factor', type=float, default=0.5,
+                        help='ReduceLROnPlateau factor for external signnet (set >=1 to disable)')
+    parser.add_argument('--delta_sign_external_lr_patience', type=int, default=1,
+                        help='ReduceLROnPlateau patience (epochs) for external signnet')
+    parser.add_argument('--delta_sign_external_min_lr', type=float, default=1e-5,
+                        help='minimum learning rate for external signnet scheduler')
+    parser.add_argument('--delta_sign_external_calibrate_bias', type=int, default=1, choices=[0, 1],
+                        help='calibrate external signnet decision bias on validation set after pretraining')
+    parser.add_argument('--delta_sign_external_bias_clip', type=float, default=2.0,
+                        help='absolute clip bound for calibrated decision bias')
+    parser.add_argument('--delta_sign_external_news_dropout', type=int, default=0, choices=[0, 1],
+                        help='apply news dropout during external signnet training (0 recommended for stability)')
+    parser.add_argument('--delta_sign_external_use_news_weighting', type=int, default=0, choices=[0, 1],
+                        help='apply news usefulness weights in external signnet BCE loss')
+    parser.add_argument('--delta_sign_external_use_residual_weighting', type=int, default=0, choices=[0, 1],
+                        help='apply residual-magnitude position weights in external signnet BCE loss')
+    parser.add_argument('--delta_sign_external_use_pos_weight', type=int, default=1, choices=[0, 1],
+                        help='enable masked dynamic pos_weight (neg/pos) for external signnet BCE')
+    parser.add_argument('--delta_sign_external_pos_weight_floor', type=float, default=0.5,
+                        help='lower bound for dynamic pos_weight in external signnet BCE')
+    parser.add_argument('--delta_sign_external_pos_weight_clip', type=float, default=3.0,
+                        help='upper bound for dynamic pos_weight in external signnet BCE')
+    parser.add_argument('--delta_sign_external_tau', type=float, default=1.0,
+                        help='temperature for mapping external signnet logits to soft sign via tanh')
+    parser.add_argument('--delta_gate_loss_weight', type=float, default=0.2,
+                        help='weight for BCE supervision on factorized residual gate logits')
+    parser.add_argument('--delta_sign_loss_weight', type=float, default=0.1,
+                        help='weight for masked BCE supervision on true residual sign logits')
+    parser.add_argument('--delta_mag_loss_weight', type=float, default=0.5,
+                        help='weight for magnitude regression loss on |true residual|')
+    parser.add_argument('--delta_mag_target', type=str, default='log1p', choices=['raw', 'log1p'],
+                        help='target transform used for magnitude regression')
+    parser.add_argument('--delta_mag_max', type=float, default=0.0,
+                        help='optional clamp for predicted magnitude in z-space; <=0 disables')
+    parser.add_argument('--delta_residual_weight_scale', type=float, default=1.0,
+                        help='bounded extra weight for larger true residual positions')
+    parser.add_argument('--delta_init_aux_weight', type=float, default=0.2,
+                        help='weight for auxiliary supervision on delta_init vs delta target')
+    parser.add_argument('--alpha_null_weight', type=float, default=0.05,
+                        help='penalty weight encouraging alpha_news to stay near 1 when news is weak/absent')
+    parser.add_argument('--beta_null_weight', type=float, default=0.05,
+                        help='penalty weight encouraging beta_news to stay near 0 when news is weak/absent')
+    parser.add_argument('--struct_impact_weight', type=float, default=0.05,
+                        help='weak consistency weight for structured impact sign/scale/decay/mask')
+    parser.add_argument('--final_gate_sup_weight', type=float, default=0.0,
+                        help='weak supervision weight for horizon-wise final gate pseudo targets')
+    parser.add_argument('--news_usefulness_weighting', type=int, default=1, choices=[0, 1],
+                        help='apply bounded per-sample usefulness weighting to news-specific losses')
+    parser.add_argument('--delta_alpha_scale', type=float, default=0.75,
+                        help='maximum multiplicative deformation range for alpha_news: 1 + scale * tanh(logits)')
+    parser.add_argument('--delta_patch_prototypes', type=int, default=0,
+                        help='optional number of learnable patch prototypes for delta patch reprogramming; 0 disables')
+    parser.add_argument('--delta_patch_proto_temp', type=float, default=1.0,
+                        help='softmax temperature for optional delta patch prototype routing')
+    parser.add_argument('--doc_candidate_mode', type=str, default='beta_only',
+                        choices=['beta_only'],
+                        help='document candidate construction mode for doc impact aggregation')
 
     parser.add_argument('--news_gate_enable', type=int, default=1, choices=[0, 1], help='enable sample-wise news gate')
     parser.add_argument('--disable_all_gates', type=int, default=0, choices=[0, 1],
@@ -33,6 +114,8 @@ if __name__ == '__main__':
     parser.add_argument('--delta_gate_init_bias', type=float, default=0.0, help='init bias for horizon-wise delta gate head')
     parser.add_argument('--delta_internal_gate', type=int, default=1, choices=[0, 1],
                         help='enable internal delta gating in model head (1=on, 0=bypass gate/rel/clip)')
+    parser.add_argument('--delta_internal_gate_in_model', type=int, default=1, choices=[0, 1],
+                        help='enable factorized residual gate inside the DELTA model output path')
     parser.add_argument('--delta_head_init_std', type=float, default=0.01, help='std for delta head weight init')
     parser.add_argument('--delta_clip', type=float, default=3.0, help='tanh clip for delta outputs in z-space (<=0 to disable)')
     parser.add_argument('--delta_news_tail_tokens', type=int, default=160, help='how many tail text tokens to pool as news context')
