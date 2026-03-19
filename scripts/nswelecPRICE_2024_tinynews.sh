@@ -62,7 +62,7 @@ echo "[env] Using PYTHON_BIN=$PYTHON_BIN"
 
 TIME_COL="SETTLEMENTDATE"
 VALUE_COL="RRP"
-UNIT="$/MWh"
+UNIT=""
 DESCRIPTION="This dataset records the electricity price data in Australia NSW from 2024, collected from National electricity market."
 REGION="Australia, NSW"
 
@@ -87,25 +87,67 @@ TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 # Keep task settings aligned with your existing NSW scripts.
 RESIDUAL_LOSS="smooth_l1"
 SELECT_METRIC="mae"
-STRIDE="48"
+STRIDE="1"
+STAGE="all"
 HORIZONS=(
   "48"
-  # "96"
-  # "192"
-  # "336"
-  # "720"
+  "96"
+  "192"
+  "336"
+  "720"
 )
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
-STAGE="all"
+
 DELTA_VAL_MODE="${DELTA_VAL_MODE:-each_epoch}"  # each_epoch | end_only | none
 DELTA_CLIP="${DELTA_CLIP:-1.0}"
-EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-4}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-5}"
 NEWS_GATE_FLOOR="${NEWS_GATE_FLOOR:-0.0}"
-FINAL_GATE_ENABLE="${FINAL_GATE_ENABLE:-0}"   # 0 => bypass only the final fusion gate
-DISABLE_ALL_GATES="${DISABLE_ALL_GATES:-0}"   # 1 => bypass internal delta gate + final gate + text gate
-REL_SUPERVISE_LAMBDA="${REL_SUPERVISE_LAMBDA:-0.5}"
-GATE_NULL_LAMBDA="${GATE_NULL_LAMBDA:-0.1}"
+# Stable DELTA default for LOAD: use additive true-residual correction with
+# in-model factorized gate/sign/magnitude heads.
+FINAL_GATE_ENABLE="${FINAL_GATE_ENABLE:-1}"   # legacy compatibility flag; factorized DELTA now gates inside the model
+DISABLE_ALL_GATES="${DISABLE_ALL_GATES:-0}"   # 1 => bypass internal delta gate + legacy outer gate + text gate
+DELTA_GATE_INIT_BIAS="${DELTA_GATE_INIT_BIAS:--2.0}"  # negative => in-model gate starts conservative
+DELTA_INTERNAL_GATE_IN_MODEL="${DELTA_INTERNAL_GATE_IN_MODEL:-1}"
+DELTA_FREEZE_FEATURE_MODULES="${DELTA_FREEZE_FEATURE_MODULES:-1}"  # keep delta adaptation focused on the residual head
+DELTA_NON_DEGRADE_LAMBDA="${DELTA_NON_DEGRADE_LAMBDA:-1.0}"
+DELTA_NON_DEGRADE_MARGIN="${DELTA_NON_DEGRADE_MARGIN:-0.0}"  # best current ablation: guard against degradation, but do not require extra margin
+DELTA_SIGN_LAMBDA="${DELTA_SIGN_LAMBDA:-0.05}"   # explicitly teach DELTA whether residual should be positive or negative
+DELTA_SIGN_MARGIN="${DELTA_SIGN_MARGIN:-0.02}"
+DELTA_SIGN_EPS="${DELTA_SIGN_EPS:-0.03}"
+DELTA_GATE_EPS="${DELTA_GATE_EPS:-0.05}"
+
+DELTA_SIGN_TAU="${DELTA_SIGN_TAU:-1.0}"
+DELTA_SIGN_MODE="${DELTA_SIGN_MODE:-signnet_binary}"  # signnet_binary only
+DELTA_SIGN_EXTERNAL_EPOCHS="${DELTA_SIGN_EXTERNAL_EPOCHS:-80}"
+DELTA_SIGN_EXTERNAL_HIDDEN="${DELTA_SIGN_EXTERNAL_HIDDEN:-192}"
+DELTA_SIGN_EXTERNAL_DROPOUT="${DELTA_SIGN_EXTERNAL_DROPOUT:-0.2}"
+DELTA_SIGN_EXTERNAL_LR="${DELTA_SIGN_EXTERNAL_LR:-3e-4}"
+DELTA_SIGN_EXTERNAL_WEIGHT_DECAY="${DELTA_SIGN_EXTERNAL_WEIGHT_DECAY:-5e-4}"
+DELTA_SIGN_EXTERNAL_GRAD_CLIP="${DELTA_SIGN_EXTERNAL_GRAD_CLIP:-1.0}"
+DELTA_SIGN_EXTERNAL_PATIENCE="${DELTA_SIGN_EXTERNAL_PATIENCE:-5}"
+DELTA_SIGN_EXTERNAL_SELECT_METRIC="${DELTA_SIGN_EXTERNAL_SELECT_METRIC:-balanced_acc}"  # acc | balanced_acc | loss
+DELTA_SIGN_EXTERNAL_MIN_DELTA="${DELTA_SIGN_EXTERNAL_MIN_DELTA:-1e-4}"
+DELTA_SIGN_EXTERNAL_LR_FACTOR="${DELTA_SIGN_EXTERNAL_LR_FACTOR:-0.5}"
+DELTA_SIGN_EXTERNAL_LR_PATIENCE="${DELTA_SIGN_EXTERNAL_LR_PATIENCE:-1}"
+DELTA_SIGN_EXTERNAL_MIN_LR="${DELTA_SIGN_EXTERNAL_MIN_LR:-1e-5}"
+DELTA_SIGN_EXTERNAL_CALIBRATE_BIAS="${DELTA_SIGN_EXTERNAL_CALIBRATE_BIAS:-1}"
+DELTA_SIGN_EXTERNAL_BIAS_CLIP="${DELTA_SIGN_EXTERNAL_BIAS_CLIP:-1.5}"
+DELTA_SIGN_EXTERNAL_NEWS_DROPOUT="${DELTA_SIGN_EXTERNAL_NEWS_DROPOUT:-0}"
+DELTA_SIGN_EXTERNAL_USE_NEWS_WEIGHTING="${DELTA_SIGN_EXTERNAL_USE_NEWS_WEIGHTING:-0}"
+DELTA_SIGN_EXTERNAL_USE_RESIDUAL_WEIGHTING="${DELTA_SIGN_EXTERNAL_USE_RESIDUAL_WEIGHTING:-0}"
+DELTA_SIGN_EXTERNAL_USE_POS_WEIGHT="${DELTA_SIGN_EXTERNAL_USE_POS_WEIGHT:-1}"
+DELTA_SIGN_EXTERNAL_POS_WEIGHT_FLOOR="${DELTA_SIGN_EXTERNAL_POS_WEIGHT_FLOOR:-0.5}"
+DELTA_SIGN_EXTERNAL_POS_WEIGHT_CLIP="${DELTA_SIGN_EXTERNAL_POS_WEIGHT_CLIP:-3.0}"
+DELTA_SIGN_EXTERNAL_TAU="${DELTA_SIGN_EXTERNAL_TAU:-1.0}"
+DELTA_GATE_LOSS_WEIGHT="${DELTA_GATE_LOSS_WEIGHT:-0.2}"
+DELTA_SIGN_LOSS_WEIGHT="${DELTA_SIGN_LOSS_WEIGHT:-0.1}"
+DELTA_MAG_LOSS_WEIGHT="${DELTA_MAG_LOSS_WEIGHT:-0.5}"
+DELTA_MAG_TARGET="${DELTA_MAG_TARGET:-log1p}"  # raw | log1p
+DELTA_MAG_MAX="${DELTA_MAG_MAX:-0.0}"          # <=0 disables clamp
+DELTA_RESIDUAL_WEIGHT_SCALE="${DELTA_RESIDUAL_WEIGHT_SCALE:-1.0}"
+REL_SUPERVISE_LAMBDA="${REL_SUPERVISE_LAMBDA:-0.0}"
+GATE_NULL_LAMBDA="${GATE_NULL_LAMBDA:-0.0}"
 CF_PSEUDO_MARGIN="${CF_PSEUDO_MARGIN:-0.01}"
 CF_PSEUDO_TEMP="${CF_PSEUDO_TEMP:-0.2}"
 CF_PSEUDO_HARD="${CF_PSEUDO_HARD:-0}"
@@ -148,24 +190,23 @@ if [[ "$NEWS_API_ENABLE" == "1" ]]; then
   NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-api}"   # off | heuristic | api
 else
   NEWS_REFINE_MODE="${NEWS_REFINE_MODE:-local}"               # local | api
-  NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-heuristic}"   # off | heuristic | api
+  NEWS_STRUCTURED_MODE="${NEWS_STRUCTURED_MODE:-off}"   # off | heuristic | api
 fi
 NEWS_REFINE_CACHE_ENABLE="${NEWS_REFINE_CACHE_ENABLE:-1}"
-NEWS_REFINE_CACHE_PATH="${NEWS_REFINE_CACHE_PATH:-}"          # empty => auto-generate dataset-specific cache path
 NEWS_STRUCTURED_CACHE_ENABLE="${NEWS_STRUCTURED_CACHE_ENABLE:-1}"
-NEWS_STRUCTURED_CACHE_PATH="${NEWS_STRUCTURED_CACHE_PATH:-}"  # empty => auto-generate cache path from news filename
-NEWS_REFINE_CACHE_READ_PATH="${NEWS_REFINE_CACHE_READ_PATH:-}"  # optional existing refined cache file(s) to preload
-NEWS_STRUCTURED_CACHE_READ_PATH="${NEWS_STRUCTURED_CACHE_READ_PATH:-}"  # optional existing structured cache file(s) to preload
-NEWS_REFINE_PREWARM="${NEWS_REFINE_PREWARM:-1}"
+
+NEWS_DOC_CACHE_PATH="${NEWS_DOC_CACHE_PATH:-}"  # optional unified cache file to reuse directly
+# NEWS_DOC_CACHE_PATH="checkpoints/_shared_refine_cache/news_doc_cache_news_2024_2025.json"
+
 NEWS_REFINE_PREWARM_MAX_BATCHES="${NEWS_REFINE_PREWARM_MAX_BATCHES:--1}"
 NEWS_REFINE_SHOW_PROGRESS="${NEWS_REFINE_SHOW_PROGRESS:-1}"
-NEWS_STRUCTURED_PREWARM="${NEWS_STRUCTURED_PREWARM:-1}"
 NEWS_STRUCTURED_SHOW_PROGRESS="${NEWS_STRUCTURED_SHOW_PROGRESS:-1}"
-DELTA_INCLUDE_STRUCTURED_NEWS="${DELTA_INCLUDE_STRUCTURED_NEWS:-1}"  # 1 to append structured fields
-DELTA_STRUCTURED_ENABLE="${DELTA_STRUCTURED_ENABLE:-1}"
+DELTA_INCLUDE_STRUCTURED_NEWS="${DELTA_INCLUDE_STRUCTURED_NEWS:-0}"  # prompt path is disabled in DELTA; keep structured text off in stable runs
+DELTA_STRUCTURED_ENABLE="${DELTA_STRUCTURED_ENABLE:-1}"  # allow DELTA to consume structured event features directly
 DELTA_STRUCTURED_FEATURE_DIM="${DELTA_STRUCTURED_FEATURE_DIM:-12}"
 
 DELTA_MODEL_VARIANT="${DELTA_MODEL_VARIANT:-tiny_news_ts}"
+DELTA_TEXT_FUSE_LAMBDA="${DELTA_TEXT_FUSE_LAMBDA:-0.0}"
 TINY_NEWS_PRESET="${TINY_NEWS_PRESET:-distilbert}"  # distilbert | gpt2 | bert_base | roberta_base | deberta_v3_base | custom
 TINY_NEWS_LOADER="${TINY_NEWS_LOADER:-auto}"        # auto | encoder | causal_lm
 TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-}"
@@ -173,16 +214,19 @@ TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-}"
 TINY_NEWS_HIDDEN_SIZE="${TINY_NEWS_HIDDEN_SIZE:-256}"
 TINY_NEWS_TEXT_TRAINABLE="${TINY_NEWS_TEXT_TRAINABLE:-0}"
 DELTA_TEXT_DIRECT_ENABLE="${DELTA_TEXT_DIRECT_ENABLE:-1}"
-DELTA_TEXT_FUSE_LAMBDA="${DELTA_TEXT_FUSE_LAMBDA:-12}"
 DELTA_TEXT_GATE_INIT_BIAS="${DELTA_TEXT_GATE_INIT_BIAS:--2.0}"
 DELTA_TEXT_CLIP="${DELTA_TEXT_CLIP:-1.5}"
 DELTA_TEXT_MAX_LEN="${DELTA_TEXT_MAX_LEN:-160}"
-DELTA_DOC_DIRECT_ENABLE="${DELTA_DOC_DIRECT_ENABLE:-1}"
-DELTA_DOC_FUSE_LAMBDA="${DELTA_DOC_FUSE_LAMBDA:-4.0}"
+
+# Keep the article-level refined-news branch off in the stable baseline.
+DELTA_DOC_DIRECT_ENABLE="${DELTA_DOC_DIRECT_ENABLE:-0}"
+DELTA_DOC_FUSE_LAMBDA="${DELTA_DOC_FUSE_LAMBDA:-0.0}"
 DELTA_DOC_GATE_INIT_BIAS="${DELTA_DOC_GATE_INIT_BIAS:--2.0}"
 DELTA_DOC_CLIP="${DELTA_DOC_CLIP:-1.0}"
 DELTA_DOC_MAX_LEN="${DELTA_DOC_MAX_LEN:-96}"
 DELTA_DOC_MAX_DOCS="${DELTA_DOC_MAX_DOCS:-4}"
+
+
 
 case "$TINY_NEWS_PRESET" in
   distilbert)
@@ -217,15 +261,15 @@ case "$TINY_NEWS_PRESET" in
     ;;
 esac
 
-DELTA_CF_LAMBDA="0.001"
+DELTA_CF_LAMBDA="0.0"
 DELTA_CF_MARGIN="0.05"
-DELTA_GATE_REG_LAMBDA="0.001"
-DELTA_NULL_LAMBDA="0.001"
-DELTA_RESIDUAL_MODE="${DELTA_RESIDUAL_MODE:-relative}"     # additive | relative
-DELTA_RELATIVE_DENOM_FLOOR="${DELTA_RELATIVE_DENOM_FLOOR:-20}"
+DELTA_GATE_REG_LAMBDA="0.0"
+DELTA_NULL_LAMBDA="0.0"
+DELTA_RESIDUAL_MODE="${DELTA_RESIDUAL_MODE:-additive}"     # additive | relative
+DELTA_RELATIVE_DENOM_FLOOR="${DELTA_RELATIVE_DENOM_FLOOR:-0.0}"
 DELTA_RELATIVE_RATIO_CLIP="${DELTA_RELATIVE_RATIO_CLIP:-0.5}"
 DELTA_HEAD_LR_SCALE="1.0"
-DELTA_AUX_LAMBDA="0.05"
+DELTA_AUX_LAMBDA="0.0"
 DELTA_WARMUP_EPOCHS="${DELTA_WARMUP_EPOCHS:-2}"
 DELTA_CURRICULUM_EPOCHS="${DELTA_CURRICULUM_EPOCHS:-6}"
 DELTA_NULL_WARMUP_STEPS="${DELTA_NULL_WARMUP_STEPS:-1200}"
@@ -233,14 +277,16 @@ DELTA_NULL_RAMP_STEPS="${DELTA_NULL_RAMP_STEPS:-1200}"
 # =======================
 # 2) Sweep spaces (same style as your original)
 # =======================
+TASK_NAME_BASE="${TASK_NAME_BASE:-[2024-nswelecPRICE-tinynews]}"
+TASK_NAME_SUFFIX="${TASK_NAME_SUFFIX:-}"
 TASK_NAMES=(
-  "[2024-nswelecPrice-tinynews]"
+  "${TASK_NAME_BASE}${TASK_NAME_SUFFIX}"
 )
 
 NEWS_CHOICES=(
   # "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
   # "dataset/FNT_2019_2020_combined.json"
-  "dataset/news_2024_2025.json"
+  "dataset/news_2024_2025_elecprice.json"
   # "dataset/empty.json"
 )
 
@@ -280,6 +326,44 @@ COMMON_ARGS=(
   --delta_gate_reg_lambda "$DELTA_GATE_REG_LAMBDA"
   --news_gate_enable "$FINAL_GATE_ENABLE"
   --disable_all_gates "$DISABLE_ALL_GATES"
+  --delta_gate_init_bias "$DELTA_GATE_INIT_BIAS"
+  --delta_internal_gate_in_model "$DELTA_INTERNAL_GATE_IN_MODEL"
+  --delta_freeze_feature_modules "$DELTA_FREEZE_FEATURE_MODULES"
+  --delta_non_degrade_lambda "$DELTA_NON_DEGRADE_LAMBDA"
+  --delta_non_degrade_margin "$DELTA_NON_DEGRADE_MARGIN"
+  --delta_sign_lambda "$DELTA_SIGN_LAMBDA"
+  --delta_sign_margin "$DELTA_SIGN_MARGIN"
+  --delta_sign_eps "$DELTA_SIGN_EPS"
+  --delta_gate_eps "$DELTA_GATE_EPS"
+  --delta_sign_tau "$DELTA_SIGN_TAU"
+  --delta_sign_mode "$DELTA_SIGN_MODE"
+  --delta_sign_external_epochs "$DELTA_SIGN_EXTERNAL_EPOCHS"
+  --delta_sign_external_hidden "$DELTA_SIGN_EXTERNAL_HIDDEN"
+  --delta_sign_external_dropout "$DELTA_SIGN_EXTERNAL_DROPOUT"
+  --delta_sign_external_lr "$DELTA_SIGN_EXTERNAL_LR"
+  --delta_sign_external_weight_decay "$DELTA_SIGN_EXTERNAL_WEIGHT_DECAY"
+  --delta_sign_external_grad_clip "$DELTA_SIGN_EXTERNAL_GRAD_CLIP"
+  --delta_sign_external_patience "$DELTA_SIGN_EXTERNAL_PATIENCE"
+  --delta_sign_external_select_metric "$DELTA_SIGN_EXTERNAL_SELECT_METRIC"
+  --delta_sign_external_min_delta "$DELTA_SIGN_EXTERNAL_MIN_DELTA"
+  --delta_sign_external_lr_factor "$DELTA_SIGN_EXTERNAL_LR_FACTOR"
+  --delta_sign_external_lr_patience "$DELTA_SIGN_EXTERNAL_LR_PATIENCE"
+  --delta_sign_external_min_lr "$DELTA_SIGN_EXTERNAL_MIN_LR"
+  --delta_sign_external_calibrate_bias "$DELTA_SIGN_EXTERNAL_CALIBRATE_BIAS"
+  --delta_sign_external_bias_clip "$DELTA_SIGN_EXTERNAL_BIAS_CLIP"
+  --delta_sign_external_news_dropout "$DELTA_SIGN_EXTERNAL_NEWS_DROPOUT"
+  --delta_sign_external_use_news_weighting "$DELTA_SIGN_EXTERNAL_USE_NEWS_WEIGHTING"
+  --delta_sign_external_use_residual_weighting "$DELTA_SIGN_EXTERNAL_USE_RESIDUAL_WEIGHTING"
+  --delta_sign_external_use_pos_weight "$DELTA_SIGN_EXTERNAL_USE_POS_WEIGHT"
+  --delta_sign_external_pos_weight_floor "$DELTA_SIGN_EXTERNAL_POS_WEIGHT_FLOOR"
+  --delta_sign_external_pos_weight_clip "$DELTA_SIGN_EXTERNAL_POS_WEIGHT_CLIP"
+  --delta_sign_external_tau "$DELTA_SIGN_EXTERNAL_TAU"
+  --delta_gate_loss_weight "$DELTA_GATE_LOSS_WEIGHT"
+  --delta_sign_loss_weight "$DELTA_SIGN_LOSS_WEIGHT"
+  --delta_mag_loss_weight "$DELTA_MAG_LOSS_WEIGHT"
+  --delta_mag_target "$DELTA_MAG_TARGET"
+  --delta_mag_max "$DELTA_MAG_MAX"
+  --delta_residual_weight_scale "$DELTA_RESIDUAL_WEIGHT_SCALE"
   --rel_supervise_lambda "$REL_SUPERVISE_LAMBDA"
   --gate_null_lambda "$GATE_NULL_LAMBDA"
   --cf_pseudo_margin "$CF_PSEUDO_MARGIN"
@@ -328,15 +412,8 @@ COMMON_ARGS=(
   --utility_show_in_prompt "$UTILITY_SHOW_IN_PROMPT"
   --news_refine_mode "$NEWS_REFINE_MODE"
   --news_refine_cache_enable "$NEWS_REFINE_CACHE_ENABLE"
-  --news_refine_cache_path "$NEWS_REFINE_CACHE_PATH"
-  --news_refine_cache_read_path "$NEWS_REFINE_CACHE_READ_PATH"
   --news_structured_cache_enable "$NEWS_STRUCTURED_CACHE_ENABLE"
-  --news_structured_cache_path "$NEWS_STRUCTURED_CACHE_PATH"
-  --news_structured_cache_read_path "$NEWS_STRUCTURED_CACHE_READ_PATH"
-  --news_refine_prewarm "$NEWS_REFINE_PREWARM"
-  --news_refine_prewarm_max_batches "$NEWS_REFINE_PREWARM_MAX_BATCHES"
   --news_refine_show_progress "$NEWS_REFINE_SHOW_PROGRESS"
-  --news_structured_prewarm "$NEWS_STRUCTURED_PREWARM"
   --news_structured_show_progress "$NEWS_STRUCTURED_SHOW_PROGRESS"
   --news_api_model "$NEWS_API_MODEL"
   --news_api_key_path "$NEWS_API_KEY_PATH"
@@ -371,6 +448,78 @@ COMMON_ARGS=(
   --delta_clip "$DELTA_CLIP"
 )
 
+normalize_cache_stem() {
+  local raw="$1"
+  local stem
+  stem="$(basename "$raw")"
+  stem="${stem%.*}"
+  stem="$(printf '%s' "$stem" | sed -E 's/[^0-9A-Za-z]+/_/g; s/^_+//; s/_+$//' | tr '[:upper:]' '[:lower:]')"
+  if [[ -z "$stem" ]]; then
+    stem="news"
+  fi
+  printf '%s\n' "$stem"
+}
+
+resolve_news_doc_cache_write_path() {
+  local news_path="$1"
+  if [[ -n "$NEWS_DOC_CACHE_PATH" ]]; then
+    printf '%s\n' "$NEWS_DOC_CACHE_PATH"
+    return
+  fi
+  local stem
+  stem="$(normalize_cache_stem "$news_path")"
+  printf 'checkpoints/_shared_refine_cache/news_doc_cache_%s.json\n' "$stem"
+}
+
+prepare_news_cache_mode() {
+  local news_path="$1"
+  local stem doc_cache_path legacy_refine_path legacy_structured_path
+  stem="$(normalize_cache_stem "$news_path")"
+  doc_cache_path="$(resolve_news_doc_cache_write_path "$news_path")"
+  legacy_refine_path="checkpoints/_shared_refine_cache/refine_news_cache_${stem}.json"
+  legacy_structured_path="checkpoints/_shared_refine_cache/structured_news_cache_${stem}.json"
+
+  CURRENT_NEWS_DOC_CACHE_PATH="$doc_cache_path"
+  CURRENT_NEWS_REFINE_CACHE_READ_PATH=""
+  CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH=""
+  CURRENT_NEWS_REFINE_PREWARM=1
+  CURRENT_NEWS_STRUCTURED_PREWARM=1
+
+  if [[ -n "$NEWS_DOC_CACHE_PATH" ]]; then
+    CURRENT_NEWS_REFINE_CACHE_READ_PATH="$doc_cache_path"
+    CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH="$doc_cache_path"
+    CURRENT_NEWS_REFINE_PREWARM=0
+    CURRENT_NEWS_STRUCTURED_PREWARM=0
+    echo "[NEWS_CACHE] mode=read cache_path=$doc_cache_path source=explicit"
+    if [[ ! -f "$doc_cache_path" ]]; then
+      echo "[NEWS_CACHE] cache_path_missing=$doc_cache_path (run will populate it on demand)"
+    fi
+    return
+  fi
+
+  if [[ -f "$doc_cache_path" ]]; then
+    CURRENT_NEWS_REFINE_CACHE_READ_PATH="$doc_cache_path"
+    CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH="$doc_cache_path"
+    CURRENT_NEWS_REFINE_PREWARM=0
+    CURRENT_NEWS_STRUCTURED_PREWARM=0
+    echo "[NEWS_CACHE] mode=read cache_path=$doc_cache_path source=auto_discovered"
+    return
+  fi
+
+  mkdir -p "$(dirname "$doc_cache_path")"
+  if [[ -f "$legacy_refine_path" ]]; then
+    rm -f "$legacy_refine_path"
+  fi
+  if [[ -f "$legacy_structured_path" ]]; then
+    rm -f "$legacy_structured_path"
+  fi
+
+  echo "[NEWS_CACHE] mode=rebuild news_path=$news_path"
+  echo "[NEWS_CACHE] target_doc_cache=$doc_cache_path"
+  echo "[NEWS_CACHE] cleared legacy_refine_cache=$legacy_refine_path"
+  echo "[NEWS_CACHE] cleared legacy_structured_cache=$legacy_structured_path"
+}
+
 # =======================
 # 4) Run combinations
 # =======================
@@ -387,8 +536,16 @@ for i in "${!TASK_NAMES[@]}"; do
             for grad_acc in "${GRAD_ACCS[@]}"; do
               for horizon in "${HORIZONS[@]}"; do
                 run_task="${task}_${base_backbone}_h${horizon}"
+                prepare_news_cache_mode "${NEWS_CHOICES[$j]}"
                 args=( --taskName "$run_task" "${COMMON_ARGS[@]}" )
 
+                args+=( --news_refine_cache_path "$CURRENT_NEWS_DOC_CACHE_PATH" )
+                args+=( --news_refine_cache_read_path "$CURRENT_NEWS_REFINE_CACHE_READ_PATH" )
+                args+=( --news_structured_cache_path "$CURRENT_NEWS_DOC_CACHE_PATH" )
+                args+=( --news_structured_cache_read_path "$CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH" )
+                args+=( --news_refine_prewarm "$CURRENT_NEWS_REFINE_PREWARM" )
+                args+=( --news_refine_prewarm_max_batches "$NEWS_REFINE_PREWARM_MAX_BATCHES" )
+                args+=( --news_structured_prewarm "$CURRENT_NEWS_STRUCTURED_PREWARM" )
                 args+=( --news_path "${NEWS_CHOICES[$j]}" )
                 if [[ -n "$tpool" ]]; then
                   args+=( --template_pool "$tpool" )
