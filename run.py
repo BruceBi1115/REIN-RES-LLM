@@ -70,6 +70,13 @@ if __name__ == '__main__':
                         help='upper bound for dynamic pos_weight in external signnet BCE')
     parser.add_argument('--delta_sign_external_tau', type=float, default=1.0,
                         help='temperature for mapping external signnet logits to soft sign via tanh')
+    parser.add_argument('--delta_sign_external_variant', type=str, default='mlp',
+                        choices=['mlp', 'dual_stream_tcn'],
+                        help='external signnet architecture: legacy mlp or dual-stream temporal-text TCN')
+    parser.add_argument('--delta_sign_external_text_dim', type=int, default=64,
+                        help='compressed text feature width for dual_stream_tcn signnet branch')
+    parser.add_argument('--delta_sign_external_text_max_len', type=int, default=64,
+                        help='max token length per aligned history-step refined news text for dual_stream_tcn signnet')
     parser.add_argument('--delta_gate_loss_weight', type=float, default=0.2,
                         help='weight for BCE supervision on factorized residual gate logits')
     parser.add_argument('--delta_sign_loss_weight', type=float, default=0.1,
@@ -313,7 +320,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42, help='random seed')
 
     # ===== Data & Instruction =====
-    parser.add_argument('--dayFirst', action="store_true", default=False, help='Are your datasets in "day-first" format?')
+    parser.add_argument('--dayFirst', action="store_true", default=True, help='Are your datasets in "day-first" format?')
     parser.add_argument('--train_file', type=str, default='', help='train set path (CSV/Parquet)')
     parser.add_argument('--val_file', type=str, default='', help='validation set path')
     parser.add_argument('--test_file', type=str, default='', help='test set path')

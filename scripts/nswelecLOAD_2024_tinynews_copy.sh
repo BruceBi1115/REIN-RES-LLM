@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 set -euo pipefail
 
 # =======================
@@ -61,24 +61,24 @@ fi
 echo "[env] Using PYTHON_BIN=$PYTHON_BIN"
 
 TIME_COL="date"
-VALUE_COL="RRP"
-UNIT=""
-DESCRIPTION="This dataset records the electricity price data in Australia NSW from 2024, collected from National electricity market."
+VALUE_COL="TOTALDEMAND"
+UNIT="MW"
+DESCRIPTION="This dataset records the electricity load demand data in Australia NSW from 2024, collected from National electricity market."
 REGION="Australia, NSW"
 
-TRAIN_FILE="dataset/2024NSWelecPRICE/2024NSWelecPRICE_trainset.csv"
-VAL_FILE="dataset/2024NSWelecPRICE/2024NSWelecPRICE_valset.csv"
-TEST_FILE="dataset/2024NSWelecPRICE/2024NSWelecPRICE_testset.csv"
+TRAIN_FILE="dataset/2024NSWelecLOAD/2024NSWelecLOAD_trainset.csv"
+VAL_FILE="dataset/2024NSWelecLOAD/2024NSWelecLOAD_valset.csv"
+TEST_FILE="dataset/2024NSWelecLOAD/2024NSWelecLOAD_testset.csv"
 
 NEWS_TEXT_COL="content"
 NEWS_TIME_COL="date"
 
-DELTA_EPOCHS="100"
-BASE_EPOCHS="40"
+DELTA_EPOCHS="${DELTA_EPOCHS:-100}"
+BASE_EPOCHS="${BASE_EPOCHS:-40}"
 # NEWS_WINDOW_DAYS="7"
 NEWS_TOPM="999"
 NEWS_TOPK="999"
-BATCH_SIZE="1"
+BATCH_SIZE="${BATCH_SIZE:-1}"
 GPU_ID="${GPU_ID:-0}"
 DEFAULT_POLICY="all"
 
@@ -87,14 +87,14 @@ TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 # Keep task settings aligned with your existing NSW scripts.
 RESIDUAL_LOSS="smooth_l1"
 SELECT_METRIC="mae"
-STRIDE="48"
-STAGE="all"
+STRIDE="${STRIDE:-1}"
+STAGE="${STAGE:-all}"
 HORIZONS=(
   "48"
-  # "96"
-  # "192"
-  # "336"
-  # "720"
+  "96"
+  "192"
+  "336"
+  "720"
 )
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
@@ -158,7 +158,7 @@ CF_PSEUDO_HARD="${CF_PSEUDO_HARD:-0}"
 # pure TS base backbone (scheme2)
 BASE_BACKBONES=(
   "mlp"
-  # "mlp"
+  # "dlinear"
 )
 BASE_HIDDEN_DIM="256"
 BASE_MOVING_AVG="25"
@@ -199,8 +199,7 @@ NEWS_REFINE_CACHE_ENABLE="${NEWS_REFINE_CACHE_ENABLE:-1}"
 NEWS_STRUCTURED_CACHE_ENABLE="${NEWS_STRUCTURED_CACHE_ENABLE:-1}"
 
 NEWS_DOC_CACHE_PATH="${NEWS_DOC_CACHE_PATH:-}"  # optional unified cache file to reuse directly
-# NEWS_DOC_CACHE_PATH="checkpoints/_shared_refine_cache/news_doc_cache_news_2024_2025.json"
-NEWS_DOC_CACHE_PATH="checkpoints/_shared_refine_cache/news_doc_cache_news_2024_2025_elecprice.json"
+NEWS_DOC_CACHE_PATH="checkpoints/_shared_refine_cache/news_doc_cache_news_2024_2025.json"
 
 NEWS_REFINE_PREWARM_MAX_BATCHES="${NEWS_REFINE_PREWARM_MAX_BATCHES:--1}"
 NEWS_REFINE_SHOW_PROGRESS="${NEWS_REFINE_SHOW_PROGRESS:-1}"
@@ -281,7 +280,7 @@ DELTA_NULL_RAMP_STEPS="${DELTA_NULL_RAMP_STEPS:-1200}"
 # =======================
 # 2) Sweep spaces (same style as your original)
 # =======================
-TASK_NAME_BASE="${TASK_NAME_BASE:-[2024-nswelecPRICE-tinynews]}"
+TASK_NAME_BASE="${TASK_NAME_BASE:-[2024-nswelecLOAD-tinynews—2]}"
 TASK_NAME_SUFFIX="${TASK_NAME_SUFFIX:-}"
 TASK_NAMES=(
   "${TASK_NAME_BASE}${TASK_NAME_SUFFIX}"
@@ -290,7 +289,7 @@ TASK_NAMES=(
 NEWS_CHOICES=(
   # "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
   # "dataset/FNT_2019_2020_combined.json"
-  "dataset/news_2024_2025_elecprice.json"
+  "dataset/news_2024_2025.json"
   # "dataset/empty.json"
 )
 

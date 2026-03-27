@@ -33,7 +33,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from transformers import get_cosine_schedule_with_warmup
+from transformers import AutoModel, get_cosine_schedule_with_warmup
 
 from src.data_construction.DataStatistic import DataStatistic
 from .data_construction.data import make_loader
@@ -46,7 +46,7 @@ from .news_rules import (
 from .data_construction.prompt import load_templates, build_prompt
 from .utils.logger import setup_live_logger
 
-from .model2 import build_delta_model, load_checkpoint, save_checkpoint
+from .model2 import _resolve_text_spec, build_delta_model, load_checkpoint, save_checkpoint
 from .base_backbone import (
     build_base_backbone,
     save_base_backbone_checkpoint,
@@ -784,27 +784,90 @@ def _refine_news_docs_from_doc_cache(
     args,
     api_adapter=None,
 ) -> list[str]:
-    items = [str(x).strip() for x in raw_news_texts if str(x).strip()]
+    aligned = _refine_news_docs_aligned_from_doc_cache(
+        raw_news_texts=raw_news_texts,
+        tokenizer=tokenizer,
+        max_tokens=max_tokens,
+        args=args,
+        api_adapter=api_adapter,
+    )
+    snippets = []
+    seen = set()
+    for refined_item in aligned:
+        clean = str(refined_item or "").strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        snippets.append(clean)
+    return snippets
+
+
+def _refine_news_docs_aligned_from_doc_cache(
+    *,
+    raw_news_texts: list[str],
+    tokenizer,
+    max_tokens: int,
+    args,
+    api_adapter=None,
+) -> list[str]:
+    items = [str(x or "").strip() for x in raw_news_texts]
     if len(items) == 0:
         return []
 
-    snippets = []
-    seen = set()
+    aligned = []
+    local_cache = {}
     for item in items:
-        refined_item = _refine_one_news_doc(
-            raw_news_text=item,
-            tokenizer=tokenizer,
-            max_tokens=max_tokens,
-            args=args,
-            api_adapter=api_adapter,
-        )
-        if not refined_item:
+        if not item:
+            aligned.append("")
             continue
-        if refined_item in seen:
+        if item not in local_cache:
+            local_cache[item] = _refine_one_news_doc(
+                raw_news_text=item,
+                tokenizer=tokenizer,
+                max_tokens=max_tokens,
+                args=args,
+                api_adapter=api_adapter,
+            )
+        aligned.append(str(local_cache[item] or "").strip())
+    return aligned
+
+
+def _align_refined_docs_to_history_steps(
+    *,
+    history_times: list[str],
+    news_times,
+    refined_news_docs: list[str],
+    tokenizer,
+    max_tokens: int,
+) -> list[str]:
+    L = len(history_times)
+    if L <= 0:
+        return [""]
+
+    hist_series = pd.Series(pd.to_datetime(history_times, errors="coerce"))
+    step_docs = [[] for _ in range(L)]
+    last_idx = L - 1
+
+    for raw_ts, doc_txt in zip(list(news_times), refined_news_docs):
+        txt = str(doc_txt or "").strip()
+        if not txt:
             continue
-        seen.add(refined_item)
-        snippets.append(refined_item)
-    return snippets
+        ts = _align_ts_to_ref_tz(raw_ts, hist_series)
+        idx = last_idx
+        if not pd.isna(ts):
+            idx = 0
+            for step_idx, step_ts in enumerate(hist_series.tolist()):
+                if pd.isna(step_ts):
+                    continue
+                if ts < step_ts:
+                    break
+                idx = step_idx
+        step_docs[int(max(0, min(last_idx, idx)))].append(txt)
+
+    return [
+        _merge_refined_news_docs(snippets, tokenizer=tokenizer, max_tokens=max_tokens) if len(snippets) > 0 else ""
+        for snippets in step_docs
+    ]
 
 
 def _init_refine_cache(args, live_logger=None):
@@ -1747,6 +1810,49 @@ def _normalize_signnet_select_metric(raw_metric) -> str:
     return "acc"
 
 
+def _normalize_external_signnet_variant(raw_variant) -> str:
+    variant = str(raw_variant or "mlp").lower().strip()
+    if variant != "dual_stream_tcn":
+        return "mlp"
+    return "dual_stream_tcn"
+
+
+def _use_external_signnet_temporal_text(args) -> bool:
+    return _normalize_external_signnet_variant(getattr(args, "delta_sign_external_variant", "mlp")) == "dual_stream_tcn"
+
+
+class _ResidualTCNBlock(nn.Module):
+    def __init__(self, channels: int, *, dilation: int, dropout: float):
+        super().__init__()
+        self.conv1 = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=int(dilation),
+            dilation=int(dilation),
+        )
+        self.conv2 = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=int(dilation),
+            dilation=int(dilation),
+        )
+        self.norm1 = nn.BatchNorm1d(channels)
+        self.norm2 = nn.BatchNorm1d(channels)
+        self.drop = nn.Dropout(float(max(0.0, dropout)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.conv1(x)
+        y = self.norm1(y)
+        y = F.gelu(y)
+        y = self.drop(y)
+        y = self.conv2(y)
+        y = self.norm2(y)
+        y = self.drop(y)
+        return F.gelu(x + y)
+
+
 class ResidualSignNet(nn.Module):
     """
     Independent sign classifier trained before DELTA.
@@ -1768,6 +1874,8 @@ class ResidualSignNet(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        self.model_variant = "mlp"
+        self.expects_temporal_text = False
         self.history_len = int(max(1, history_len))
         self.horizon = int(max(1, horizon))
         self.structured_dim = int(max(0, structured_dim))
@@ -1818,7 +1926,11 @@ class ResidualSignNet(nn.Module):
         base_pred_z: torch.Tensor,
         structured_feats: torch.Tensor | None,
         news_counts: torch.Tensor | None,
+        signnet_text_ids: torch.Tensor | None = None,
+        signnet_text_attn: torch.Tensor | None = None,
+        signnet_text_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del signnet_text_ids, signnet_text_attn, signnet_text_mask
         h_raw = history_raw.to(torch.float32)
         if h_raw.ndim != 2:
             h_raw = h_raw.reshape(h_raw.size(0), -1)
@@ -1865,6 +1977,267 @@ class ResidualSignNet(nn.Module):
         return self.out_head(fused)
 
 
+class DualStreamTCNSignNet(nn.Module):
+    """
+    Lightweight external sign classifier with:
+      - history raw-value TCN
+      - aligned refined-news text TCN
+      - base_pred_z MLP branch
+      - gated late fusion
+    """
+
+    def __init__(
+        self,
+        history_len: int,
+        horizon: int,
+        structured_dim: int,
+        text_encoder: nn.Module,
+        text_encoder_hidden_size: int,
+        hidden_size: int = 256,
+        text_low_dim: int = 64,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.model_variant = "dual_stream_tcn"
+        self.expects_temporal_text = True
+        self.history_len = int(max(1, history_len))
+        self.horizon = int(max(1, horizon))
+        self.structured_dim = int(max(0, structured_dim))
+        self.hidden_size = int(max(32, hidden_size))
+        self.text_low_dim = int(max(32, text_low_dim))
+        self.text_encoder_hidden_size = int(max(1, text_encoder_hidden_size))
+        self.text_encoder = text_encoder
+        for p in self.text_encoder.parameters():
+            p.requires_grad = False
+
+        drop = float(max(0.0, dropout))
+        tcn_width = self.hidden_size
+
+        self.hist_norm = nn.LayerNorm(self.history_len)
+        self.hist_diff_norm = nn.LayerNorm(self.history_len)
+        self.hist_in = nn.Conv1d(2, tcn_width, kernel_size=1)
+        self.hist_tcn = nn.ModuleList(
+            [_ResidualTCNBlock(tcn_width, dilation=d, dropout=drop) for d in (1, 2, 4)]
+        )
+        self.hist_out = nn.Sequential(
+            nn.Linear(tcn_width, self.hidden_size),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.LayerNorm(self.hidden_size),
+        )
+
+        self.text_step_proj = nn.Sequential(
+            nn.Linear(self.text_encoder_hidden_size, self.text_low_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.text_low_dim),
+        )
+        self.text_in = nn.Conv1d(self.text_low_dim, tcn_width, kernel_size=1)
+        self.text_tcn = nn.ModuleList(
+            [_ResidualTCNBlock(tcn_width, dilation=d, dropout=drop) for d in (1, 2, 4)]
+        )
+        self.text_out = nn.Sequential(
+            nn.Linear(tcn_width, self.hidden_size),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.LayerNorm(self.hidden_size),
+        )
+
+        self.base_proj = nn.Sequential(
+            nn.Linear(self.horizon, self.hidden_size),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.LayerNorm(self.hidden_size),
+        )
+        if self.structured_dim > 0:
+            self.structured_proj = nn.Sequential(
+                nn.Linear(self.structured_dim, self.hidden_size),
+                nn.GELU(),
+                nn.Dropout(drop),
+                nn.LayerNorm(self.hidden_size),
+            )
+        else:
+            self.structured_proj = None
+        self.news_count_proj = nn.Sequential(
+            nn.Linear(1, self.hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(drop),
+        )
+
+        numeric_in = self.hidden_size * 2 + (self.hidden_size if self.structured_proj is not None else 0) + self.hidden_size // 2
+        self.numeric_fuse = nn.Sequential(
+            nn.Linear(numeric_in, self.hidden_size),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.LayerNorm(self.hidden_size),
+        )
+        self.text_aux = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.LayerNorm(self.hidden_size),
+        )
+        self.text_gate = nn.Sequential(
+            nn.Linear(self.hidden_size * 2 + 1, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.Sigmoid(),
+        )
+        self.out_ln = nn.LayerNorm(self.hidden_size)
+        self.out_drop = nn.Dropout(drop)
+        self.out_head = nn.Linear(self.hidden_size, self.horizon)
+        self.register_buffer("decision_bias", torch.zeros((), dtype=torch.float32))
+
+    def _run_text_encoder(self, ids: torch.Tensor, attn: torch.Tensor) -> torch.Tensor | None:
+        if self.text_encoder is None:
+            return None
+        was_training = bool(self.text_encoder.training)
+        self.text_encoder.eval()
+        with torch.no_grad():
+            enc = self.text_encoder(input_ids=ids, attention_mask=attn)
+        if was_training:
+            self.text_encoder.train()
+        hidden = getattr(enc, "last_hidden_state", None)
+        if hidden is None and isinstance(enc, (tuple, list)) and len(enc) > 0:
+            hidden = enc[0]
+        return hidden
+
+    def _pool_temporal_features(self, seq_feat: torch.Tensor, valid_mask: torch.Tensor | None) -> torch.Tensor:
+        if valid_mask is None:
+            pooled = seq_feat.mean(dim=-1)
+        else:
+            weights = valid_mask.to(device=seq_feat.device, dtype=seq_feat.dtype).unsqueeze(1)
+            denom = weights.sum(dim=-1).clamp_min(1.0)
+            pooled = (seq_feat * weights).sum(dim=-1) / denom
+        return pooled
+
+    def _encode_history(self, history_raw: torch.Tensor) -> torch.Tensor:
+        h_raw = history_raw.to(torch.float32)
+        if h_raw.ndim != 2:
+            h_raw = h_raw.reshape(h_raw.size(0), -1)
+        if h_raw.size(1) < self.history_len:
+            pad = h_raw.new_zeros(h_raw.size(0), self.history_len - h_raw.size(1))
+            h_raw = torch.cat([pad, h_raw], dim=1)
+        elif h_raw.size(1) > self.history_len:
+            h_raw = h_raw[:, -self.history_len :]
+
+        h_diff = torch.diff(h_raw, dim=1, prepend=h_raw[:, :1])
+        hist_seq = torch.stack([self.hist_norm(h_raw), self.hist_diff_norm(h_diff)], dim=1)
+        hist_feat = self.hist_in(hist_seq)
+        for block in self.hist_tcn:
+            hist_feat = block(hist_feat)
+        return self.hist_out(self._pool_temporal_features(hist_feat, valid_mask=None))
+
+    def _encode_text_sequence(
+        self,
+        signnet_text_ids: torch.Tensor | None,
+        signnet_text_attn: torch.Tensor | None,
+        signnet_text_mask: torch.Tensor | None,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        zeros = torch.zeros(batch_size, self.hidden_size, device=device, dtype=dtype)
+        valid = torch.zeros(batch_size, 1, device=device, dtype=dtype)
+        if (
+            signnet_text_ids is None
+            or signnet_text_attn is None
+            or signnet_text_ids.ndim != 3
+            or signnet_text_attn.ndim != 3
+            or signnet_text_ids.size(0) != batch_size
+        ):
+            return zeros, valid
+
+        ids = signnet_text_ids.to(device=device, dtype=torch.long)
+        attn = signnet_text_attn.to(device=device, dtype=torch.long)
+        B, L, T = ids.shape
+        flat_ids = ids.reshape(B * L, T)
+        flat_attn = attn.reshape(B * L, T)
+        hidden = self._run_text_encoder(flat_ids, flat_attn)
+        if hidden is None:
+            return zeros, valid
+
+        hidden = hidden.to(device=device, dtype=dtype)
+        tok_mask = flat_attn.to(device=device, dtype=dtype).unsqueeze(-1)
+        flat_valid = (tok_mask.sum(dim=1) > 0).to(dtype=dtype)
+        if float(flat_valid.sum().item()) <= 0.0:
+            return zeros, valid
+
+        denom = tok_mask.sum(dim=1).clamp_min(1.0)
+        pooled = (hidden * tok_mask).sum(dim=1) / denom
+        step_feat = self.text_step_proj(pooled).reshape(B, L, self.text_low_dim)
+        if signnet_text_mask is not None and signnet_text_mask.ndim == 2:
+            step_valid = signnet_text_mask.to(device=device, dtype=dtype).unsqueeze(-1)
+        else:
+            step_valid = flat_valid.reshape(B, L, 1)
+        step_feat = step_feat * step_valid
+        text_seq = self.text_in(step_feat.transpose(1, 2))
+        for block in self.text_tcn:
+            text_seq = block(text_seq)
+        pooled_text = self._pool_temporal_features(text_seq, valid_mask=step_valid.squeeze(-1))
+        valid = (step_valid.sum(dim=1) > 0).to(dtype=dtype)
+        return self.text_out(pooled_text) * valid, valid
+
+    def forward(
+        self,
+        history_raw: torch.Tensor,
+        base_pred_z: torch.Tensor,
+        structured_feats: torch.Tensor | None,
+        news_counts: torch.Tensor | None,
+        signnet_text_ids: torch.Tensor | None = None,
+        signnet_text_attn: torch.Tensor | None = None,
+        signnet_text_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hist_feat = self._encode_history(history_raw)
+
+        base = base_pred_z.to(torch.float32)
+        if base.ndim != 2:
+            base = base.reshape(base.size(0), -1)
+        if base.size(1) < self.horizon:
+            pad = base.new_zeros(base.size(0), self.horizon - base.size(1))
+            base = torch.cat([base, pad], dim=1)
+        elif base.size(1) > self.horizon:
+            base = base[:, : self.horizon]
+        base_feat = self.base_proj(base)
+
+        parts = [hist_feat, base_feat]
+        if self.structured_proj is not None:
+            sf = structured_feats
+            if sf is None:
+                sf = hist_feat.new_zeros(hist_feat.size(0), self.structured_dim)
+            sf = sf.to(torch.float32)
+            if sf.ndim != 2:
+                sf = sf.reshape(sf.size(0), -1)
+            if sf.size(1) < self.structured_dim:
+                pad = sf.new_zeros(sf.size(0), self.structured_dim - sf.size(1))
+                sf = torch.cat([sf, pad], dim=1)
+            elif sf.size(1) > self.structured_dim:
+                sf = sf[:, : self.structured_dim]
+            parts.append(self.structured_proj(sf))
+
+        nc = news_counts
+        if nc is None:
+            nc = hist_feat.new_zeros(hist_feat.size(0))
+        nc = nc.to(torch.float32).reshape(-1, 1)
+        parts.append(self.news_count_proj(nc))
+
+        fused = self.numeric_fuse(torch.cat(parts, dim=-1))
+        text_feat, text_valid = self._encode_text_sequence(
+            signnet_text_ids=signnet_text_ids,
+            signnet_text_attn=signnet_text_attn,
+            signnet_text_mask=signnet_text_mask,
+            dtype=fused.dtype,
+            device=fused.device,
+            batch_size=fused.size(0),
+        )
+        if float(text_valid.sum().item()) > 0.0:
+            text_gate = self.text_gate(torch.cat([fused, text_feat, nc], dim=-1))
+            fused = fused + text_gate * self.text_aux(text_feat) * text_valid
+
+        fused = self.out_ln(fused)
+        return self.out_head(self.out_drop(fused))
+
+
 def _history_raw_tensor_from_batch(batch, args, device) -> torch.Tensor:
     L = int(max(1, getattr(args, "history_len", 1)))
     B = len(batch["history_value"])
@@ -1886,18 +2259,24 @@ def _history_raw_tensor_from_batch(batch, args, device) -> torch.Tensor:
 
 
 def _run_external_signnet(
-    signnet_model: ResidualSignNet,
+    signnet_model: nn.Module,
     history_raw: torch.Tensor,
     base_pred_z: torch.Tensor,
     structured_feats: torch.Tensor,
     news_counts: torch.Tensor,
     tau: float,
+    signnet_text_ids: torch.Tensor | None = None,
+    signnet_text_attn: torch.Tensor | None = None,
+    signnet_text_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     logits = signnet_model(
         history_raw=history_raw,
         base_pred_z=base_pred_z.to(torch.float32),
         structured_feats=structured_feats.to(torch.float32),
         news_counts=news_counts.to(torch.float32),
+        signnet_text_ids=signnet_text_ids,
+        signnet_text_attn=signnet_text_attn,
+        signnet_text_mask=signnet_text_mask,
     ).to(torch.float32)
     bias = getattr(signnet_model, "decision_bias", None)
     if torch.is_tensor(bias):
@@ -1930,7 +2309,7 @@ def _compose_delta_with_external_sign(
 @torch.no_grad()
 def _evaluate_external_signnet(
     *,
-    signnet_model: ResidualSignNet,
+    signnet_model: nn.Module,
     base_backbone,
     tokenizer,
     data_loader,
@@ -1995,6 +2374,9 @@ def _evaluate_external_signnet(
         targets_z = delta_inputs["targets_z"].to(device=device, dtype=torch.float32)
         structured_feats = delta_inputs["structured_feats"].to(device=device, dtype=torch.float32)
         news_counts = delta_inputs["news_counts"].to(device=device, dtype=torch.float32)
+        signnet_text_ids = delta_inputs["signnet_text_ids"].to(device=device, dtype=torch.long)
+        signnet_text_attn = delta_inputs["signnet_text_attn"].to(device=device, dtype=torch.long)
+        signnet_text_mask = delta_inputs["signnet_text_mask"].to(device=device, dtype=torch.float32)
         history_raw = _history_raw_tensor_from_batch(batch, args, device=device)
         sign_logits, _ = _run_external_signnet(
             signnet_model=signnet_model,
@@ -2003,6 +2385,9 @@ def _evaluate_external_signnet(
             structured_feats=structured_feats,
             news_counts=news_counts,
             tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
+            signnet_text_ids=signnet_text_ids,
+            signnet_text_attn=signnet_text_attn,
+            signnet_text_mask=signnet_text_mask,
         )
 
         true_residual_z = targets_z - base_pred
@@ -2158,7 +2543,7 @@ def _train_external_signnet(
     device,
     live_logger,
     api_adapter=None,
-) -> ResidualSignNet | None:
+) -> nn.Module | None:
     if not _use_external_signnet(args):
         return None
     if val_loader is None:
@@ -2169,13 +2554,46 @@ def _train_external_signnet(
         raise ValueError("delta_sign_mode=signnet_binary requires delta_sign_external_epochs > 0.")
 
     structured_dim = int(getattr(args, "delta_structured_feature_dim", 12))
-    signnet = ResidualSignNet(
-        history_len=int(max(1, getattr(args, "history_len", 1))),
-        horizon=int(max(1, getattr(args, "horizon", 1))),
-        structured_dim=max(0, structured_dim),
-        hidden_size=int(max(32, getattr(args, "delta_sign_external_hidden", 256))),
-        dropout=float(max(0.0, getattr(args, "delta_sign_external_dropout", 0.1))),
-    ).to(device)
+    signnet_variant = _normalize_external_signnet_variant(getattr(args, "delta_sign_external_variant", "mlp"))
+    signnet_text_model_id = ""
+    signnet_text_dim = int(max(32, getattr(args, "delta_sign_external_text_dim", 64)))
+    if signnet_variant == "dual_stream_tcn":
+        model_id, _tok_id = _resolve_text_spec(
+            getattr(args, "tiny_news_model_preset", "custom"),
+            getattr(args, "tiny_news_model", ""),
+            getattr(args, "tiny_news_tokenizer", ""),
+        )
+        signnet_text_model_id = str(model_id)
+        try:
+            text_encoder = AutoModel.from_pretrained(model_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load dual_stream_tcn signnet text encoder from {model_id!r}. "
+                "Please use a cached encoder-style tiny_news preset/model such as distilbert or bert_base."
+            ) from exc
+        text_hidden = getattr(text_encoder.config, "hidden_size", None)
+        if text_hidden is None:
+            text_hidden = getattr(text_encoder.config, "n_embd", None)
+        if text_hidden is None:
+            raise ValueError(f"Cannot infer hidden size for signnet text encoder {model_id!r}.")
+        signnet = DualStreamTCNSignNet(
+            history_len=int(max(1, getattr(args, "history_len", 1))),
+            horizon=int(max(1, getattr(args, "horizon", 1))),
+            structured_dim=max(0, structured_dim),
+            text_encoder=text_encoder,
+            text_encoder_hidden_size=int(text_hidden),
+            hidden_size=int(max(32, getattr(args, "delta_sign_external_hidden", 256))),
+            text_low_dim=signnet_text_dim,
+            dropout=float(max(0.0, getattr(args, "delta_sign_external_dropout", 0.1))),
+        ).to(device)
+    else:
+        signnet = ResidualSignNet(
+            history_len=int(max(1, getattr(args, "history_len", 1))),
+            horizon=int(max(1, getattr(args, "horizon", 1))),
+            structured_dim=max(0, structured_dim),
+            hidden_size=int(max(32, getattr(args, "delta_sign_external_hidden", 256))),
+            dropout=float(max(0.0, getattr(args, "delta_sign_external_dropout", 0.1))),
+        ).to(device)
 
     lr = float(getattr(args, "delta_sign_external_lr", args.lr))
     wd = float(getattr(args, "delta_sign_external_weight_decay", args.weight_decay))
@@ -2196,7 +2614,10 @@ def _train_external_signnet(
     pos_weight_clip = float(max(pos_weight_floor + 1e-6, getattr(args, "delta_sign_external_pos_weight_clip", 3.0)))
     if hasattr(signnet, "decision_bias"):
         signnet.decision_bias.data.zero_()
-    opt = AdamW(signnet.parameters(), lr=lr, weight_decay=wd)
+    trainable_params = [p for p in signnet.parameters() if p.requires_grad]
+    if len(trainable_params) <= 0:
+        raise ValueError("External signnet has no trainable parameters.")
+    opt = AdamW(trainable_params, lr=lr, weight_decay=wd)
     scheduler = None
     if 0.0 < lr_factor < 1.0:
         scheduler_mode = "min" if select_metric == "loss" else "max"
@@ -2216,13 +2637,16 @@ def _train_external_signnet(
     if live_logger is not None:
         live_logger.info(
             "[SIGNNET] pretrain start: "
+            f"variant={signnet_variant} "
             f"epochs={epochs} lr={lr:.3e} wd={wd:.3e} hidden={int(max(32, getattr(args, 'delta_sign_external_hidden', 256)))} "
             f"dropout={float(max(0.0, getattr(args, 'delta_sign_external_dropout', 0.1))):.3f} "
             f"patience={patience} select_metric={select_metric} min_delta={min_delta:.1e} "
             f"lr_sched_factor={lr_factor:.3f} lr_sched_patience={max(1, lr_patience)} min_lr={min_lr:.3e} "
             f"news_dropout={int(signnet_news_dropout)} calibrate_bias={int(calibrate_bias)} bias_clip={bias_clip:.3f} "
             f"use_news_weighting={int(use_news_weighting)} use_residual_weighting={int(use_residual_weighting)} "
-            f"use_pos_weight={int(use_pos_weight)} pos_weight_floor={pos_weight_floor:.3f} pos_weight_clip={pos_weight_clip:.3f}"
+            f"use_pos_weight={int(use_pos_weight)} pos_weight_floor={pos_weight_floor:.3f} pos_weight_clip={pos_weight_clip:.3f} "
+            f"text_dim={signnet_text_dim if signnet_variant == 'dual_stream_tcn' else 0} "
+            f"text_model={signnet_text_model_id or 'n/a'}"
         )
 
     for epoch in range(epochs):
@@ -2259,6 +2683,9 @@ def _train_external_signnet(
             targets_z = delta_inputs["targets_z"].to(device=device, dtype=torch.float32)
             structured_feats = delta_inputs["structured_feats"].to(device=device, dtype=torch.float32)
             news_counts = delta_inputs["news_counts"].to(device=device, dtype=torch.float32)
+            signnet_text_ids = delta_inputs["signnet_text_ids"].to(device=device, dtype=torch.long)
+            signnet_text_attn = delta_inputs["signnet_text_attn"].to(device=device, dtype=torch.long)
+            signnet_text_mask = delta_inputs["signnet_text_mask"].to(device=device, dtype=torch.float32)
             history_raw = _history_raw_tensor_from_batch(batch, args, device=device)
             sign_logits, _ = _run_external_signnet(
                 signnet_model=signnet,
@@ -2267,6 +2694,9 @@ def _train_external_signnet(
                 structured_feats=structured_feats,
                 news_counts=news_counts,
                 tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
+                signnet_text_ids=signnet_text_ids,
+                signnet_text_attn=signnet_text_attn,
+                signnet_text_mask=signnet_text_mask,
             )
 
             true_residual_z = targets_z - base_pred
@@ -2453,11 +2883,14 @@ def _train_external_signnet(
     torch.save(
         {
             "state_dict": signnet.state_dict(),
+            "variant": signnet_variant,
             "history_len": int(max(1, getattr(args, "history_len", 1))),
             "horizon": int(max(1, getattr(args, "horizon", 1))),
             "structured_dim": int(max(0, structured_dim)),
             "hidden_size": int(max(32, getattr(args, "delta_sign_external_hidden", 256))),
             "dropout": float(max(0.0, getattr(args, "delta_sign_external_dropout", 0.1))),
+            "text_dim": int(signnet_text_dim if signnet_variant == "dual_stream_tcn" else 0),
+            "text_model_id": str(signnet_text_model_id or ""),
             "best_val_loss": float(best_val),
             "best_val_acc": float(best_acc),
             "best_val_bacc": float(best_bacc),
@@ -3004,6 +3437,8 @@ def build_batch_inputs(
     patch_len = int(getattr(args, "patch_len", 4))
     patch_stride = int(getattr(args, "patch_stride", patch_len))
     need_prompt_context = bool(build_prompt_inputs or record_train_prompt)
+    need_signnet_text_seq = _use_external_signnet_temporal_text(args)
+    signnet_text_max_len = int(max(1, getattr(args, "delta_sign_external_text_max_len", 64)))
 
     tpl_text = templates[tpl_id]["text"]
     B = len(batch["history_value"])
@@ -3017,6 +3452,7 @@ def build_batch_inputs(
     news_str_list = []
     refined_news_list = []
     refined_news_docs_list = []
+    signnet_text_step_list = []
     structured_events_list = []
     structured_doc_events_list = []
     structured_feature_list = []
@@ -3076,23 +3512,46 @@ def build_batch_inputs(
         news_str = ""
         refined_news = ""
         refined_news_docs = []
+        signnet_step_texts = ["" for _ in range(L)]
         structured_events = {}
         structured_doc_events = []
         if (not force_no_news) and len(selected) > 0:
             raw_news_texts = selected[news_text_col].fillna("").astype(str).tolist()
+            selected_news_times = (
+                selected[args.news_time_col].tolist()
+                if args.news_time_col in selected.columns
+                else [t_target for _ in raw_news_texts]
+            )
+            history_times_i = _batch_time_seq_for_sample(batch.get("history_times"), i)
             refine_context = build_refine_context(args, target_time=t_target)
-            refined_news_docs = _refine_news_docs_from_doc_cache(
+            aligned_refined_news_docs = _refine_news_docs_aligned_from_doc_cache(
                 raw_news_texts=raw_news_texts,
                 tokenizer=tokenizer,
                 max_tokens=news_budget,
                 args=args,
                 api_adapter=api_adapter,
             )
+            refined_news_docs = []
+            seen_refined_docs = set()
+            for refined_item in aligned_refined_news_docs:
+                clean = str(refined_item or "").strip()
+                if not clean or clean in seen_refined_docs:
+                    continue
+                seen_refined_docs.add(clean)
+                refined_news_docs.append(clean)
             refined_news = _merge_refined_news_docs(
                 refined_news_docs,
                 tokenizer=tokenizer,
                 max_tokens=news_budget,
             )
+            if need_signnet_text_seq:
+                signnet_step_texts = _align_refined_docs_to_history_steps(
+                    history_times=history_times_i,
+                    news_times=selected_news_times,
+                    refined_news_docs=aligned_refined_news_docs,
+                    tokenizer=tokenizer,
+                    max_tokens=signnet_text_max_len,
+                )
 
             if not refined_news:
                 # Last fallback keeps legacy behavior if doc-level refine yields empty.
@@ -3188,6 +3647,7 @@ def build_batch_inputs(
             news_str_list.append(news_str)
         refined_news_list.append(str(refined_news or ""))
         refined_news_docs_list.append(list(refined_news_docs))
+        signnet_text_step_list.append(list(signnet_step_texts))
         structured_events_list.append(dict(structured_events) if isinstance(structured_events, dict) else {})
         structured_doc_events_list.append(list(structured_doc_events))
 
@@ -3255,6 +3715,7 @@ def build_batch_inputs(
     input_ids, attn = _pad_2d_int(ids_list, pad_id=tokenizer.pad_token_id)
     refined_ids_list = []
     refined_doc_ids_list = []
+    signnet_text_ids_list = []
     refined_max_len = int(max(1, getattr(args, "delta_text_max_len", 160)))
     refined_doc_max_len = int(max(1, getattr(args, "delta_doc_max_len", 96)))
     refined_doc_max_docs = int(max(1, getattr(args, "delta_doc_max_docs", 4)))
@@ -3287,9 +3748,32 @@ def build_batch_inputs(
             )
             doc_ids.append(enc["input_ids"])
         refined_doc_ids_list.append(doc_ids)
+    for step_texts in signnet_text_step_list:
+        step_ids = []
+        seq_trim = list(step_texts[:L])
+        if len(seq_trim) < L:
+            seq_trim.extend(["" for _ in range(L - len(seq_trim))])
+        for step_txt in seq_trim:
+            txt = str(step_txt or "").strip()
+            if not txt:
+                step_ids.append([])
+                continue
+            enc = tokenizer(
+                txt,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=signnet_text_max_len,
+                return_attention_mask=False,
+            )
+            step_ids.append(enc["input_ids"])
+        signnet_text_ids_list.append(step_ids)
     refined_news_ids, refined_news_attn = _pad_2d_int(refined_ids_list, pad_id=tokenizer.pad_token_id)
     refined_news_doc_ids, refined_news_doc_attn, refined_news_doc_mask = _pad_3d_int(
         refined_doc_ids_list,
+        pad_id=tokenizer.pad_token_id,
+    )
+    signnet_text_ids, signnet_text_attn, signnet_text_mask = _pad_3d_int(
+        signnet_text_ids_list,
         pad_id=tokenizer.pad_token_id,
     )
     ts_patches, ts_patch_mask = _pad_patches(patches_list, patchmask_list, patch_len=patch_len)
@@ -3316,6 +3800,9 @@ def build_batch_inputs(
         refined_news_doc_ids,
         refined_news_doc_attn,
         refined_news_doc_mask,
+        signnet_text_ids,
+        signnet_text_attn,
+        signnet_text_mask,
     )
 
 
@@ -3354,6 +3841,9 @@ def build_delta_batch_inputs(
         refined_news_doc_ids,
         refined_news_doc_attn,
         refined_news_doc_mask,
+        signnet_text_ids,
+        signnet_text_attn,
+        signnet_text_mask,
     ) = build_batch_inputs(
         batch=batch,
         tokenizer=tokenizer,
@@ -3388,6 +3878,9 @@ def build_delta_batch_inputs(
         "refined_news_doc_ids": refined_news_doc_ids,
         "refined_news_doc_attn": refined_news_doc_attn,
         "refined_news_doc_mask": refined_news_doc_mask,
+        "signnet_text_ids": signnet_text_ids,
+        "signnet_text_attn": signnet_text_attn,
+        "signnet_text_mask": signnet_text_mask,
     }
 
 # ----------------------------
@@ -3455,6 +3948,9 @@ def evaluate_metrics_single(
             _refined_news_doc_ids,
             _refined_news_doc_attn,
             _refined_news_doc_mask,
+            _signnet_text_ids,
+            _signnet_text_attn,
+            _signnet_text_mask,
         ) = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
@@ -3624,7 +4120,7 @@ def evaluate_metrics_backbone(
 def evaluate_metrics_residual(
     base_model,
     delta_model,
-    external_signnet: ResidualSignNet | None,
+    external_signnet: nn.Module | None,
     tokenizer,
     data_loader,
     templates,
@@ -3726,6 +4222,9 @@ def evaluate_metrics_residual(
             refined_news_doc_ids_d = delta_inputs["refined_news_doc_ids"]
             refined_news_doc_attn_d = delta_inputs["refined_news_doc_attn"]
             refined_news_doc_mask_d = delta_inputs["refined_news_doc_mask"]
+            signnet_text_ids_d = delta_inputs["signnet_text_ids"]
+            signnet_text_attn_d = delta_inputs["signnet_text_attn"]
+            signnet_text_mask_d = delta_inputs["signnet_text_mask"]
 
             ts_p = ts_p.to(device)
             ts_pm = ts_pm.to(device)
@@ -3736,6 +4235,9 @@ def evaluate_metrics_residual(
             refined_news_doc_ids_d = refined_news_doc_ids_d.to(device)
             refined_news_doc_attn_d = refined_news_doc_attn_d.to(device)
             refined_news_doc_mask_d = refined_news_doc_mask_d.to(device)
+            signnet_text_ids_d = signnet_text_ids_d.to(device=device, dtype=torch.long)
+            signnet_text_attn_d = signnet_text_attn_d.to(device=device, dtype=torch.long)
+            signnet_text_mask_d = signnet_text_mask_d.to(device=device, dtype=torch.float32)
             history_raw = (
                 _history_raw_tensor_from_batch(batch, args, device=device)
                 if use_external_sign
@@ -3770,6 +4272,9 @@ def evaluate_metrics_residual(
                     structured_feats=structured_feats_d,
                     news_counts=news_counts_d.to(device=device, dtype=torch.float32),
                     tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
+                    signnet_text_ids=signnet_text_ids_d,
+                    signnet_text_attn=signnet_text_attn_d,
+                    signnet_text_mask=signnet_text_mask_d,
                 )
                 delta_corr, gate = _compose_delta_with_external_sign(
                     gate=gate,
@@ -4940,11 +5445,18 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             torch.save(
                 {
                     "state_dict": external_signnet_model.state_dict(),
+                    "variant": str(getattr(external_signnet_model, "model_variant", "mlp")),
                     "history_len": int(max(1, getattr(args, "history_len", 1))),
                     "horizon": int(max(1, getattr(args, "horizon", 1))),
                     "structured_dim": int(max(0, getattr(args, "delta_structured_feature_dim", 12))),
                     "hidden_size": int(max(32, getattr(args, "delta_sign_external_hidden", 256))),
                     "dropout": float(max(0.0, getattr(args, "delta_sign_external_dropout", 0.1))),
+                    "text_dim": int(getattr(args, "delta_sign_external_text_dim", 64)),
+                    "text_model_id": str(_resolve_text_spec(
+                        getattr(args, "tiny_news_model_preset", "custom"),
+                        getattr(args, "tiny_news_model", ""),
+                        getattr(args, "tiny_news_tokenizer", ""),
+                    )[0]) if _use_external_signnet_temporal_text(args) else "",
                     "tau": float(getattr(args, "delta_sign_external_tau", 1.0)),
                     "decision_bias": float(
                         external_signnet_model.decision_bias.detach().cpu().item()
@@ -5041,6 +5553,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             refined_news_doc_ids_d = delta_inputs["refined_news_doc_ids"]
             refined_news_doc_attn_d = delta_inputs["refined_news_doc_attn"]
             refined_news_doc_mask_d = delta_inputs["refined_news_doc_mask"]
+            signnet_text_ids_d = delta_inputs["signnet_text_ids"]
+            signnet_text_attn_d = delta_inputs["signnet_text_attn"]
+            signnet_text_mask_d = delta_inputs["signnet_text_mask"]
             # build base text inputs (no news)
             delta_null_inputs = build_delta_batch_inputs(
                 batch=batch,
@@ -5065,6 +5580,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             refined_news_doc_ids_b = delta_null_inputs["refined_news_doc_ids"]
             refined_news_doc_attn_b = delta_null_inputs["refined_news_doc_attn"]
             refined_news_doc_mask_b = delta_null_inputs["refined_news_doc_mask"]
+            signnet_text_ids_b = delta_null_inputs["signnet_text_ids"]
+            signnet_text_attn_b = delta_null_inputs["signnet_text_attn"]
+            signnet_text_mask_b = delta_null_inputs["signnet_text_mask"]
 
             ts_p = ts_p.to(device)
             ts_pm = ts_pm.to(device)
@@ -5083,6 +5601,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             refined_news_doc_ids_b = refined_news_doc_ids_b.to(device)
             refined_news_doc_attn_b = refined_news_doc_attn_b.to(device)
             refined_news_doc_mask_b = refined_news_doc_mask_b.to(device)
+            signnet_text_ids_d = signnet_text_ids_d.to(device=device, dtype=torch.long)
+            signnet_text_attn_d = signnet_text_attn_d.to(device=device, dtype=torch.long)
+            signnet_text_mask_d = signnet_text_mask_d.to(device=device, dtype=torch.float32)
+            signnet_text_ids_b = signnet_text_ids_b.to(device=device, dtype=torch.long)
+            signnet_text_attn_b = signnet_text_attn_b.to(device=device, dtype=torch.long)
+            signnet_text_mask_b = signnet_text_mask_b.to(device=device, dtype=torch.float32)
             has_news = (news_counts_d > 0).to(dtype=torch.float32)
             history_raw = (
                 _history_raw_tensor_from_batch(batch, args, device=device)
@@ -5128,6 +5652,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                         structured_feats=structured_feats_d,
                         news_counts=news_counts_d,
                         tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
+                        signnet_text_ids=signnet_text_ids_d,
+                        signnet_text_attn=signnet_text_attn_d,
+                        signnet_text_mask=signnet_text_mask_d,
                     )
                 delta_pred_real, gate_real_h = _compose_delta_with_external_sign(
                     gate=gate_real,
@@ -5295,6 +5822,9 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                             structured_feats=structured_feats_b,
                             news_counts=news_counts_b,
                             tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
+                            signnet_text_ids=signnet_text_ids_b,
+                            signnet_text_attn=signnet_text_attn_b,
+                            signnet_text_mask=signnet_text_mask_b,
                         )
                     delta_pred_null, gate_null_h = _compose_delta_with_external_sign(
                         gate=gate_null,
@@ -5394,36 +5924,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     gnull=float(loss_gate_null.detach().cpu()),
                     cf=float(loss_cf.detach().cpu()),
                 )
-                if global_step % 100 == 0:
-                    dh_grad = 0.0
-                    dh_grad_terms = []
-                    for n, p in delta_model.named_parameters():
-                        if n.startswith("delta_head") and p.grad is not None:
-                            g = float(p.grad.norm().cpu())
-                            if np.isfinite(g):
-                                dh_grad_terms.append(g * g)
-                    if dh_grad_terms:
-                        dh_grad = float(np.sqrt(sum(dh_grad_terms)))
-                    doc_attn_entropy = float(out_delta.get("doc_attn_entropy", torch.zeros((), device=device)).detach().cpu())
-                    doc_attn_max = float(out_delta.get("doc_attn_max", torch.zeros((), device=device)).detach().cpu())
-                    live_logger.info(
-                        f"[GRAD] step={global_step} delta_head_grad={dh_grad:.6f} "
-                        f"gate={gate_mean:.4f} gate>0.5={gate_frac:.4f} "
-                        f"sgn_acc={sign_acc:.4f} mag={mag_mean:.4f} |r|={mag_true_mean:.4f} |d|={delta_abs_mean:.4f} "
-                        f"reg={epoch_reg_scale:.3f} null={null_step_scale:.3f} "
-                        f"gsup={float(loss_gate_sup.detach().cpu()):.6f} "
-                        f"sgn={float(loss_delta_sign.detach().cpu()):.6f} "
-                        f"magL={float(loss_delta_mag.detach().cpu()):.6f} "
-                        f"ndg={float(loss_non_degrade.detach().cpu()):.6f} "
-                        f"news_frac={news_frac:.4f} "
-                        f"docH={doc_attn_entropy:.4f} docW={doc_attn_max:.4f} "
-                        f"lam(reg/g/s/m/g0/c/n/nd)=("
-                        f"{gate_reg_lambda_eff:.4f}/{delta_gate_loss_weight:.4f}/"
-                        f"{delta_sign_loss_weight:.4f}/{delta_mag_loss_weight:.4f}/"
-                        f"{gate_null_lambda_eff:.4f}/{delta_cf_lambda_eff:.4f}/"
-                        f"{delta_null_lambda_eff:.4f}/{delta_non_degrade_lambda:.4f}/"
-                        f"{struct_impact_weight:.4f})"
-                    )
 
             if (global_step + 1) % args.grad_accum == 0:
                 grad_clip = float(getattr(args, "delta_grad_clip", 0.0))

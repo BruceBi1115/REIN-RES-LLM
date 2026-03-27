@@ -1,1 +1,2 @@
 Task,MSE,MAE
+[2024-nswelecLOAD-tinynews]_mlp_h48_all_s1_h48_news_dataset/news_2024_2025.json_selmae_0.0_0.1_0.0_0.0_0.0_0.05_base_40_delta_100_lr_5e-06_gradacc_8_sche_1_lookback_1_topK_999_frz_1_ndl_1.0_ndm_0.0_dgib_-2.0,554229.3567182088,515.4461895309107
