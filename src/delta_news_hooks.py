@@ -427,6 +427,23 @@ def _read_api_key_from_path(path: str) -> str:
         return ""
 
 
+def discover_news_api_key(args) -> tuple[str, str]:
+    key = str(os.environ.get("OPENAI_API_KEY", "")).strip()
+    if key:
+        return key, "env:OPENAI_API_KEY"
+
+    key_path = str(getattr(args, "news_api_key_path", ".secrets/api_key.txt"))
+    key = _read_api_key_from_path(key_path)
+    if key:
+        return key, key_path
+
+    for fallback in ["api_key.txt", ".secrets/api_key.txt"]:
+        key = _read_api_key_from_path(fallback)
+        if key:
+            return key, fallback
+    return "", ""
+
+
 def build_news_api_adapter(args, live_logger=None):
     refine_mode = str(getattr(args, "news_refine_mode", "local")).lower().strip()
     structured_mode = str(getattr(args, "news_structured_mode", "off")).lower().strip()
@@ -435,18 +452,24 @@ def build_news_api_adapter(args, live_logger=None):
     if not need_api:
         return None
 
-    key = str(os.environ.get("OPENAI_API_KEY", "")).strip()
+    key, key_source = discover_news_api_key(args)
     key_path = str(getattr(args, "news_api_key_path", ".secrets/api_key.txt"))
+    strict_required = bool(getattr(args, "_require_news_api_adapter", False))
+    cache_mode = str(getattr(args, "_news_doc_cache_mode", "") or "").strip()
     if not key:
-        key = _read_api_key_from_path(key_path)
-    if not key:
-        for fallback in ["api_key.txt", ".secrets/api_key.txt"]:
-            key = _read_api_key_from_path(fallback)
-            if key:
-                break
-    if not key:
+        if strict_required:
+            raise RuntimeError(
+                "API mode is required to build refined news cache, but no API key was found. "
+                f"Checked OPENAI_API_KEY, {key_path}, api_key.txt, and .secrets/api_key.txt."
+            )
         if live_logger is not None:
-            live_logger.info("[NEWS_API] API mode requested but no API key found; fallback to local/heuristic behavior.")
+            if cache_mode == "read_only" and ((refine_mode == "api") or (structured_mode == "api")):
+                live_logger.info(
+                    "[NEWS_API] API mode configured, but read_only cache mode does not require an adapter; "
+                    "no API key found."
+                )
+            else:
+                live_logger.info("[NEWS_API] API mode requested but no API key found; fallback to local/heuristic behavior.")
         return None
 
     model = str(getattr(args, "news_api_model", "gpt-5.1") or "gpt-5.1")
@@ -462,14 +485,16 @@ def build_news_api_adapter(args, live_logger=None):
             max_retries=max_retries,
             live_logger=live_logger,
         )
-    except Exception:
+    except Exception as exc:
+        if strict_required:
+            raise RuntimeError(f"Failed to initialize OpenAI adapter for cache build: {exc}") from exc
         if live_logger is not None:
             live_logger.info("[NEWS_API] failed to initialize OpenAI adapter; fallback to local/heuristic behavior.")
         return None
 
     if live_logger is not None:
         live_logger.info(
-            f"[NEWS_API] enabled model={model} key_path={key_path} "
+            f"[NEWS_API] enabled model={model} key_source={key_source or key_path} "
             f"refine_mode={refine_mode} structured_mode={structured_mode}"
         )
     return adapter

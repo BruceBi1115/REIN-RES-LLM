@@ -1,4 +1,8 @@
+import json
 import os
+import re
+import warnings
+from datetime import datetime
 from typing import List
 
 import numpy as np
@@ -6,7 +10,144 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from textblob import TextBlob
-    
+
+
+def _parse_news_datetime(raw):
+    s = str(raw or "").strip()
+    if not s:
+        return pd.NaT
+
+    iso_candidate = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso_candidate)
+        ts = pd.Timestamp(dt)
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+        return ts
+    except Exception:
+        pass
+
+    fmts = [
+        "%d-%m-%Y %I:%M:%S %p",
+        "%d/%m/%Y %I:%M:%S %p",
+        "%d-%m-%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d/%m/%Y %H:%M",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ]
+    for fmt in fmts:
+        try:
+            return pd.Timestamp(datetime.strptime(s, fmt))
+        except Exception:
+            continue
+
+    return pd.to_datetime(s, dayfirst=True, errors="coerce")
+
+
+def _normalize_news_identity_title_local(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip()).casefold()
+
+
+def _normalize_news_identity_time_local(value) -> str:
+    if isinstance(value, pd.Timestamp):
+        ts = value
+    else:
+        ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return ""
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts.floor("s").isoformat()
+
+
+def _normalize_news_identity_url_local(url: str) -> str:
+    return re.sub(r"\s+", "", str(url or "").strip())
+
+
+def _deduplicate_news_identity_rows(df: pd.DataFrame, time_col: str, *, source_path: str = "") -> pd.DataFrame:
+    if df is None or len(df) == 0 or "title" not in df.columns or time_col not in df.columns:
+        return df
+
+    work = df.copy()
+    work["_identity_title"] = work["title"].apply(_normalize_news_identity_title_local)
+    work["_identity_time"] = work[time_col].apply(_normalize_news_identity_time_local)
+    work["_identity_url"] = (
+        work["url"].apply(_normalize_news_identity_url_local) if "url" in work.columns else ""
+    )
+    valid_identity = work["_identity_title"].ne("") & work["_identity_time"].ne("")
+    if not valid_identity.any():
+        return df
+
+    dup_mask = valid_identity & work.duplicated(
+        subset=["_identity_title", "_identity_time", "_identity_url"],
+        keep=False,
+    )
+    if not dup_mask.any():
+        return df
+
+    content_col = "content" if "content" in work.columns else ""
+    url_col = "url" if "url" in work.columns else ""
+    work["_content_len"] = (
+        work[content_col].fillna("").astype(str).str.len() if content_col else 0
+    )
+    work["_canonical_url_score"] = (
+        work[url_col]
+        .fillna("")
+        .astype(str)
+        .apply(lambda s: 0 if re.search(r"(?:-|%3A)0/?$", s.strip()) else 1)
+        if url_col
+        else 0
+    )
+    work["_original_order"] = np.arange(len(work), dtype=np.int64)
+
+    deduped = (
+        work.sort_values(
+            by=[
+                "_identity_title",
+                "_identity_time",
+                "_identity_url",
+                "_content_len",
+                "_canonical_url_score",
+                "_original_order",
+            ],
+            ascending=[True, True, True, False, False, True],
+            kind="mergesort",
+        )
+        .drop_duplicates(subset=["_identity_title", "_identity_time", "_identity_url"], keep="first")
+        .sort_values(by=["_original_order"], kind="mergesort")
+        .drop(
+            columns=[
+                "_identity_title",
+                "_identity_time",
+                "_identity_url",
+                "_content_len",
+                "_canonical_url_score",
+                "_original_order",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    removed = int(len(df) - len(deduped))
+    dup_groups = int(
+        work.loc[dup_mask, ["_identity_title", "_identity_time", "_identity_url"]].drop_duplicates().shape[0]
+    )
+    warnings.warn(
+        f"[NEWS] Deduplicated {removed} rows across {dup_groups} duplicate title+date+url identities from {source_path or 'news source'}. "
+        "The framework keeps the most informative row per identity to preserve strict refined-cache matching.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return deduped
+
+
 def load_news(path: str, time_col: str, tz: str) -> pd.DataFrame:
     """
     Load news ONLY from a JSON file that contains an array of objects.
@@ -20,15 +161,19 @@ def load_news(path: str, time_col: str, tz: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
 
-    # Expect the JSON to be a list of records (array of objects)
-    df = pd.read_json(path)  # if your file is JSON Lines, use: pd.read_json(path, lines=True)
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, list):
+        raise TypeError(f"Expected a JSON array of news objects, got: {type(payload).__name__}")
+    df = pd.DataFrame(payload)
 
     if time_col not in df.columns:
         raise KeyError(f"time_col '{time_col}' not found in JSON file.")
 
     # Parse using the input data's own time basis; only localize/convert if the caller
     # explicitly provides a timezone.
-    df[time_col] = pd.to_datetime(df[time_col], dayfirst=True, errors="coerce")
+    df[time_col] = df[time_col].apply(_parse_news_datetime)
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
     df = df.dropna(subset=[time_col])
 
     if tz:
@@ -36,7 +181,8 @@ def load_news(path: str, time_col: str, tz: str) -> pd.DataFrame:
             df[time_col] = df[time_col].dt.tz_localize(tz)
         else:
             df[time_col] = df[time_col].dt.tz_convert(tz)
-    
+
+    df = _deduplicate_news_identity_rows(df, time_col, source_path=path)
 
     # print(df.sort_values(time_col).reset_index(drop=True))
 

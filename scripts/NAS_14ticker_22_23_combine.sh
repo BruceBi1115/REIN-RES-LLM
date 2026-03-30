@@ -55,20 +55,96 @@ if ! PYTHON_BIN="$(pick_python_bin "$PYTHON_BIN")"; then
   echo "[ERROR] No suitable Python found for this project." >&2
   echo "        Need modules: pandas, torch, transformers, peft, openai" >&2
   echo "        You can run with an explicit interpreter, e.g.:" >&2
-  echo "        PYTHON_BIN=/path/to/env/bin/python bash scripts/nswelecload_new.sh" >&2
+  echo "        PYTHON_BIN=/path/to/env/bin/python bash scripts/nasaaplOPEN_22_23_tinynews.sh" >&2
   exit 1
 fi
 echo "[env] Using PYTHON_BIN=$PYTHON_BIN"
 
-TIME_COL="date"
-VALUE_COL="TOTALDEMAND"
-UNIT="MW"
-DESCRIPTION="This dataset records the electricity load demand data in Australia NSW from 2024, collected from National electricity market."
-REGION="Australia, NSW"
+prepare_chronological_timeseries_splits() {
+  "$PYTHON_BIN" - <<'PY'
+import os
+import pandas as pd
 
-TRAIN_FILE="dataset/2024NSWelecLOAD/2024NSWelecLOAD_trainset.csv"
-VAL_FILE="dataset/2024NSWelecLOAD/2024NSWelecLOAD_valset.csv"
-TEST_FILE="dataset/2024NSWelecLOAD/2024NSWelecLOAD_testset.csv"
+raw_file = "dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine.csv"
+source_train = "dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_trainset.csv"
+source_val = "dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_valset.csv"
+source_test = "dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_testset.csv"
+out_train = "dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_chrono_trainset.csv"
+out_val = "dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_chrono_valset.csv"
+out_test = "dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_chrono_testset.csv"
+time_col = "date"
+
+def parse_time_series(series):
+    text = series.astype(str).str.strip()
+    parsed = pd.to_datetime(text, format="%Y-%m-%d", errors="coerce")
+    missing = parsed.isna()
+    if missing.any():
+        parsed.loc[missing] = pd.to_datetime(text.loc[missing], dayfirst=True, errors="coerce")
+    return parsed
+
+for path in (raw_file, source_train, source_val, source_test):
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+src_train = pd.read_csv(source_train)
+src_val = pd.read_csv(source_val)
+src_test = pd.read_csv(source_test)
+full_df = pd.read_csv(raw_file)
+
+expected_total = len(src_train) + len(src_val) + len(src_test)
+if len(full_df) != expected_total:
+    raise ValueError(
+        f"NAS_14ticker split source mismatch: full={len(full_df)} split_sum={expected_total}"
+    )
+
+parsed = parse_time_series(full_df[time_col])
+if parsed.isna().any():
+    bad_rows = full_df.loc[parsed.isna(), [time_col]].head(5).to_dict("records")
+    raise ValueError(f"Failed to parse {time_col} in raw file. examples={bad_rows}")
+
+full_sorted = full_df.copy()
+full_sorted["_parsed_time"] = parsed
+full_sorted = full_sorted.sort_values("_parsed_time", kind="mergesort").reset_index(drop=True)
+full_sorted = full_sorted.drop(columns=["_parsed_time"])
+
+n_train = len(src_train)
+n_val = len(src_val)
+train_df = full_sorted.iloc[:n_train].copy()
+val_df = full_sorted.iloc[n_train:n_train + n_val].copy()
+test_df = full_sorted.iloc[n_train + n_val:].copy()
+
+for path, df in ((out_train, train_df), (out_val, val_df), (out_test, test_df)):
+    df.to_csv(path, index=False)
+
+def _span(df):
+    ts = parse_time_series(df[time_col])
+    return str(ts.min()), str(ts.max()), int(len(df))
+
+tr_min, tr_max, tr_n = _span(train_df)
+va_min, va_max, va_n = _span(val_df)
+te_min, te_max, te_n = _span(test_df)
+print(
+    "[DATASET] prepared chronological splits "
+    f"train={tr_n}[{tr_min} -> {tr_max}] "
+    f"val={va_n}[{va_min} -> {va_max}] "
+    f"test={te_n}[{te_min} -> {te_max}]"
+)
+PY
+}
+
+prepare_chronological_timeseries_splits
+
+TIME_COL="date"
+VALUE_COL="open"
+ID_COL="ticker"
+UNIT="USD"
+DESCRIPTION="This dataset records 14 tickers' daily opening stock prices on the NASDAQ market from 2022 to 2023, paired with related NASDAQ news articles."
+REGION="United States, NASDAQ"
+FREQ_MIN="1440"  # daily data
+
+TRAIN_FILE="dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_chrono_trainset.csv"
+VAL_FILE="dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_chrono_valset.csv"
+TEST_FILE="dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_chrono_testset.csv"
 
 NEWS_TEXT_COL="content"
 NEWS_TIME_COL="date"
@@ -78,7 +154,7 @@ BASE_EPOCHS="${BASE_EPOCHS:-40}"
 # NEWS_WINDOW_DAYS="7"
 NEWS_TOPM="999"
 NEWS_TOPK="999"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
 GPU_ID="${GPU_ID:-0}"
 DEFAULT_POLICY="all"
 
@@ -91,11 +167,17 @@ STRIDE="${STRIDE:-1}"
 STAGE="${STAGE:-all}"
 HORIZONS=(
   "48"
-  "96"
-  "192"
-  "336"
-  "720"
+  # "96"
+  # "192"
+  # "336"
+  # "720"
 )
+# pure TS base backbone (scheme2)
+BASE_BACKBONES=(
+  # "mlp"
+  "dlinear"
+)
+
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
 
@@ -153,11 +235,7 @@ CF_PSEUDO_MARGIN="${CF_PSEUDO_MARGIN:-0.01}"
 CF_PSEUDO_TEMP="${CF_PSEUDO_TEMP:-0.2}"
 CF_PSEUDO_HARD="${CF_PSEUDO_HARD:-0}"
 
-# pure TS base backbone (scheme2)
-BASE_BACKBONES=(
-  # "mlp"
-  # "dlinear"
-)
+
 BASE_HIDDEN_DIM="256"
 BASE_MOVING_AVG="25"
 BASE_DROPOUT="0.0"
@@ -196,20 +274,20 @@ NEWS_REFINE_CACHE_ENABLE="${NEWS_REFINE_CACHE_ENABLE:-1}"
 NEWS_STRUCTURED_CACHE_ENABLE="${NEWS_STRUCTURED_CACHE_ENABLE:-1}"
 
 NEWS_DOC_CACHE_PATH="${NEWS_DOC_CACHE_PATH:-}"  # optional unified cache file to reuse directly
-# NEWS_DOC_CACHE_PATH="checkpoints/_shared_refine_cache/news_doc_cache_news_2024_2025.json"
+# NEWS_DOC_CACHE_PATH="checkpoints/_shared_refine_cache/news_doc_cache_nasdaq_news_22_23.json"
 
 NEWS_REFINE_PREWARM_MAX_BATCHES="${NEWS_REFINE_PREWARM_MAX_BATCHES:--1}"
 NEWS_REFINE_SHOW_PROGRESS="${NEWS_REFINE_SHOW_PROGRESS:-1}"
 NEWS_STRUCTURED_SHOW_PROGRESS="${NEWS_STRUCTURED_SHOW_PROGRESS:-1}"
 DELTA_INCLUDE_STRUCTURED_NEWS="${DELTA_INCLUDE_STRUCTURED_NEWS:-0}"  # prompt path is disabled in DELTA; keep structured text off in stable runs
 DELTA_STRUCTURED_ENABLE="${DELTA_STRUCTURED_ENABLE:-1}"  # allow DELTA to consume structured event features directly
-DELTA_STRUCTURED_FEATURE_DIM="${DELTA_STRUCTURED_FEATURE_DIM:-12}"
+DELTA_STRUCTURED_FEATURE_DIM="${DELTA_STRUCTURED_FEATURE_DIM:-5}"
 
 DELTA_MODEL_VARIANT="${DELTA_MODEL_VARIANT:-tiny_news_ts}"
 DELTA_TEXT_FUSE_LAMBDA="${DELTA_TEXT_FUSE_LAMBDA:-10.0}"
 TINY_NEWS_PRESET="${TINY_NEWS_PRESET:-distilbert}"  # distilbert | gpt2 | bert_base | roberta_base | deberta_v3_base | custom
 TINY_NEWS_LOADER="${TINY_NEWS_LOADER:-auto}"        # auto | encoder | causal_lm
-# TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-}"
+TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-}"
 TINY_NEWS_TOKENIZER="${TINY_NEWS_TOKENIZER:-}"
 TINY_NEWS_HIDDEN_SIZE="${TINY_NEWS_HIDDEN_SIZE:-256}"
 TINY_NEWS_TEXT_TRAINABLE="${TINY_NEWS_TEXT_TRAINABLE:-0}"
@@ -277,7 +355,7 @@ DELTA_NULL_RAMP_STEPS="${DELTA_NULL_RAMP_STEPS:-1200}"
 # =======================
 # 2) Sweep spaces (same style as your original)
 # =======================
-TASK_NAME_BASE="${TASK_NAME_BASE:-[2024-nswelecLOAD-tinynews]}"
+TASK_NAME_BASE="${TASK_NAME_BASE:-[2022_2023-nasdaq14tickeropen-tinynews]}"
 TASK_NAME_SUFFIX="${TASK_NAME_SUFFIX:-}"
 TASK_NAMES=(
   "${TASK_NAME_BASE}${TASK_NAME_SUFFIX}"
@@ -286,7 +364,7 @@ TASK_NAMES=(
 NEWS_CHOICES=(
   # "dataset/Rated_Sum_V7_FNT_2019_2020_WAtt2019_combined.json"
   # "dataset/FNT_2019_2020_combined.json"
-  "dataset/news_2024_2025.json"
+  "dataset/nasdaq_news_22_23.json"
   # "dataset/empty.json"
 )
 
@@ -308,7 +386,7 @@ SCHEDULERS=(
 
 LRS=(
   "5e-6"
-  "1e-5"
+  # "1e-5"
 )
 
 GRAD_ACCS=(
@@ -321,6 +399,7 @@ GRAD_ACCS=(
 # 3) Shared args
 # =======================
 COMMON_ARGS=(
+  --freq_min "$FREQ_MIN"
   --delta_cf_lambda "$DELTA_CF_LAMBDA"
   --delta_cf_margin "$DELTA_CF_MARGIN"
   --delta_gate_reg_lambda "$DELTA_GATE_REG_LAMBDA"
@@ -384,6 +463,7 @@ COMMON_ARGS=(
   --early_stop_patience "$EARLY_STOP_PATIENCE"
   --time_col "$TIME_COL"
   --value_col "$VALUE_COL"
+  --id_col "$ID_COL"
   --unit "$UNIT"
   --description "$DESCRIPTION"
   --region "$REGION"
@@ -527,21 +607,21 @@ prepare_news_cache_mode() {
     return
   fi
 
-  if [[ -f "$doc_cache_path" ]]; then
-    if verify_news_doc_cache_file "$news_path" "$doc_cache_path"; then
-      CURRENT_NEWS_REFINE_CACHE_READ_PATH="$doc_cache_path"
-      CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH="$doc_cache_path"
-      CURRENT_NEWS_REFINE_PREWARM=0
-      CURRENT_NEWS_STRUCTURED_PREWARM=0
-      CURRENT_NEWS_CACHE_MODE="read_only"
-      echo "[NEWS_CACHE] mode=read_only cache_path=$doc_cache_path source=auto_discovered"
-      return
-    fi
+  # if [[ -f "$doc_cache_path" ]]; then
+  #   if verify_news_doc_cache_file "$news_path" "$doc_cache_path"; then
+  #     CURRENT_NEWS_REFINE_CACHE_READ_PATH="$doc_cache_path"
+  #     CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH="$doc_cache_path"
+  #     CURRENT_NEWS_REFINE_PREWARM=0
+  #     CURRENT_NEWS_STRUCTURED_PREWARM=0
+  #     CURRENT_NEWS_CACHE_MODE="read_only"
+  #     echo "[NEWS_CACHE] mode=read_only cache_path=$doc_cache_path source=auto_discovered"
+  #     return
+  #   fi
 
-    echo "[NEWS_CACHE][ERROR] auto-discovered cache is incompatible with current framework identity rules: $doc_cache_path" >&2
-    echo "[NEWS_CACHE][ERROR] Repair or delete this cache file before rerunning." >&2
-    return 1
-  fi
+  #   echo "[NEWS_CACHE][ERROR] auto-discovered cache is incompatible with current framework identity rules: $doc_cache_path" >&2
+  #   echo "[NEWS_CACHE][ERROR] Repair or delete this cache file before rerunning." >&2
+  #   return 1
+  # fi
 
   mkdir -p "$(dirname "$doc_cache_path")"
   if [[ -f "$legacy_refine_path" ]]; then

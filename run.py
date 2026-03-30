@@ -9,17 +9,11 @@ if __name__ == '__main__':
 
     
     parser.add_argument('--rel_lambda', type=float, default=0.3, help='weight for relative loss')
-    parser.add_argument('--rel_supervise_lambda', type=float, default=0.5,
-                        help='weight for supervised rel_head BCE in delta stage')
-    
     parser.add_argument('--delta_null_lambda', type=float, default=0.05)
-    parser.add_argument('--delta_adv_margin', type=float, default=0.02, help='margin in z-space: err_null >= err_real + margin')
     parser.add_argument('--delta_non_degrade_lambda', type=float, default=1.0, help='weight for non-degradation guard vs base')
     parser.add_argument('--delta_non_degrade_margin', type=float, default=0.0, help='margin in z-space: err_real <= err_base - margin')
     parser.add_argument('--delta_sign_lambda', type=float, default=0.0,
                         help='weight for explicit delta sign-consistency loss against signed residual target')
-    parser.add_argument('--delta_sign_margin', type=float, default=0.0,
-                        help='hinge margin for signed delta supervision; positive requires a small same-sign output')
     parser.add_argument('--delta_sign_eps', type=float, default=0.03,
                         help='ignore sign supervision where |delta_target| <= eps')
     parser.add_argument('--delta_gate_eps', type=float, default=0.05,
@@ -91,10 +85,6 @@ if __name__ == '__main__':
                         help='bounded extra weight for larger true residual positions')
     parser.add_argument('--delta_init_aux_weight', type=float, default=0.2,
                         help='weight for auxiliary supervision on delta_init vs delta target')
-    parser.add_argument('--alpha_null_weight', type=float, default=0.05,
-                        help='penalty weight encouraging alpha_news to stay near 1 when news is weak/absent')
-    parser.add_argument('--beta_null_weight', type=float, default=0.05,
-                        help='penalty weight encouraging beta_news to stay near 0 when news is weak/absent')
     parser.add_argument('--struct_impact_weight', type=float, default=0.05,
                         help='weak consistency weight for structured impact sign/scale/decay/mask')
     parser.add_argument('--final_gate_sup_weight', type=float, default=0.0,
@@ -169,17 +159,12 @@ if __name__ == '__main__':
     parser.add_argument('--cf_pseudo_margin', type=float, default=0.01, help='counterfactual gain margin for pseudo labels')
     parser.add_argument('--cf_pseudo_temp', type=float, default=0.2, help='temperature for soft pseudo labels')
     parser.add_argument('--cf_pseudo_hard', type=int, default=0, choices=[0, 1], help='use hard(1)/soft(0) pseudo labels')
-    parser.add_argument('--cf_min_weight', type=float, default=0.30, help='minimum residual weight for samples with news')
-    parser.add_argument('--delta_cold_start_steps', type=int, default=200, help='force sample_w=1 for first N delta steps')
     parser.add_argument('--delta_null_warmup_steps', type=int, default=500, help='delay null loss for first N delta steps')
     parser.add_argument('--delta_null_ramp_steps', type=int, default=500, help='ramp null loss weight for next N delta steps')
-    parser.add_argument('--news_contrastive_lambda', type=float, default=0.1, help='weight for news-vs-null rel-logit contrastive loss')
-    parser.add_argument('--base_pred_noise', type=float, default=0.5, help='std of Gaussian noise added to base_pred in delta training')
     parser.add_argument('--delta_warmup_epochs', type=int, default=2,
                         help='disable gate/counterfactual regularizers in first N delta epochs')
     parser.add_argument('--delta_curriculum_epochs', type=int, default=3, help='ramp-up epochs for delta constraints')
     parser.add_argument('--delta_grad_clip', type=float, default=1.0, help='grad clip norm for delta stage (<=0 to disable)')
-    parser.add_argument('--delta_violation_cap', type=float, default=1.0, help='cap per-sample margin/non-degrade hinge value (>0 to enable)')
     parser.add_argument('--delta_head_lr_scale', type=float, default=1.0, help='lr scale for delta/rel heads in delta stage')
     parser.add_argument('--delta_other_lr_scale', type=float, default=0.5, help='lr scale for other trainable params in delta stage')
     parser.add_argument('--delta_freeze_feature_modules', type=int, default=0, choices=[0, 1],
@@ -206,6 +191,10 @@ if __name__ == '__main__':
                         help='news refinement backend; local is join+truncate fallback')
     parser.add_argument('--news_refine_cache_enable', type=int, default=1, choices=[0, 1],
                         help='enable persistent cache for refined news text')
+    parser.add_argument('--news_doc_cache_path', type=str, default='',
+                        help='optional unified refined-news cache path; when present, this file is treated as the primary cache object store')
+    parser.add_argument('--news_doc_cache_explicit', type=int, default=0, choices=[0, 1],
+                        help='whether the unified cache path was explicitly requested by the caller rather than auto-discovered')
     parser.add_argument('--news_refine_cache_path', type=str, default='',
                         help='optional cache file path for refined news; default is a shared cache under checkpoints/_shared_refine_cache/')
     parser.add_argument('--news_refine_cache_read_path', type=str, default='',
@@ -232,6 +221,8 @@ if __name__ == '__main__':
                         help='allow DELTA to consume structured event features directly')
     parser.add_argument('--delta_structured_feature_dim', type=int, default=12,
                         help='feature dimension for structured event vector injected into DELTA')
+    parser.add_argument('--news_api_enable', type=int, default=0, choices=[0, 1],
+                        help='caller-level switch recording whether API-backed news processing was requested')
     parser.add_argument('--news_api_model', type=str, default='gpt-5.1',
                         help='OpenAI model name used by API adapter when news_*_mode=api')
     parser.add_argument('--news_api_key_path', type=str, default='api_key.txt',
@@ -248,12 +239,6 @@ if __name__ == '__main__':
                         help='optional hard-sample reflection backend (offline utility hook)')
     parser.add_argument('--hard_reflection_topk', type=int, default=8,
                         help='number of hardest samples per epoch sent to reflection hook')
-    parser.add_argument('--utility_rank_lambda', type=float, default=0.2,
-                        help='weight for real-vs-null utility ranking loss on rel logits')
-    parser.add_argument('--utility_rank_margin', type=float, default=0.10,
-                        help='margin for ranking loss: rel_real - rel_null should exceed this value')
-
-
     parser.add_argument("--patch_dropout", type=float, default=0.0)
     parser.add_argument("--head_dropout", type=float, default=0.0)
     parser.add_argument("--head_mlp", action="store_true", default=False)
@@ -278,9 +263,6 @@ if __name__ == '__main__':
     parser.add_argument("--utility_dedup_threshold", type=float, default=0.95, help="dedup threshold in utility rerank")
     parser.add_argument("--utility_keep_topk", type=int, default=-1, help="optional post-rerank truncation; <=0 disables")
     parser.add_argument("--utility_min_score", type=float, default=-1.0, help="drop selected news below this utility score; <0 disables")
-    parser.add_argument("--utility_show_in_prompt", type=int, default=1, choices=[0, 1],
-                        help="show utility score tag for each news item in prompt")
-
     #TIME-SEIRES DATA PATCH LEN
     parser.add_argument("--patch_len", type=int, default=4)
     # ==== News dropout ====
@@ -332,12 +314,6 @@ if __name__ == '__main__':
     parser.add_argument('--unit', type=str, default='', help='unit string')
     parser.add_argument('--volatility_bin_tiers', type=int, default=100, help='the tiers to bin volatility')
     parser.add_argument('--token_budget', type=int, default=700, help='max tokens for composed prompt')
-    parser.add_argument('--val_ema_alpha', type=float, default=0.9, help='EMA alpha for validation loss smoothing')
-
-    # Whether to include explanations in the prompt template
-    parser.add_argument('--need_explain', action='store_true', help='include explanations in template')
-    parser.add_argument('--need_ci', action='store_true', help='include confidence interval in output')
-
     # ===== Task windowing =====
     parser.add_argument('--history_len', type=int, default=48, help='steps for history window L')
     parser.add_argument('--horizon', type=int, default=48, help='steps to predict H')
@@ -351,14 +327,6 @@ if __name__ == '__main__':
     parser.add_argument('--news_topM', type=int, default=20, help='candidate news cap per sample')
     parser.add_argument('--news_topK', type=int, default=5, help='news K after policy')
     
-    # ===== News summarization =====
-    # News is pre-summarized offline in this workflow, so this option is usually unused.
-    parser.add_argument('--news_summary_method', type=str, default='none', choices=['none', 'lead3', 'rule'],
-                        help='shorten news before inserting to prompt')
-    parser.add_argument('--news_max_sentences', type=int, default=3, help='max sentences per selected news')
-
-
-
     # ===== Prompt templates =====
     parser.add_argument('--template_pool', type=str, default='configs/templates3.yaml',
                         help='YAML/JSON templates with placeholders')

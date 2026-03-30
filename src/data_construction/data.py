@@ -113,9 +113,12 @@ class SlidingDataset(Dataset):
             n = len(g)
             gid = self.groups[gi][0]
             group_min_target_time = self.min_target_time_by_id.get(gid, self.min_target_time)
+            max_start = n - (L + H)
+            if max_start < 0:
+                continue
             #print("n:", n, "L:", L, "H:", H, "stride:", stride)
-            # 能切出的起点 s: 0..n-(L+H)
-            for s in range(0, max(0, n - (L + H)) + 1, stride):
+            # 只保留完整的 history(L) + target(H) 样本，避免短 target 混入训练/评估。
+            for s in range(0, max_start + 1, stride):
                 if group_min_target_time is not None and not pd.isna(group_min_target_time):
                     target_idx = s + self.L
                     if target_idx >= n:

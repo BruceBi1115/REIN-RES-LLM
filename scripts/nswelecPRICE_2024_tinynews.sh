@@ -87,14 +87,14 @@ TEMPLATE_POOL_2="configs/deltaWithNews_template.yaml"
 # Keep task settings aligned with your existing NSW scripts.
 RESIDUAL_LOSS="smooth_l1"
 SELECT_METRIC="mae"
-STRIDE="48"
+STRIDE="1"
 STAGE="all"
 HORIZONS=(
   "48"
-  # "96"
-  # "192"
-  # "336"
-  # "720"
+  "96"
+  "192"
+  "336"
+  "720"
 )
 PATCH_DROPOUT="0"
 HEAD_DROPOUT="0.1"
@@ -113,7 +113,6 @@ DELTA_FREEZE_FEATURE_MODULES="${DELTA_FREEZE_FEATURE_MODULES:-1}"  # keep delta 
 DELTA_NON_DEGRADE_LAMBDA="${DELTA_NON_DEGRADE_LAMBDA:-1.0}"
 DELTA_NON_DEGRADE_MARGIN="${DELTA_NON_DEGRADE_MARGIN:-0.0}"  # best current ablation: guard against degradation, but do not require extra margin
 DELTA_SIGN_LAMBDA="${DELTA_SIGN_LAMBDA:-0.05}"   # explicitly teach DELTA whether residual should be positive or negative
-DELTA_SIGN_MARGIN="${DELTA_SIGN_MARGIN:-0.02}"
 DELTA_SIGN_EPS="${DELTA_SIGN_EPS:-0.03}"
 DELTA_GATE_EPS="${DELTA_GATE_EPS:-0.05}"
 
@@ -149,7 +148,6 @@ DELTA_MAG_LOSS_WEIGHT="${DELTA_MAG_LOSS_WEIGHT:-0.5}"
 DELTA_MAG_TARGET="${DELTA_MAG_TARGET:-log1p}"  # raw | log1p
 DELTA_MAG_MAX="${DELTA_MAG_MAX:-0.0}"          # <=0 disables clamp
 DELTA_RESIDUAL_WEIGHT_SCALE="${DELTA_RESIDUAL_WEIGHT_SCALE:-1.0}"
-REL_SUPERVISE_LAMBDA="${REL_SUPERVISE_LAMBDA:-0.0}"
 GATE_NULL_LAMBDA="${GATE_NULL_LAMBDA:-0.0}"
 CF_PSEUDO_MARGIN="${CF_PSEUDO_MARGIN:-0.01}"
 CF_PSEUDO_TEMP="${CF_PSEUDO_TEMP:-0.2}"
@@ -179,7 +177,6 @@ UTILITY_MMR_LAMBDA="0.8"
 UTILITY_DEDUP_THRESHOLD="0.95"
 UTILITY_KEEP_TOPK="-1"
 UTILITY_MIN_SCORE="-1.0"
-UTILITY_SHOW_IN_PROMPT="1"
 
 # Delta news extension hooks
 NEWS_API_ENABLE="${NEWS_API_ENABLE:-1}"                       # 1 => use OpenAI API for news refine hooks
@@ -200,7 +197,6 @@ NEWS_STRUCTURED_CACHE_ENABLE="${NEWS_STRUCTURED_CACHE_ENABLE:-1}"
 
 NEWS_DOC_CACHE_PATH="${NEWS_DOC_CACHE_PATH:-}"  # optional unified cache file to reuse directly
 # NEWS_DOC_CACHE_PATH="checkpoints/_shared_refine_cache/news_doc_cache_news_2024_2025.json"
-NEWS_DOC_CACHE_PATH="checkpoints/_shared_refine_cache/news_doc_cache_news_2024_2025_elecprice.json"
 
 NEWS_REFINE_PREWARM_MAX_BATCHES="${NEWS_REFINE_PREWARM_MAX_BATCHES:--1}"
 NEWS_REFINE_SHOW_PROGRESS="${NEWS_REFINE_SHOW_PROGRESS:-1}"
@@ -210,7 +206,7 @@ DELTA_STRUCTURED_ENABLE="${DELTA_STRUCTURED_ENABLE:-1}"  # allow DELTA to consum
 DELTA_STRUCTURED_FEATURE_DIM="${DELTA_STRUCTURED_FEATURE_DIM:-12}"
 
 DELTA_MODEL_VARIANT="${DELTA_MODEL_VARIANT:-tiny_news_ts}"
-DELTA_TEXT_FUSE_LAMBDA="${DELTA_TEXT_FUSE_LAMBDA:-0.0}"
+DELTA_TEXT_FUSE_LAMBDA="${DELTA_TEXT_FUSE_LAMBDA:-5.0}"
 TINY_NEWS_PRESET="${TINY_NEWS_PRESET:-distilbert}"  # distilbert | gpt2 | bert_base | roberta_base | deberta_v3_base | custom
 TINY_NEWS_LOADER="${TINY_NEWS_LOADER:-auto}"        # auto | encoder | causal_lm
 TINY_NEWS_MODEL="${TINY_NEWS_MODEL:-}"
@@ -336,7 +332,6 @@ COMMON_ARGS=(
   --delta_non_degrade_lambda "$DELTA_NON_DEGRADE_LAMBDA"
   --delta_non_degrade_margin "$DELTA_NON_DEGRADE_MARGIN"
   --delta_sign_lambda "$DELTA_SIGN_LAMBDA"
-  --delta_sign_margin "$DELTA_SIGN_MARGIN"
   --delta_sign_eps "$DELTA_SIGN_EPS"
   --delta_gate_eps "$DELTA_GATE_EPS"
   --delta_sign_tau "$DELTA_SIGN_TAU"
@@ -371,7 +366,6 @@ COMMON_ARGS=(
   --delta_mag_target "$DELTA_MAG_TARGET"
   --delta_mag_max "$DELTA_MAG_MAX"
   --delta_residual_weight_scale "$DELTA_RESIDUAL_WEIGHT_SCALE"
-  --rel_supervise_lambda "$REL_SUPERVISE_LAMBDA"
   --gate_null_lambda "$GATE_NULL_LAMBDA"
   --cf_pseudo_margin "$CF_PSEUDO_MARGIN"
   --cf_pseudo_temp "$CF_PSEUDO_TEMP"
@@ -416,7 +410,6 @@ COMMON_ARGS=(
   --utility_dedup_threshold "$UTILITY_DEDUP_THRESHOLD"
   --utility_keep_topk "$UTILITY_KEEP_TOPK"
   --utility_min_score "$UTILITY_MIN_SCORE"
-  --utility_show_in_prompt "$UTILITY_SHOW_IN_PROMPT"
   --news_refine_mode "$NEWS_REFINE_MODE"
   --news_refine_cache_enable "$NEWS_REFINE_CACHE_ENABLE"
   --news_structured_cache_enable "$NEWS_STRUCTURED_CACHE_ENABLE"
@@ -467,6 +460,26 @@ normalize_cache_stem() {
   printf '%s\n' "$stem"
 }
 
+verify_news_doc_cache_file() {
+  local news_path="$1"
+  local cache_path="$2"
+  local verify_output
+  if [[ ! -f "$cache_path" ]]; then
+    return 1
+  fi
+  if verify_output="$("$PYTHON_BIN" scripts/verify_refined_news_cache.py \
+    --news "$news_path" \
+    --cache "$cache_path" \
+    --allow-missing 2>&1)"; then
+    if [[ -n "$verify_output" ]]; then
+      printf '%s\n' "$verify_output" >&2
+    fi
+    return 0
+  fi
+  printf '%s\n' "$verify_output" >&2
+  return 1
+}
+
 resolve_news_doc_cache_write_path() {
   local news_path="$1"
   if [[ -n "$NEWS_DOC_CACHE_PATH" ]]; then
@@ -491,26 +504,43 @@ prepare_news_cache_mode() {
   CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH=""
   CURRENT_NEWS_REFINE_PREWARM=1
   CURRENT_NEWS_STRUCTURED_PREWARM=1
+  CURRENT_NEWS_DOC_CACHE_EXPLICIT=0
+  CURRENT_NEWS_CACHE_MODE="build_mode"
 
   if [[ -n "$NEWS_DOC_CACHE_PATH" ]]; then
     CURRENT_NEWS_REFINE_CACHE_READ_PATH="$doc_cache_path"
     CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH="$doc_cache_path"
     CURRENT_NEWS_REFINE_PREWARM=0
     CURRENT_NEWS_STRUCTURED_PREWARM=0
-    echo "[NEWS_CACHE] mode=read cache_path=$doc_cache_path source=explicit"
+    CURRENT_NEWS_DOC_CACHE_EXPLICIT=1
+    CURRENT_NEWS_CACHE_MODE="read_only"
+    echo "[NEWS_CACHE] mode=read_only cache_path=$doc_cache_path source=explicit"
     if [[ ! -f "$doc_cache_path" ]]; then
-      echo "[NEWS_CACHE] cache_path_missing=$doc_cache_path (run will populate it on demand)"
+      echo "[NEWS_CACHE][ERROR] explicit cache path does not exist: $doc_cache_path" >&2
+      return 1
+    fi
+    if ! verify_news_doc_cache_file "$news_path" "$doc_cache_path"; then
+      echo "[NEWS_CACHE][ERROR] explicit cache path is incompatible with current framework identity rules: $doc_cache_path" >&2
+      echo "[NEWS_CACHE][ERROR] Repair the cache or point NEWS_DOC_CACHE_PATH to a validated cache file." >&2
+      return 1
     fi
     return
   fi
 
   if [[ -f "$doc_cache_path" ]]; then
-    CURRENT_NEWS_REFINE_CACHE_READ_PATH="$doc_cache_path"
-    CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH="$doc_cache_path"
-    CURRENT_NEWS_REFINE_PREWARM=0
-    CURRENT_NEWS_STRUCTURED_PREWARM=0
-    echo "[NEWS_CACHE] mode=read cache_path=$doc_cache_path source=auto_discovered"
-    return
+    if verify_news_doc_cache_file "$news_path" "$doc_cache_path"; then
+      CURRENT_NEWS_REFINE_CACHE_READ_PATH="$doc_cache_path"
+      CURRENT_NEWS_STRUCTURED_CACHE_READ_PATH="$doc_cache_path"
+      CURRENT_NEWS_REFINE_PREWARM=0
+      CURRENT_NEWS_STRUCTURED_PREWARM=0
+      CURRENT_NEWS_CACHE_MODE="read_only"
+      echo "[NEWS_CACHE] mode=read_only cache_path=$doc_cache_path source=auto_discovered"
+      return
+    fi
+
+    echo "[NEWS_CACHE][ERROR] auto-discovered cache is incompatible with current framework identity rules: $doc_cache_path" >&2
+    echo "[NEWS_CACHE][ERROR] Repair or delete this cache file before rerunning." >&2
+    return 1
   fi
 
   mkdir -p "$(dirname "$doc_cache_path")"
@@ -521,7 +551,7 @@ prepare_news_cache_mode() {
     rm -f "$legacy_structured_path"
   fi
 
-  echo "[NEWS_CACHE] mode=rebuild news_path=$news_path"
+  echo "[NEWS_CACHE] mode=build_mode news_path=$news_path"
   echo "[NEWS_CACHE] target_doc_cache=$doc_cache_path"
   echo "[NEWS_CACHE] cleared legacy_refine_cache=$legacy_refine_path"
   echo "[NEWS_CACHE] cleared legacy_structured_cache=$legacy_structured_path"
@@ -543,9 +573,12 @@ for i in "${!TASK_NAMES[@]}"; do
             for grad_acc in "${GRAD_ACCS[@]}"; do
               for horizon in "${HORIZONS[@]}"; do
                 run_task="${task}_${base_backbone}_h${horizon}"
-                prepare_news_cache_mode "${NEWS_CHOICES[$j]}"
+                prepare_news_cache_mode "${NEWS_CHOICES[$j]}" || exit 1
                 args=( --taskName "$run_task" "${COMMON_ARGS[@]}" )
 
+                args+=( --news_api_enable "$NEWS_API_ENABLE" )
+                args+=( --news_doc_cache_path "$CURRENT_NEWS_DOC_CACHE_PATH" )
+                args+=( --news_doc_cache_explicit "$CURRENT_NEWS_DOC_CACHE_EXPLICIT" )
                 args+=( --news_refine_cache_path "$CURRENT_NEWS_DOC_CACHE_PATH" )
                 args+=( --news_refine_cache_read_path "$CURRENT_NEWS_REFINE_CACHE_READ_PATH" )
                 args+=( --news_structured_cache_path "$CURRENT_NEWS_DOC_CACHE_PATH" )
