@@ -20,11 +20,9 @@ from ..data_construction.prompt import build_prompt
 from ..delta_news_hooks import extract_structured_events, format_structured_events_for_prompt, refine_news_text
 from ..news_rules import get_candidates, rerank_selected_news_by_utility, select_news
 from ..refine_cache_utils import build_refine_context
-from ..utils.batch_utils import _batch_time_seq_for_sample
 from ..utils.utils import print_prompt_stats
-from ..delta.core import _all_gates_disabled, _delta_gate_is_modeled_internally, _resolve_delta_sign_mode
+from ..delta.core import _resolve_delta_sign_mode
 from ..refine.cache import (
-    _align_refined_docs_to_history_steps,
     _align_ts_to_ref_tz,
     _ascii_table,
     _cache_decision_rows,
@@ -35,7 +33,6 @@ from ..refine.cache import (
     _selected_news_meta_records,
     _structured_events_to_feature_vec,
 )
-from ..signnet.utils import _use_external_signnet_temporal_text
 
 dataStatistic = DataStatistic()
 
@@ -101,13 +98,12 @@ def _open_residual_debug_csv(path: str | None):
         "pred_residual_z",
         "pred_residual_sign_match_pct_additive",
         "final_pred_z",
-        "gate",
-        "gate_logits",
         "sign_logits",
         "sign_soft",
+        "state_logits",
+        "state_score",
         "magnitude",
         "magnitude_raw",
-        "gate_mean",
         "news_count",
         "policy",
         "template_id",
@@ -247,12 +243,6 @@ def _log_enabled_mechanisms(args, live_logger, stage: str):
         for attr in ["news_refine_mode", "news_structured_mode", "hard_reflection_mode"]
     )
     structured_enabled = int(getattr(args, "delta_structured_enable", 0)) == 1
-    text_direct_enabled = int(getattr(args, "delta_text_direct_enable", 0)) == 1
-    text_direct_effective = text_direct_enabled and abs(float(getattr(args, "delta_text_fuse_lambda", 0.0))) > 0.0
-    doc_direct_enabled = int(getattr(args, "delta_doc_direct_enable", 0)) == 1
-    doc_direct_effective = doc_direct_enabled and abs(float(getattr(args, "delta_doc_fuse_lambda", 0.0))) > 0.0
-    non_degrade_enabled = float(getattr(args, "delta_non_degrade_lambda", 0.0)) > 0.0
-    sign_enabled = float(getattr(args, "delta_sign_lambda", 0.0)) > 0.0
 
     live_logger.info(
         f"[MECH][NEWS_API] {'enabled' if news_api_enabled else 'disabled'}: "
@@ -263,62 +253,11 @@ def _log_enabled_mechanisms(args, live_logger, stage: str):
         f"[MECH][STRUCTURED] {'enabled' if structured_enabled else 'disabled'}: "
         f"delta_structured_feature_dim={int(getattr(args, 'delta_structured_feature_dim', 0) or 0)}"
     )
-    if _all_gates_disabled(args):
-        live_logger.info(
-            "[MECH][GATE] disabled: internal delta gate, final fusion gate, and text gate are all bypassed."
-        )
-    elif int(getattr(args, "news_gate_enable", 1)) != 1 and (not _delta_gate_is_modeled_internally(args)):
-        live_logger.info(
-            "[MECH][FINAL_GATE] disabled: final fusion gate is bypassed; internal delta gate/text gate remain active."
-        )
-    elif delta_active:
-        live_logger.info(
-            "[MECH][FINAL_GATE] enabled in-model: DELTA predicts gate * sign * magnitude directly, "
-            "and trainer fusion is additive base + delta."
-        )
-
     if delta_active:
         live_logger.info(
             "[MECH][DELTA_PROMPT] skipped in DELTA model path: template prompt tokens are not "
-            "consumed by tiny_news_ts; news enters through structured and direct text/doc branches."
+            "consumed by tiny_news_ts; news enters through structured features only."
         )
-    if text_direct_effective:
-        if delta_active:
-            live_logger.info(
-                "[MECH][TEXT_DIRECT] enabled: refined-news text contributes to the fused news context "
-                "when its branch weight is nonzero."
-            )
-        else:
-            live_logger.info(
-                "[MECH][TEXT_DIRECT] enabled in args, but current stage is BASE-only; "
-                "it will not be executed in this run."
-            )
-    elif text_direct_enabled:
-        live_logger.info(
-            "[MECH][TEXT_DIRECT] disabled in practice: branch is enabled in args but fuse_lambda=0, "
-            "so it does not contribute to the current run."
-        )
-    else:
-        live_logger.info("[MECH][TEXT_DIRECT] disabled.")
-    if doc_direct_effective:
-        if delta_active:
-            live_logger.info(
-                "[MECH][DOC_DIRECT] enabled: article-level refined-news documents are encoded individually "
-                "to produce document attention and document impact in the DELTA deformation path."
-            )
-        else:
-            live_logger.info(
-                "[MECH][DOC_DIRECT] enabled in args, but current stage is BASE-only; "
-                "it will not be executed in this run."
-            )
-    elif doc_direct_enabled:
-        live_logger.info(
-            "[MECH][DOC_DIRECT] disabled in practice: branch is enabled in args but fuse_lambda=0, "
-            "so it does not contribute to the current run."
-        )
-    else:
-        live_logger.info("[MECH][DOC_DIRECT] disabled.")
-    live_logger.info(f"[MECH][NON_DEGRADE] {'enabled' if non_degrade_enabled else 'disabled'}.")
     sign_mode = _resolve_delta_sign_mode(args)
     if sign_mode == "signnet_binary" and delta_active:
         live_logger.info(
@@ -327,8 +266,8 @@ def _log_enabled_mechanisms(args, live_logger, stage: str):
         )
     else:
         live_logger.info(
-            f"[MECH][DELTA_SIGN] {'enabled' if sign_enabled else 'disabled'} "
-            f"(mode={sign_mode})."
+            f"[MECH][DELTA_SIGN] internal sign path only (mode={sign_mode}); "
+            "DELTA training itself is supervised by final prediction loss."
         )
 
 def _format_ts_range(ts_min, ts_max) -> str:
@@ -629,6 +568,95 @@ def _pad_patches(
         ts_patch_mask[i, :P_i] = torch.tensor(pm, dtype=torch.long)
     return ts_patches, ts_patch_mask
 
+def _build_temporal_text_series_for_sample(
+    *,
+    history_times: list[str],
+    news_metas: list[dict],
+    news_docs: list[str],
+    tokenizer,
+    max_tokens: int,
+    per_step_topk: int,
+) -> list[str]:
+    L = len(history_times)
+    if L <= 0:
+        return []
+
+    hist_series = pd.Series(pd.to_datetime(history_times, errors="coerce"))
+    step_times = hist_series.tolist()
+    topk = int(max(1, per_step_topk))
+    doc_items = []
+    for meta, doc_txt in zip(list(news_metas or []), list(news_docs or [])):
+        clean = str(doc_txt or "").strip()
+        if not clean:
+            continue
+        raw_ts = ""
+        if isinstance(meta, dict):
+            raw_ts = meta.get("date", "")
+        ts = _align_ts_to_ref_tz(raw_ts, hist_series)
+        doc_items.append((ts, clean))
+
+    out = []
+    for step_ts in step_times:
+        if pd.isna(step_ts) or len(doc_items) == 0:
+            out.append("")
+            continue
+        eligible = []
+        for doc_ts, clean in doc_items:
+            if pd.isna(doc_ts) or doc_ts <= step_ts:
+                eligible.append((doc_ts, clean))
+        if len(eligible) == 0:
+            out.append("")
+            continue
+        eligible.sort(
+            key=lambda item: (
+                pd.Timestamp.min if pd.isna(item[0]) else item[0]
+            ),
+            reverse=True,
+        )
+        merged = _merge_refined_news_docs(
+            [clean for _, clean in eligible[:topk]],
+            tokenizer=tokenizer,
+            max_tokens=max_tokens,
+        )
+        out.append(str(merged or "").strip())
+    return out
+
+def _tokenize_temporal_text_series(
+    temporal_text_series: list[list[str]],
+    *,
+    tokenizer,
+    max_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if tokenizer is None:
+        raise ValueError("tokenizer is required for temporal text tokenization")
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+
+    ids_3d = []
+    max_len = int(max(1, max_length))
+    for seq in list(temporal_text_series or []):
+        step_ids = []
+        for step_text in list(seq or []):
+            clean = str(step_text or "").strip()
+            if not clean:
+                step_ids.append([])
+                continue
+            try:
+                enc = tokenizer(
+                    clean,
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=max_len,
+                    return_attention_mask=False,
+                )
+                ids = enc.get("input_ids", []) if isinstance(enc, dict) else []
+            except Exception:
+                ids = []
+            step_ids.append(list(ids or []))
+        ids_3d.append(step_ids)
+    return _pad_3d_int(ids_3d, pad_id=pad_id)
+
 def build_batch_inputs(
     batch,
     tokenizer,
@@ -647,6 +675,7 @@ def build_batch_inputs(
     news_dropout: bool = False,
     prompt_path: str = None,
     api_adapter=None,
+    temporal_text_tokenizer=None,
     build_prompt_inputs: bool = True,
 ):
     """
@@ -666,10 +695,12 @@ def build_batch_inputs(
     patch_len = int(getattr(args, "patch_len", 4))
     patch_stride = int(getattr(args, "patch_stride", patch_len))
     need_prompt_context = bool(build_prompt_inputs or record_train_prompt)
-    need_signnet_text_seq = _use_external_signnet_temporal_text(args)
-    signnet_text_max_len = int(max(1, getattr(args, "delta_sign_external_text_max_len", 64)))
 
     tpl_text = templates[tpl_id]["text"]
+    temporal_tok = temporal_text_tokenizer if temporal_text_tokenizer is not None else tokenizer
+    temporal_text_source = str(getattr(args, "delta_temporal_text_source", "refined") or "refined").strip().lower()
+    if temporal_text_source not in {"refined", "raw"}:
+        temporal_text_source = "refined"
     B = len(batch["history_value"])
 
     targets_z_list = []
@@ -679,13 +710,11 @@ def build_batch_inputs(
 
     hist_strs = []
     news_str_list = []
-    refined_news_list = []
-    refined_news_docs_list = []
-    signnet_text_step_list = []
     structured_events_list = []
     structured_doc_events_list = []
     structured_feature_list = []
     rel_labels_list = []
+    temporal_text_series_list = []
 
     start_dates = []
     end_dates = []
@@ -741,9 +770,9 @@ def build_batch_inputs(
         news_str = ""
         refined_news = ""
         refined_news_docs = []
-        signnet_step_texts = ["" for _ in range(L)]
         structured_events = {}
         structured_doc_events = []
+        temporal_text_series = [""] * L
         if (not force_no_news) and len(selected) > 0:
             raw_news_texts = selected[news_text_col].fillna("").astype(str).tolist()
             selected_news_metas = _selected_news_meta_records(
@@ -752,12 +781,6 @@ def build_batch_inputs(
                 text_col=news_text_col,
                 time_col=args.news_time_col,
             )
-            selected_news_times = (
-                selected[args.news_time_col].tolist()
-                if args.news_time_col in selected.columns
-                else [t_target for _ in raw_news_texts]
-            )
-            history_times_i = _batch_time_seq_for_sample(batch.get("history_times"), i)
             refine_context = build_refine_context(args, target_time=t_target)
             aligned_refined_news_docs = _refine_news_docs_aligned_from_doc_cache(
                 raw_news_texts=raw_news_texts,
@@ -780,14 +803,6 @@ def build_batch_inputs(
                 tokenizer=tokenizer,
                 max_tokens=news_budget,
             )
-            if need_signnet_text_seq:
-                signnet_step_texts = _align_refined_docs_to_history_steps(
-                    history_times=history_times_i,
-                    news_times=selected_news_times,
-                    refined_news_docs=aligned_refined_news_docs,
-                    tokenizer=tokenizer,
-                    max_tokens=signnet_text_max_len,
-                )
 
             if (not refined_news) and (not _news_cache_is_read_only(args)):
                 # Last fallback keeps legacy behavior if doc-level refine yields empty.
@@ -801,9 +816,20 @@ def build_batch_inputs(
                     context=refine_context,
                 )
             refined_news_docs = [str(x or "").strip() for x in refined_news_docs if str(x or "").strip()]
-            doc_cap = int(max(1, getattr(args, "delta_doc_max_docs", 4)))
+            doc_cap = 4
             if doc_cap > 0:
                 refined_news_docs = refined_news_docs[:doc_cap]
+
+            if int(getattr(args, "delta_temporal_text_enable", 0)) == 1:
+                temporal_text_docs = aligned_refined_news_docs if temporal_text_source == "refined" else raw_news_texts
+                temporal_text_series = _build_temporal_text_series_for_sample(
+                    history_times=list(batch["history_times"][i]),
+                    news_metas=selected_news_metas,
+                    news_docs=temporal_text_docs,
+                    tokenizer=temporal_tok,
+                    max_tokens=int(max(1, getattr(args, "delta_temporal_text_max_len", 96))),
+                    per_step_topk=int(max(1, getattr(args, "delta_temporal_text_per_step_topk", 3))),
+                )
 
             pieces = [refined_news] if need_prompt_context and refined_news else []
 
@@ -882,11 +908,9 @@ def build_batch_inputs(
         if need_prompt_context:
             hist_strs.append(history_text(history_z, mu_global, sigma_global))
             news_str_list.append(news_str)
-        refined_news_list.append(str(refined_news or ""))
-        refined_news_docs_list.append(list(refined_news_docs))
-        signnet_text_step_list.append(list(signnet_step_texts))
         structured_events_list.append(dict(structured_events) if isinstance(structured_events, dict) else {})
         structured_doc_events_list.append(list(structured_doc_events))
+        temporal_text_series_list.append(list(temporal_text_series))
 
         if need_prompt_context:
             start_dates.append(start_date)
@@ -950,75 +974,20 @@ def build_batch_inputs(
                 with open(prompt_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     input_ids, attn = _pad_2d_int(ids_list, pad_id=tokenizer.pad_token_id)
-    refined_ids_list = []
-    refined_doc_ids_list = []
-    signnet_text_ids_list = []
-    refined_max_len = int(max(1, getattr(args, "delta_text_max_len", 160)))
-    refined_doc_max_len = int(max(1, getattr(args, "delta_doc_max_len", 96)))
-    refined_doc_max_docs = int(max(1, getattr(args, "delta_doc_max_docs", 4)))
-    for refined_txt in refined_news_list:
-        txt = str(refined_txt or "").strip()
-        if not txt:
-            refined_ids_list.append([])
-            continue
-        enc = tokenizer(
-            txt,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=refined_max_len,
-            return_attention_mask=False,
-        )
-        refined_ids_list.append(enc["input_ids"])
-    for refined_docs in refined_news_docs_list:
-        doc_ids = []
-        docs_trim = list(refined_docs[:refined_doc_max_docs])
-        for doc_txt in docs_trim:
-            txt = str(doc_txt or "").strip()
-            if not txt:
-                continue
-            enc = tokenizer(
-                txt,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=refined_doc_max_len,
-                return_attention_mask=False,
-            )
-            doc_ids.append(enc["input_ids"])
-        refined_doc_ids_list.append(doc_ids)
-    for step_texts in signnet_text_step_list:
-        step_ids = []
-        seq_trim = list(step_texts[:L])
-        if len(seq_trim) < L:
-            seq_trim.extend(["" for _ in range(L - len(seq_trim))])
-        for step_txt in seq_trim:
-            txt = str(step_txt or "").strip()
-            if not txt:
-                step_ids.append([])
-                continue
-            enc = tokenizer(
-                txt,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=signnet_text_max_len,
-                return_attention_mask=False,
-            )
-            step_ids.append(enc["input_ids"])
-        signnet_text_ids_list.append(step_ids)
-    refined_news_ids, refined_news_attn = _pad_2d_int(refined_ids_list, pad_id=tokenizer.pad_token_id)
-    refined_news_doc_ids, refined_news_doc_attn, refined_news_doc_mask = _pad_3d_int(
-        refined_doc_ids_list,
-        pad_id=tokenizer.pad_token_id,
-    )
-    signnet_text_ids, signnet_text_attn, signnet_text_mask = _pad_3d_int(
-        signnet_text_ids_list,
-        pad_id=tokenizer.pad_token_id,
-    )
     ts_patches, ts_patch_mask = _pad_patches(patches_list, patchmask_list, patch_len=patch_len)
     targets_z = torch.stack([torch.tensor(t, dtype=torch.float32) for t in targets_z_list], dim=0)
     # print("max = ", len_selected_news)
     rel_labels = torch.tensor(rel_labels_list, dtype=torch.float32)
     news_counts = torch.tensor(len_selected_news, dtype=torch.float32)
     structured_feats = torch.tensor(np.stack(structured_feature_list, axis=0), dtype=torch.float32)
+    if int(getattr(args, "delta_temporal_text_enable", 0)) == 1:
+        temporal_text_ids, temporal_text_attn, temporal_text_step_mask = _tokenize_temporal_text_series(
+            temporal_text_series_list,
+            tokenizer=temporal_tok,
+            max_length=int(max(1, getattr(args, "delta_temporal_text_max_len", 96))),
+        )
+    else:
+        temporal_text_ids, temporal_text_attn, temporal_text_step_mask = None, None, None
     return (
         input_ids,
         attn,
@@ -1032,20 +1001,16 @@ def build_batch_inputs(
         structured_events_list,
         structured_doc_events_list,
         structured_feats,
-        refined_news_ids,
-        refined_news_attn,
-        refined_news_doc_ids,
-        refined_news_doc_attn,
-        refined_news_doc_mask,
-        signnet_text_ids,
-        signnet_text_attn,
-        signnet_text_mask,
+        temporal_text_ids,
+        temporal_text_attn,
+        temporal_text_step_mask,
     )
 
 def build_delta_batch_inputs(
     *,
     batch,
     tokenizer,
+    temporal_text_tokenizer=None,
     templates,
     tpl_id,
     args,
@@ -1072,17 +1037,13 @@ def build_delta_batch_inputs(
         structured_events_list,
         structured_doc_events_list,
         structured_feats,
-        refined_news_ids,
-        refined_news_attn,
-        refined_news_doc_ids,
-        refined_news_doc_attn,
-        refined_news_doc_mask,
-        signnet_text_ids,
-        signnet_text_attn,
-        signnet_text_mask,
+        temporal_text_ids,
+        temporal_text_attn,
+        temporal_text_step_mask,
     ) = build_batch_inputs(
         batch=batch,
         tokenizer=tokenizer,
+        temporal_text_tokenizer=temporal_text_tokenizer,
         templates=templates,
         tpl_id=tpl_id,
         args=args,
@@ -1109,14 +1070,9 @@ def build_delta_batch_inputs(
         "structured_events": structured_events_list,
         "structured_doc_events": structured_doc_events_list,
         "structured_feats": structured_feats,
-        "refined_news_ids": refined_news_ids,
-        "refined_news_attn": refined_news_attn,
-        "refined_news_doc_ids": refined_news_doc_ids,
-        "refined_news_doc_attn": refined_news_doc_attn,
-        "refined_news_doc_mask": refined_news_doc_mask,
-        "signnet_text_ids": signnet_text_ids,
-        "signnet_text_attn": signnet_text_attn,
-        "signnet_text_mask": signnet_text_mask,
+        "temporal_text_ids": temporal_text_ids,
+        "temporal_text_attn": temporal_text_attn,
+        "temporal_text_step_mask": temporal_text_step_mask,
     }
 
 def evaluate_metrics_single(
@@ -1175,14 +1131,9 @@ def evaluate_metrics_single(
             _structured_events,
             _structured_doc_events,
             _structured_feats,
-            _refined_news_ids,
-            _refined_news_attn,
-            _refined_news_doc_ids,
-            _refined_news_doc_attn,
-            _refined_news_doc_mask,
-            _signnet_text_ids,
-            _signnet_text_attn,
-            _signnet_text_mask,
+            _temporal_text_ids,
+            _temporal_text_attn,
+            _temporal_text_step_mask,
         ) = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,

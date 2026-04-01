@@ -33,33 +33,26 @@ from ..base.common import (
 )
 from ..base_backbone import load_base_backbone_checkpoint
 from ..delta_news_hooks import reflect_hard_samples
-from ..model2 import _resolve_text_spec, build_delta_model, load_checkpoint, save_checkpoint
+from ..model2 import build_delta_model, load_checkpoint, save_checkpoint
 from ..refine.cache import _init_refine_cache, _init_structured_cache, _prewarm_refine_cache, _save_refine_cache, _save_structured_cache
 from ..signnet.training import _compose_delta_with_external_sign, _run_external_signnet, _train_external_signnet
-from ..signnet.utils import _use_external_signnet_temporal_text
 from ..utils.batch_utils import _batch_time_seq_for_sample
 from ..utils.residual_utils import split_two_stage_epochs
 from ..utils.utils import draw_pred_true, record_test_results_csv
 from .core import (
-    _all_gates_disabled,
+    _build_cleaned_residual_targets,
     _build_delta_optimizer,
-    _build_delta_residual_position_weights,
     _build_delta_targets,
-    _build_horizon_gate_targets,
     _build_news_usefulness_weights,
-    _bounded_sigmoid_gate,
-    _epoch_ramp_scale,
+    _build_relative_state_targets,
     _fuse_base_and_delta,
     _log_last_residual_eval_diag,
+    _match_horizon_shape,
     _masked_binary_accuracy_from_logits,
-    _masked_weighted_mean,
-    _match_gate_shape,
+    _masked_multiclass_accuracy_from_logits,
     _resolve_delta_residual_mode,
     _resolve_delta_sign_mode,
     _select_metric,
-    _step_ramp_scale,
-    _structured_consistency_losses,
-    _transform_delta_magnitude_target,
     _use_external_signnet,
 )
 
@@ -83,13 +76,14 @@ def evaluate_metrics_residual(
     news_dropout: bool = False,
     filename: str = None,
     api_adapter=None,
+    temporal_text_tokenizer=None,
     residual_debug_csv_path: str | None = None,
     residual_debug_split: str | None = None,
 ):
     """
     Residual evaluation:
       additive mode: final_pred = base_pred + delta_pred
-      relative mode: legacy fallback only
+      relative mode: final_pred = base_raw * (1 + relative_delta)
     Returns:
       final_loss, final_mse, final_mae, base_loss, base_mse, base_mae
     """
@@ -104,6 +98,7 @@ def evaluate_metrics_residual(
     if _use_external_signnet(args) and external_signnet is None:
         raise ValueError("delta_sign_mode=signnet_binary requires an external_signnet model during evaluation.")
     use_external_sign = _use_external_signnet(args) and (external_signnet is not None)
+    relative_mode = _resolve_delta_residual_mode(args) == "relative"
     if use_external_sign:
         external_signnet.eval()
 
@@ -111,9 +106,6 @@ def evaluate_metrics_residual(
     base_loss_sum = 0.0
     se_sum, ae_sum, n_elems = 0.0, 0.0, 0
     base_se_sum, base_ae_sum = 0.0, 0.0
-    gate_sum = 0.0
-    gate_active_sum = 0.0
-    gate_count = 0
     sign_correct_sum = 0.0
     sign_valid_sum = 0.0
     mag_pred_sum = 0.0
@@ -142,6 +134,7 @@ def evaluate_metrics_residual(
             delta_inputs = build_delta_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
+                temporal_text_tokenizer=temporal_text_tokenizer,
                 templates=templates,
                 tpl_id=tpl_id,
                 args=args,
@@ -163,71 +156,80 @@ def evaluate_metrics_residual(
             structured_events_d = delta_inputs["structured_events"]
             structured_doc_events_d = delta_inputs["structured_doc_events"]
             structured_feats_d = delta_inputs["structured_feats"]
-            refined_news_ids_d = delta_inputs["refined_news_ids"]
-            refined_news_attn_d = delta_inputs["refined_news_attn"]
-            refined_news_doc_ids_d = delta_inputs["refined_news_doc_ids"]
-            refined_news_doc_attn_d = delta_inputs["refined_news_doc_attn"]
-            refined_news_doc_mask_d = delta_inputs["refined_news_doc_mask"]
-            signnet_text_ids_d = delta_inputs["signnet_text_ids"]
-            signnet_text_attn_d = delta_inputs["signnet_text_attn"]
-            signnet_text_mask_d = delta_inputs["signnet_text_mask"]
+            temporal_text_ids_d = delta_inputs.get("temporal_text_ids")
+            temporal_text_attn_d = delta_inputs.get("temporal_text_attn")
+            temporal_text_step_mask_d = delta_inputs.get("temporal_text_step_mask")
 
             ts_p = ts_p.to(device)
             ts_pm = ts_pm.to(device)
             targets_z = targets_z.to(device)
             structured_feats_d = structured_feats_d.to(device=device, dtype=torch.float32)
-            refined_news_ids_d = refined_news_ids_d.to(device)
-            refined_news_attn_d = refined_news_attn_d.to(device)
-            refined_news_doc_ids_d = refined_news_doc_ids_d.to(device)
-            refined_news_doc_attn_d = refined_news_doc_attn_d.to(device)
-            refined_news_doc_mask_d = refined_news_doc_mask_d.to(device)
-            signnet_text_ids_d = signnet_text_ids_d.to(device=device, dtype=torch.long)
-            signnet_text_attn_d = signnet_text_attn_d.to(device=device, dtype=torch.long)
-            signnet_text_mask_d = signnet_text_mask_d.to(device=device, dtype=torch.float32)
+            if temporal_text_ids_d is not None:
+                temporal_text_ids_d = temporal_text_ids_d.to(device=device, dtype=torch.long)
+            if temporal_text_attn_d is not None:
+                temporal_text_attn_d = temporal_text_attn_d.to(device=device, dtype=torch.long)
+            if temporal_text_step_mask_d is not None:
+                temporal_text_step_mask_d = temporal_text_step_mask_d.to(device=device, dtype=torch.long)
             signnet_history_z = history_z.to(torch.float32) if use_external_sign else None
 
             # delta pred: adapter on + with news
             out_delta = delta_model(
                 ts_patches=ts_p,
                 ts_patch_mask=ts_pm,
-                refined_news_input_ids=refined_news_ids_d,
-                refined_news_attention_mask=refined_news_attn_d,
-                refined_news_doc_input_ids=refined_news_doc_ids_d,
-                refined_news_doc_attention_mask=refined_news_doc_attn_d,
-                refined_news_doc_mask=refined_news_doc_mask_d,
                 targets=None,
                 head_mode="delta",
                 rel_targets=None,
                 rel_lambda=0.0,
                 structured_feats=structured_feats_d,
+                temporal_text_ids=temporal_text_ids_d,
+                temporal_text_attn=temporal_text_attn_d,
+                temporal_text_step_mask=temporal_text_step_mask_d,
             )
             delta_corr_model = out_delta["pred"].to(torch.float32)
-            gate_logits = out_delta.get("gate_logits", out_delta["rel_logits"]).to(torch.float32)
-            gate = out_delta.get("gate", torch.sigmoid(gate_logits)).to(torch.float32)
             magnitude = out_delta.get("magnitude", torch.abs(delta_corr_model)).to(torch.float32)
             magnitude_raw = out_delta.get("magnitude_raw", magnitude).to(torch.float32)
             if use_external_sign:
-                sign_logits, sign_soft = _run_external_signnet(
+                ctrl_logits, ctrl_score = _run_external_signnet(
                     signnet_model=external_signnet,
                     history_z=signnet_history_z,
                     base_pred_z=base_pred,
                     structured_feats=structured_feats_d,
-                    news_counts=news_counts_d.to(device=device, dtype=torch.float32),
+                    text_summary=out_delta.get("text_summary"),
+                    text_strength=out_delta.get("text_strength"),
                     tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
-                    signnet_text_ids=signnet_text_ids_d,
-                    signnet_text_attn=signnet_text_attn_d,
-                    signnet_text_mask=signnet_text_mask_d,
                 )
-                delta_corr, gate = _compose_delta_with_external_sign(
-                    gate=gate,
+                delta_corr = _compose_delta_with_external_sign(
                     magnitude=magnitude,
-                    sign_soft=sign_soft,
+                    sign_soft=ctrl_score,
                     delta_clip=float(getattr(delta_model, "delta_clip", getattr(args, "delta_clip", 0.0))),
+                    residual_mode=_resolve_delta_residual_mode(args),
+                    relative_delta=delta_corr_model,
                 )
+                if relative_mode:
+                    state_logits = ctrl_logits.to(torch.float32)
+                    state_score = ctrl_score.to(torch.float32)
+                    sign_logits = None
+                    sign_soft = None
+                else:
+                    sign_logits = ctrl_logits.to(torch.float32)
+                    sign_soft = ctrl_score.to(torch.float32)
+                    state_logits = None
+                    state_score = None
             else:
                 delta_corr = delta_corr_model
-                sign_logits = out_delta.get("sign_logits", torch.zeros_like(delta_corr)).to(torch.float32)
-                sign_soft = out_delta.get("sign_soft", torch.zeros_like(delta_corr)).to(torch.float32)
+                if relative_mode:
+                    state_logits = out_delta.get(
+                        "state_logits",
+                        torch.zeros(delta_corr.size(0), delta_corr.size(1), 3, device=delta_corr.device, dtype=torch.float32),
+                    ).to(torch.float32)
+                    state_score = out_delta.get("state_score", torch.zeros_like(delta_corr)).to(torch.float32)
+                    sign_logits = None
+                    sign_soft = None
+                else:
+                    sign_logits = out_delta.get("sign_logits", torch.zeros_like(delta_corr)).to(torch.float32)
+                    sign_soft = out_delta.get("sign_soft", torch.zeros_like(delta_corr)).to(torch.float32)
+                    state_logits = None
+                    state_score = None
 
             targets_cpu = batch["target_value"].detach().cpu().numpy()  # raw
 
@@ -237,48 +239,84 @@ def evaluate_metrics_residual(
             targets_z_cpu = targets_z_f.detach().cpu().numpy()
             base_pred_f = base_pred.to(torch.float32)
             delta_corr_f = delta_corr.to(torch.float32)
-            gate_f = _match_gate_shape(gate.to(torch.float32), delta_corr_f)
-            gate_logits_f = _match_gate_shape(gate_logits.to(torch.float32), delta_corr_f)
-            sign_logits_f = _match_gate_shape(sign_logits.to(torch.float32), delta_corr_f)
-            sign_soft_f = _match_gate_shape(sign_soft.to(torch.float32), delta_corr_f)
-            magnitude_f = _match_gate_shape(magnitude.to(torch.float32), delta_corr_f)
-            magnitude_raw_f = _match_gate_shape(magnitude_raw.to(torch.float32), delta_corr_f)
+            magnitude_f = _match_horizon_shape(magnitude.to(torch.float32), delta_corr_f)
+            magnitude_raw_f = _match_horizon_shape(magnitude_raw.to(torch.float32), delta_corr_f)
+            if relative_mode:
+                state_logits_f = state_logits.to(torch.float32)
+                state_score_f = _match_horizon_shape(state_score.to(torch.float32), delta_corr_f)
+                sign_logits_f = None
+                sign_soft_f = None
+            else:
+                sign_logits_f = _match_horizon_shape(sign_logits.to(torch.float32), delta_corr_f)
+                sign_soft_f = _match_horizon_shape(sign_soft.to(torch.float32), delta_corr_f)
+                state_logits_f = None
+                state_score_f = None
             pred_z = _fuse_base_and_delta(
                 base_pred_z=base_pred_f,
                 delta_pred=delta_corr_f,
-                gate_h=gate_f,
                 args=args,
                 mu_global=mu_global,
                 sigma_global=sigma_global,
             )
             loss = F.l1_loss(pred_z, targets_z_f, reduction="mean")
             base_loss = F.l1_loss(base_pred_f, targets_z_f, reduction="mean")
-            true_residual_batch = targets_z_f - base_pred_f
-            abs_residual_batch = true_residual_batch.abs()
-            sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
-            valid_sign_mask = (abs_residual_batch > sign_eps).to(torch.float32)
-            sign_target_bin = (true_residual_batch > 0).to(torch.float32)
+            raw_residual_batch = _build_delta_targets(
+                targets_z=targets_z_f,
+                base_pred=base_pred_f,
+                mu_global=mu_global,
+                sigma_global=sigma_global,
+                args=args,
+            )
+            cleaned_residual_batch = _build_cleaned_residual_targets(
+                raw_residual=raw_residual_batch,
+                structured_feats=structured_feats_d,
+                args=args,
+            )
+            if relative_mode:
+                abs_residual_batch = raw_residual_batch.abs()
+                valid_sign_mask = torch.ones_like(abs_residual_batch, dtype=torch.float32)
+                state_targets = _build_relative_state_targets(
+                    raw_residual_batch,
+                    args,
+                    structured_feats=structured_feats_d,
+                )
+                sign_target_bin = None
+            else:
+                abs_residual_batch = cleaned_residual_batch.abs()
+                sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
+                valid_sign_mask = (abs_residual_batch > sign_eps).to(torch.float32)
+                sign_target_bin = (cleaned_residual_batch > 0).to(torch.float32)
             pred_z_cpu = pred_z.detach().cpu().numpy()
             base_pred_cpu = base_pred_f.detach().cpu().numpy()
             delta_corr_cpu = delta_corr_f.detach().cpu().numpy()
-            gate_cpu = gate_f.detach().cpu().numpy()
-            gate_logits_cpu = gate_logits_f.detach().cpu().numpy()
-            sign_logits_cpu = sign_logits_f.detach().cpu().numpy()
-            sign_soft_cpu = sign_soft_f.detach().cpu().numpy()
             magnitude_cpu = magnitude_f.detach().cpu().numpy()
             magnitude_raw_cpu = magnitude_raw_f.detach().cpu().numpy()
+            if relative_mode:
+                state_logits_cpu = state_logits_f.detach().cpu().numpy()
+                state_score_cpu = state_score_f.detach().cpu().numpy()
+                sign_logits_cpu = None
+                sign_soft_cpu = None
+            else:
+                sign_logits_cpu = sign_logits_f.detach().cpu().numpy()
+                sign_soft_cpu = sign_soft_f.detach().cpu().numpy()
+                state_logits_cpu = None
+                state_score_cpu = None
             loss_sum += float(loss.detach().cpu()) * bs
             base_loss_sum += float(base_loss.detach().cpu()) * bs
             n_samples += bs
-            gate_sum += float(gate_f.sum().detach().cpu())
-            gate_active_sum += float((gate_f > 0.5).to(torch.float32).sum().detach().cpu())
-            gate_count += int(gate_f.numel())
-            sign_correct_sum += float(
-                (((sign_logits_f > 0).to(torch.float32) == sign_target_bin).to(torch.float32) * valid_sign_mask)
-                .sum()
-                .detach()
-                .cpu()
-            )
+            if relative_mode:
+                sign_correct_sum += float(
+                    (_masked_multiclass_accuracy_from_logits(state_logits_f, state_targets, valid_sign_mask) * valid_sign_mask.sum())
+                    .detach()
+                    .cpu()
+                )
+            else:
+                sign_correct_sum += float(
+                    (((sign_logits_f > 0).to(torch.float32) == sign_target_bin).to(torch.float32) * valid_sign_mask)
+                    .sum()
+                    .detach()
+                    .cpu()
+                )
             sign_valid_sum += float(valid_sign_mask.sum().detach().cpu())
             mag_pred_sum += float(magnitude_f.sum().detach().cpu())
             mag_true_sum += float(abs_residual_batch.sum().detach().cpu())
@@ -349,13 +387,12 @@ def evaluate_metrics_residual(
                             "pred_residual_z": _json_csv_cell([float(x) for x in pred_residual_z.tolist()]),
                             "pred_residual_sign_match_pct_additive": sign_match_pct_additive,
                             "final_pred_z": _json_csv_cell([float(x) for x in pred_z_cpu[i].tolist()]),
-                            "gate": _json_csv_cell([float(x) for x in gate_cpu[i].tolist()]),
-                            "gate_logits": _json_csv_cell([float(x) for x in gate_logits_cpu[i].tolist()]),
-                            "sign_logits": _json_csv_cell([float(x) for x in sign_logits_cpu[i].tolist()]),
-                            "sign_soft": _json_csv_cell([float(x) for x in sign_soft_cpu[i].tolist()]),
+                            "sign_logits": "" if sign_logits_cpu is None else _json_csv_cell([float(x) for x in sign_logits_cpu[i].tolist()]),
+                            "sign_soft": "" if sign_soft_cpu is None else _json_csv_cell([float(x) for x in sign_soft_cpu[i].tolist()]),
+                            "state_logits": "" if state_logits_cpu is None else _json_csv_cell([[float(v) for v in row] for row in state_logits_cpu[i].tolist()]),
+                            "state_score": "" if state_score_cpu is None else _json_csv_cell([float(x) for x in state_score_cpu[i].tolist()]),
                             "magnitude": _json_csv_cell([float(x) for x in magnitude_cpu[i].tolist()]),
                             "magnitude_raw": _json_csv_cell([float(x) for x in magnitude_raw_cpu[i].tolist()]),
-                            "gate_mean": float(gate_cpu[i].mean()),
                             "news_count": int(float(news_counts_d[i])) if i < len(news_counts_d) else 0,
                             "policy": str(policy_name),
                             "template_id": int(tpl_id),
@@ -380,7 +417,6 @@ def evaluate_metrics_residual(
                         "pred": [float(x) for x in pred_denorm],
                         "base_pred": [float(x) for x in base_denorm],
                         "true": [float(x) for x in true_vals],
-                        "gate_mean": float(gate_cpu[i].mean()),
                         "news_count": int(float(news_counts_d[i])) if i < len(news_counts_d) else 0,
                         "structured_events": structured_merged,
                         "structured_events_per_doc": structured_docs,
@@ -411,9 +447,7 @@ def evaluate_metrics_residual(
         args,
         "_last_residual_eval_diag",
         {
-            "gate_mean": gate_sum / max(1, gate_count),
-            "gate_frac_gt_0_5": gate_active_sum / max(1, gate_count),
-            "sign_acc": sign_correct_sum / max(1.0, sign_valid_sum),
+            ("state_acc" if relative_mode else "sign_acc"): sign_correct_sum / max(1.0, sign_valid_sum),
             "pred_mag_mean": mag_pred_sum / max(1, n_elems),
             "true_abs_residual_mean": mag_true_sum / max(1, n_elems),
             "delta_abs_mean": delta_abs_sum / max(1, n_elems),
@@ -491,51 +525,39 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             f"sigma_global={global_zstats['sigma_global']:.6f}"
         )
 
-    tokenizer, delta_model = build_delta_model(
+    tokenizer, temporal_text_tokenizer, delta_model = build_delta_model(
         base_model=args.base_model,
         tokenizer_id=args.tokenizer,
         horizon=args.horizon,
         patch_dim=patch_len,
+        patch_stride=int(getattr(args, "patch_stride", patch_len)),
         patch_dropout=args.patch_dropout,
         head_dropout=args.head_dropout,
         head_mlp=args.head_mlp,
-        delta_gate_init_bias=float(getattr(args, "delta_gate_init_bias", 0.0)),
         delta_head_init_std=float(getattr(args, "delta_head_init_std", 0.01)),
-        delta_internal_gate=bool(int(getattr(args, "delta_internal_gate_in_model", getattr(args, "delta_internal_gate", 1)))) and (not _all_gates_disabled(args)),
-        disable_all_gates=_all_gates_disabled(args),
         delta_clip=float(getattr(args, "delta_clip", 3.0)),
         delta_news_tail_tokens=int(getattr(args, "delta_news_tail_tokens", 160)),
-        delta_rel_floor=float(getattr(args, "delta_rel_floor", 0.05)),
         delta_structured_feature_dim=(
             int(getattr(args, "delta_structured_feature_dim", 12))
             if int(getattr(args, "delta_structured_enable", 0)) == 1
             else 0
         ),
         delta_model_variant=str(getattr(args, "delta_model_variant", "tiny_news_ts")),
-        tiny_news_model_preset=str(getattr(args, "tiny_news_model_preset", "custom")),
-        tiny_news_model=str(getattr(args, "tiny_news_model", "")),
-        tiny_news_tokenizer=str(getattr(args, "tiny_news_tokenizer", "")),
         tiny_news_hidden_size=int(getattr(args, "tiny_news_hidden_size", 256)),
-        tiny_news_text_trainable=bool(int(getattr(args, "tiny_news_text_trainable", 0))),
-        tiny_news_loader=str(getattr(args, "tiny_news_loader", "auto")),
-        delta_text_direct_enable=bool(int(getattr(args, "delta_text_direct_enable", 0))),
-        delta_text_fuse_lambda=float(getattr(args, "delta_text_fuse_lambda", 0.5)),
-        delta_text_gate_init_bias=float(getattr(args, "delta_text_gate_init_bias", -2.0)),
-        delta_text_clip=float(getattr(args, "delta_text_clip", 1.5)),
-        delta_text_max_len=int(getattr(args, "delta_text_max_len", 160)),
-        delta_doc_direct_enable=bool(int(getattr(args, "delta_doc_direct_enable", 0))),
-        delta_doc_fuse_lambda=float(getattr(args, "delta_doc_fuse_lambda", 0.75)),
-        delta_doc_gate_init_bias=float(getattr(args, "delta_doc_gate_init_bias", -2.0)),
-        delta_doc_clip=float(getattr(args, "delta_doc_clip", 1.0)),
-        delta_doc_max_len=int(getattr(args, "delta_doc_max_len", 96)),
-        delta_doc_max_docs=int(getattr(args, "delta_doc_max_docs", 4)),
         delta_alpha_scale=float(getattr(args, "delta_alpha_scale", 0.75)),
         delta_patch_prototypes=int(getattr(args, "delta_patch_prototypes", 0)),
         delta_patch_proto_temp=float(getattr(args, "delta_patch_proto_temp", 1.0)),
         delta_sign_tau=float(getattr(args, "delta_sign_tau", 1.0)),
+        delta_residual_mode=_resolve_delta_residual_mode(args),
         delta_sign_mode=_resolve_delta_sign_mode(args),
         delta_mag_max=float(getattr(args, "delta_mag_max", 0.0)),
         doc_candidate_mode=str(getattr(args, "doc_candidate_mode", "beta_only")),
+        # encode news text as inputs
+        delta_temporal_text_enable=int(getattr(args, "delta_temporal_text_enable", 0)),
+        delta_temporal_text_model_id=str(getattr(args, "temporal_text_model_id", "") or ""),
+        delta_temporal_text_dim=int(getattr(args, "delta_temporal_text_dim", 8)),
+        delta_temporal_text_fuse_lambda=float(getattr(args, "delta_temporal_text_fuse_lambda", 0.5)),
+        delta_temporal_text_freeze_encoder=int(getattr(args, "delta_temporal_text_freeze_encoder", 1)),
     )
     delta_model.to(device)
     live_logger.info(
@@ -561,6 +583,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             "pool_ln",
             "text_ctx_ln",
             "text2q",
+            "temporal_text_tower",
+            "temporal_text_gate",
         ]
         for name in freeze_modules:
             if hasattr(delta_model, name):
@@ -579,13 +603,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     # ensure delta-specific heads remain trainable
     train_modules = [
         "delta_head",
-        "delta_gate",
         "delta_fuse",
         "delta_mag_head",
-        "delta_text_ln",
-        "text_proj",
-        "text_delta_head",
-        "text_gate",
+        "text_mag_head",
+        "text_summary_ln",
         "rel_head",
     ]
     for name in train_modules:
@@ -596,8 +617,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     p.requires_grad = True
     if hasattr(delta_model, "delta_log_scale"):
         delta_model.delta_log_scale.requires_grad = True
-    if hasattr(delta_model, "text_log_scale") and delta_model.text_log_scale is not None:
-        delta_model.text_log_scale.requires_grad = True
 
     optim_delta, lr_info = _build_delta_optimizer(delta_model, args)
     live_logger.info(
@@ -636,11 +655,13 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         live_logger=live_logger,
         api_adapter=news_api_adapter,
     )
-
+    # signnet
     external_signnet_model = _train_external_signnet(
         args=args,
         base_backbone=base_backbone,
         tokenizer=tokenizer,
+        temporal_text_tokenizer=temporal_text_tokenizer,
+        temporal_text_tower=getattr(delta_model, "temporal_text_tower", None),
         templates=templates,
         tpl_id=tpl_id,
         policy_name=policy_name,
@@ -658,6 +679,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         api_adapter=news_api_adapter,
     )
     external_sign_enabled = external_signnet_model is not None
+    relative_mode = _resolve_delta_residual_mode(args) == "relative"
     if external_sign_enabled:
         live_logger.info(
             "[DELTA] external signnet is active: DELTA internal sign branch is overridden during train/val/test."
@@ -700,21 +722,28 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     best_delta_alpha = 1.0
     early_stop_patience = max(0, int(getattr(args, "early_stop_patience", 0))) if delta_val_mode == "each_epoch" else 0
     best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
-    delta_warmup_epochs = int(max(0, getattr(args, "delta_warmup_epochs", 0)))
-    delta_curriculum_epochs = int(max(1, getattr(args, "delta_curriculum_epochs", 1)))
-    delta_null_warmup_steps = int(max(0, getattr(args, "delta_null_warmup_steps", 0)))
-    delta_null_ramp_steps = int(max(0, getattr(args, "delta_null_ramp_steps", 0)))
-    live_logger.info(
-        "[DELTA] regularization curriculum: "
-        f"warmup_epochs={delta_warmup_epochs}, curriculum_epochs={delta_curriculum_epochs}, "
-        f"null_warmup_steps={delta_null_warmup_steps}, null_ramp_steps={delta_null_ramp_steps}"
-    )
     live_logger.info(
         "[DELTA] residual branch: "
         f"mode={_resolve_delta_residual_mode(args)} "
         f"sign_mode={_resolve_delta_sign_mode(args)} "
-        f"denom_floor={float(getattr(args, 'delta_relative_denom_floor', 1.0) or 1.0):.6f} "
+        f"denom_floor={float(getattr(args, 'delta_relative_denom_floor', 1.0) if getattr(args, 'delta_relative_denom_floor', 1.0) is not None else 1.0):.6f} "
         f"ratio_clip={float(getattr(args, 'delta_relative_ratio_clip', 0.0) or 0.0):.6f}"
+    )
+    live_logger.info(
+        "[DELTA] cleaned residual supervision: "
+        f"enable={int(getattr(args, 'cleaned_residual_enable', 1))} "
+        f"smooth_alpha={float(getattr(args, 'cleaned_residual_smooth_alpha', 0.6) or 0.0):.3f} "
+        f"structured_mix={float(getattr(args, 'cleaned_residual_structured_mix', 0.35) or 0.0):.3f}"
+    )
+    live_logger.info(
+        "[DELTA] temporal text auxiliary input: "
+        f"enable={int(getattr(args, 'delta_temporal_text_enable', 0))} "
+        f"source={str(getattr(args, 'delta_temporal_text_source', 'refined') or 'refined')} "
+        f"dim={int(getattr(args, 'delta_temporal_text_dim', 8) or 8)} "
+        f"max_len={int(getattr(args, 'delta_temporal_text_max_len', 96) or 96)} "
+        f"per_step_topk={int(getattr(args, 'delta_temporal_text_per_step_topk', 3) or 3)} "
+        f"fuse_lambda={float(getattr(args, 'delta_temporal_text_fuse_lambda', 0.5) or 0.0):.3f} "
+        f"freeze_encoder={int(getattr(args, 'delta_temporal_text_freeze_encoder', 1))}"
     )
 
     def _save_residual_best(epoch_idx: int, metric_now: float | None, tpl_id_now: int, policy_name_now: str):
@@ -736,22 +765,16 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 "mu_global": float(global_zstats["mu_global"]),
                 "sigma_global": float(global_zstats["sigma_global"]),
                 "delta_residual_mode": _resolve_delta_residual_mode(args),
-                "delta_relative_denom_floor": float(getattr(args, "delta_relative_denom_floor", 1.0) or 1.0),
+                "delta_relative_denom_floor": float(
+                    getattr(args, "delta_relative_denom_floor", 1.0)
+                    if getattr(args, "delta_relative_denom_floor", 1.0) is not None
+                    else 1.0
+                ),
                 "delta_relative_ratio_clip": float(getattr(args, "delta_relative_ratio_clip", 0.0) or 0.0),
-                "delta_text_direct_enable": int(getattr(args, "delta_text_direct_enable", 0)),
-                "delta_text_fuse_lambda": float(getattr(args, "delta_text_fuse_lambda", 0.5)),
-                "delta_text_gate_init_bias": float(getattr(args, "delta_text_gate_init_bias", -2.0)),
-                "delta_text_clip": float(getattr(args, "delta_text_clip", 1.5)),
-                "delta_text_max_len": int(getattr(args, "delta_text_max_len", 160)),
-                "delta_doc_direct_enable": int(getattr(args, "delta_doc_direct_enable", 0)),
-                "delta_doc_fuse_lambda": float(getattr(args, "delta_doc_fuse_lambda", 0.75)),
-                "delta_doc_gate_init_bias": float(getattr(args, "delta_doc_gate_init_bias", -2.0)),
-                "delta_doc_clip": float(getattr(args, "delta_doc_clip", 1.0)),
-                "delta_doc_max_len": int(getattr(args, "delta_doc_max_len", 96)),
-                "delta_doc_max_docs": int(getattr(args, "delta_doc_max_docs", 4)),
                 "delta_sign_mode": _resolve_delta_sign_mode(args),
                 "delta_sign_external_enable": int(external_sign_enabled),
                 "delta_sign_external_tau": float(getattr(args, "delta_sign_external_tau", 1.0)),
+                "delta_temporal_text_source": str(getattr(args, "delta_temporal_text_source", "refined") or "refined"),
             },
         )
         if external_sign_enabled:
@@ -763,14 +786,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     "history_len": int(max(1, getattr(args, "history_len", 1))),
                     "horizon": int(max(1, getattr(args, "horizon", 1))),
                     "structured_dim": int(max(0, getattr(args, "delta_structured_feature_dim", 12))),
+                    "text_summary_dim": int(max(0, getattr(external_signnet_model, "text_summary_dim", 0))),
+                    "task_type": str(getattr(external_signnet_model, "task_type", "binary_sign")),
                     "hidden_size": int(max(32, getattr(args, "delta_sign_external_hidden", 256))),
                     "dropout": float(max(0.0, getattr(args, "delta_sign_external_dropout", 0.1))),
-                    "text_dim": int(getattr(args, "delta_sign_external_text_dim", 64)),
-                    "text_model_id": str(_resolve_text_spec(
-                        getattr(args, "tiny_news_model_preset", "custom"),
-                        getattr(args, "tiny_news_model", ""),
-                        getattr(args, "tiny_news_tokenizer", ""),
-                    )[0]) if _use_external_signnet_temporal_text(args) else "",
                     "tau": float(getattr(args, "delta_sign_external_tau", 1.0)),
                     "decision_bias": float(
                         external_signnet_model.decision_bias.detach().cpu().item()
@@ -803,6 +822,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             delta_model=delta_model,
             external_signnet=external_signnet_model,
             tokenizer=tokenizer,
+            temporal_text_tokenizer=temporal_text_tokenizer,
             data_loader=val_loader,
             templates=templates,
             tpl_id=tpl_id,
@@ -826,12 +846,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         pbar = tqdm(train_loader, desc=f"[DELTA] Epoch {epoch+1}/{delta_epochs}")
         hard_reflect_mode = str(getattr(args, "hard_reflection_mode", "off")).lower().strip()
         hard_reflect_buffer = []
-        epoch_reg_scale = _epoch_ramp_scale(
-            epoch_idx=epoch,
-            warmup_epochs=delta_warmup_epochs,
-            curriculum_epochs=delta_curriculum_epochs,
-        )
-        live_logger.info(f"[DELTA][CURRICULUM] epoch={epoch+1} reg_scale={epoch_reg_scale:.3f}")
 
         for bidx, batch in enumerate(pbar):
             with torch.no_grad():
@@ -843,6 +857,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             delta_inputs = build_delta_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
+                temporal_text_tokenizer=temporal_text_tokenizer,
                 templates=templates,
                 tpl_id=tpl_id,
                 args=args,
@@ -862,122 +877,106 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             prompt_texts_d = delta_inputs["prompt_texts"]
             news_counts_d = delta_inputs["news_counts"]
             structured_feats_d = delta_inputs["structured_feats"]
-            refined_news_ids_d = delta_inputs["refined_news_ids"]
-            refined_news_attn_d = delta_inputs["refined_news_attn"]
-            refined_news_doc_ids_d = delta_inputs["refined_news_doc_ids"]
-            refined_news_doc_attn_d = delta_inputs["refined_news_doc_attn"]
-            refined_news_doc_mask_d = delta_inputs["refined_news_doc_mask"]
-            signnet_text_ids_d = delta_inputs["signnet_text_ids"]
-            signnet_text_attn_d = delta_inputs["signnet_text_attn"]
-            signnet_text_mask_d = delta_inputs["signnet_text_mask"]
-            # build base text inputs (no news)
-            delta_null_inputs = build_delta_batch_inputs(
-                batch=batch,
-                tokenizer=tokenizer,
-                templates=templates,
-                tpl_id=tpl_id,
-                args=args,
-                global_zstats=global_zstats,
-                news_df=news_df,
-                policy_name=policy_name,
-                policy_kw=policy_kw,
-                volatility_bin=volatility_bin,
-                testing=False,
-                force_no_news=True,
-                news_dropout=False,
-                api_adapter=news_api_adapter,
-            )
-            news_counts_b = delta_null_inputs["news_counts"]
-            structured_feats_b = delta_null_inputs["structured_feats"]
-            refined_news_ids_b = delta_null_inputs["refined_news_ids"]
-            refined_news_attn_b = delta_null_inputs["refined_news_attn"]
-            refined_news_doc_ids_b = delta_null_inputs["refined_news_doc_ids"]
-            refined_news_doc_attn_b = delta_null_inputs["refined_news_doc_attn"]
-            refined_news_doc_mask_b = delta_null_inputs["refined_news_doc_mask"]
-            signnet_text_ids_b = delta_null_inputs["signnet_text_ids"]
-            signnet_text_attn_b = delta_null_inputs["signnet_text_attn"]
-            signnet_text_mask_b = delta_null_inputs["signnet_text_mask"]
+            temporal_text_ids_d = delta_inputs.get("temporal_text_ids")
+            temporal_text_attn_d = delta_inputs.get("temporal_text_attn")
+            temporal_text_step_mask_d = delta_inputs.get("temporal_text_step_mask")
 
             ts_p = ts_p.to(device)
             ts_pm = ts_pm.to(device)
             targets_z = targets_z.to(device)
             news_counts_d = news_counts_d.to(device=device, dtype=torch.float32)
-            news_counts_b = news_counts_b.to(device=device, dtype=torch.float32)
             structured_feats_d = structured_feats_d.to(device=device, dtype=torch.float32)
-            structured_feats_b = structured_feats_b.to(device=device, dtype=torch.float32)
-            refined_news_ids_d = refined_news_ids_d.to(device)
-            refined_news_attn_d = refined_news_attn_d.to(device)
-            refined_news_ids_b = refined_news_ids_b.to(device)
-            refined_news_attn_b = refined_news_attn_b.to(device)
-            refined_news_doc_ids_d = refined_news_doc_ids_d.to(device)
-            refined_news_doc_attn_d = refined_news_doc_attn_d.to(device)
-            refined_news_doc_mask_d = refined_news_doc_mask_d.to(device)
-            refined_news_doc_ids_b = refined_news_doc_ids_b.to(device)
-            refined_news_doc_attn_b = refined_news_doc_attn_b.to(device)
-            refined_news_doc_mask_b = refined_news_doc_mask_b.to(device)
-            signnet_text_ids_d = signnet_text_ids_d.to(device=device, dtype=torch.long)
-            signnet_text_attn_d = signnet_text_attn_d.to(device=device, dtype=torch.long)
-            signnet_text_mask_d = signnet_text_mask_d.to(device=device, dtype=torch.float32)
-            signnet_text_ids_b = signnet_text_ids_b.to(device=device, dtype=torch.long)
-            signnet_text_attn_b = signnet_text_attn_b.to(device=device, dtype=torch.long)
-            signnet_text_mask_b = signnet_text_mask_b.to(device=device, dtype=torch.float32)
+            if temporal_text_ids_d is not None:
+                temporal_text_ids_d = temporal_text_ids_d.to(device=device, dtype=torch.long)
+            if temporal_text_attn_d is not None:
+                temporal_text_attn_d = temporal_text_attn_d.to(device=device, dtype=torch.long)
+            if temporal_text_step_mask_d is not None:
+                temporal_text_step_mask_d = temporal_text_step_mask_d.to(device=device, dtype=torch.long)
             has_news = (news_counts_d > 0).to(dtype=torch.float32)
             signnet_history_z = history_z.to(torch.float32) if external_sign_enabled else None
 
             delta_model.train()
 
-            delta_targets = _build_delta_targets(
+            raw_delta_targets = _build_delta_targets(
                 targets_z=targets_z,
                 base_pred=base_pred,
                 mu_global=float(global_zstats["mu_global"]),
                 sigma_global=float(global_zstats["sigma_global"]),
                 args=args,
             )
+            if relative_mode:
+                delta_targets = raw_delta_targets
+                relative_state_targets = _build_relative_state_targets(
+                    raw_delta_targets,
+                    args,
+                    structured_feats=structured_feats_d,
+                )
+            else:
+                delta_targets = _build_cleaned_residual_targets(
+                    raw_residual=raw_delta_targets,
+                    structured_feats=structured_feats_d,
+                    args=args,
+                )
+                relative_state_targets = None
 
             out_delta = delta_model(
                 ts_patches=ts_p,
                 ts_patch_mask=ts_pm,
-                refined_news_input_ids=refined_news_ids_d,
-                refined_news_attention_mask=refined_news_attn_d,
-                refined_news_doc_input_ids=refined_news_doc_ids_d,
-                refined_news_doc_attention_mask=refined_news_doc_attn_d,
-                refined_news_doc_mask=refined_news_doc_mask_d,
                 targets=None,
                 head_mode="delta",
                 rel_targets=None,
                 rel_lambda=0.0,
                 structured_feats=structured_feats_d,
+                temporal_text_ids=temporal_text_ids_d,
+                temporal_text_attn=temporal_text_attn_d,
+                temporal_text_step_mask=temporal_text_step_mask_d,
             )
             delta_pred_model_real = out_delta["pred"].to(torch.float32)
-            gate_logits_real = out_delta.get("gate_logits", out_delta["rel_logits"]).to(torch.float32)
-            gate_real = out_delta.get("gate", torch.sigmoid(gate_logits_real)).to(torch.float32)
             magnitude_real = out_delta.get("magnitude", delta_pred_model_real.abs()).to(torch.float32)
             magnitude_raw_real = out_delta.get("magnitude_raw", magnitude_real).to(torch.float32)
             if external_sign_enabled:
                 with torch.no_grad():
-                    sign_logits_real, sign_soft_real = _run_external_signnet(
+                    ctrl_logits_real, ctrl_score_real = _run_external_signnet(
                         signnet_model=external_signnet_model,
                         history_z=signnet_history_z,
                         base_pred_z=base_pred,
                         structured_feats=structured_feats_d,
-                        news_counts=news_counts_d,
+                        text_summary=out_delta.get("text_summary"),
+                        text_strength=out_delta.get("text_strength"),
                         tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
-                        signnet_text_ids=signnet_text_ids_d,
-                        signnet_text_attn=signnet_text_attn_d,
-                        signnet_text_mask=signnet_text_mask_d,
                     )
-                delta_pred_real, gate_real_h = _compose_delta_with_external_sign(
-                    gate=gate_real,
+                delta_pred_real = _compose_delta_with_external_sign(
                     magnitude=magnitude_real,
-                    sign_soft=sign_soft_real,
+                    sign_soft=ctrl_score_real,
                     delta_clip=float(getattr(delta_model, "delta_clip", getattr(args, "delta_clip", 0.0))),
+                    residual_mode=_resolve_delta_residual_mode(args),
+                    relative_delta=delta_pred_model_real,
                 )
+                if relative_mode:
+                    state_logits_real = ctrl_logits_real.to(torch.float32)
+                    state_score_real = ctrl_score_real.to(torch.float32)
+                    sign_logits_real = None
+                    sign_soft_real = None
+                else:
+                    sign_logits_real = ctrl_logits_real.to(torch.float32)
+                    sign_soft_real = ctrl_score_real.to(torch.float32)
+                    state_logits_real = None
+                    state_score_real = None
             else:
-                sign_logits_real = out_delta.get("sign_logits", torch.zeros_like(delta_pred_model_real)).to(torch.float32)
-                sign_soft_real = out_delta.get("sign_soft", torch.zeros_like(delta_pred_model_real)).to(torch.float32)
                 delta_pred_real = delta_pred_model_real
-                gate_real_h = _match_gate_shape(gate_real, delta_pred_real)
-            delta_init_real = (sign_soft_real * magnitude_real).to(torch.float32)
+                if relative_mode:
+                    state_logits_real = out_delta.get(
+                        "state_logits",
+                        torch.zeros(delta_pred_model_real.size(0), delta_pred_model_real.size(1), 3, device=delta_pred_model_real.device, dtype=torch.float32),
+                    ).to(torch.float32)
+                    state_score_real = out_delta.get("state_score", torch.zeros_like(delta_pred_model_real)).to(torch.float32)
+                    sign_logits_real = None
+                    sign_soft_real = None
+                else:
+                    sign_logits_real = out_delta.get("sign_logits", torch.zeros_like(delta_pred_model_real)).to(torch.float32)
+                    sign_soft_real = out_delta.get("sign_soft", torch.zeros_like(delta_pred_model_real)).to(torch.float32)
+                    state_logits_real = None
+                    state_score_real = None
             news_available_mask = out_delta.get(
                 "news_available_mask",
                 has_news.unsqueeze(1),
@@ -994,7 +993,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             pred_real_z = _fuse_base_and_delta(
                 base_pred_z=base_pred,
                 delta_pred=delta_pred_real,
-                gate_h=gate_real_h,
                 args=args,
                 mu_global=float(global_zstats["mu_global"]),
                 sigma_global=float(global_zstats["sigma_global"]),
@@ -1002,189 +1000,30 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             targets_z_typed = targets_z.to(torch.float32)
             true_residual_z = delta_targets.to(torch.float32)
             abs_residual_target = true_residual_z.abs()
-            sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
-            gate_eps_raw = getattr(args, "delta_gate_eps", None)
-            gate_eps = float(sign_eps if gate_eps_raw is None else gate_eps_raw)
-            valid_sign_mask = (abs_residual_target > sign_eps).to(torch.float32)
-            sign_target_bin = (true_residual_z > 0).to(torch.float32)
-            gate_target = (abs_residual_target > gate_eps).to(torch.float32)
-            position_weight = _build_delta_residual_position_weights(abs_residual_target, args)
-            sample_pos_weight = sample_weight.unsqueeze(1) * position_weight
+            valid_sign_mask = torch.ones_like(abs_residual_target, dtype=torch.float32) if relative_mode else (
+                abs_residual_target > float(getattr(args, "delta_sign_eps", 0.03))
+            ).to(torch.float32)
+            sign_target_bin = None if relative_mode else (true_residual_z > 0).to(torch.float32)
 
             residual_mode = str(getattr(args, "residual_loss", "mae")).lower()
             loss_final = _point_loss(pred_real_z, targets_z_typed, mode=residual_mode)
             err_real = torch.abs(pred_real_z - targets_z_typed).mean(dim=1)
-            err_base = torch.abs(base_pred.to(torch.float32) - targets_z_typed).mean(dim=1)
-
-            delta_init_aux_weight = float(
-                getattr(args, "delta_init_aux_weight", getattr(args, "delta_aux_lambda", 0.2))
-            )
-            if delta_init_aux_weight > 0.0:
-                delta_aux_mode = str(getattr(args, "delta_aux_loss", residual_mode)).lower()
-                loss_delta_aux = _point_loss(delta_init_real, true_residual_z, mode=delta_aux_mode)
-            else:
-                loss_delta_aux = torch.zeros((), device=device, dtype=torch.float32)
-
-            delta_gate_loss_weight = float(
-                getattr(args, "delta_gate_loss_weight", getattr(args, "final_gate_sup_weight", getattr(args, "gate_lambda", 0.2)))
-            )
-            if delta_gate_loss_weight > 0.0:
-                gate_bce = F.binary_cross_entropy_with_logits(
-                    gate_logits_real,
-                    gate_target,
-                    reduction="none",
-                )
-                loss_gate_sup = _masked_weighted_mean(gate_bce, sample_pos_weight)
-            else:
-                loss_gate_sup = torch.zeros((), device=device, dtype=torch.float32)
-
-            delta_sign_loss_weight = float(
-                getattr(args, "delta_sign_loss_weight", getattr(args, "delta_sign_lambda", 0.1))
-            )
-            if external_sign_enabled:
-                delta_sign_loss_weight = 0.0
-                loss_delta_sign = torch.zeros((), device=device, dtype=torch.float32)
-            elif delta_sign_loss_weight > 0.0:
-                sign_bce = F.binary_cross_entropy_with_logits(
-                    sign_logits_real,
-                    sign_target_bin,
-                    reduction="none",
-                )
-                loss_delta_sign = _masked_weighted_mean(sign_bce, sample_pos_weight, mask=valid_sign_mask)
-            else:
-                loss_delta_sign = torch.zeros((), device=device, dtype=torch.float32)
-
-            delta_mag_loss_weight = float(getattr(args, "delta_mag_loss_weight", 0.5))
-            if delta_mag_loss_weight > 0.0:
-                mag_pred_target = _transform_delta_magnitude_target(magnitude_real, args)
-                mag_true_target = _transform_delta_magnitude_target(abs_residual_target, args)
-                mag_beta = float(getattr(args, "huber_beta", 0.5))
-                mag_loss_raw = F.smooth_l1_loss(
-                    mag_pred_target,
-                    mag_true_target,
-                    beta=max(1e-6, mag_beta),
-                    reduction="none",
-                )
-                loss_delta_mag = _masked_weighted_mean(mag_loss_raw, sample_pos_weight)
-            else:
-                loss_delta_mag = torch.zeros((), device=device, dtype=torch.float32)
-
-            delta_non_degrade_lambda = float(getattr(args, "delta_non_degrade_lambda", 0.0))
-            delta_non_degrade_margin = float(getattr(args, "delta_non_degrade_margin", 0.0))
-            if delta_non_degrade_lambda > 0.0:
-                loss_non_degrade = torch.relu(err_real - err_base + delta_non_degrade_margin).mean()
-            else:
-                loss_non_degrade = torch.zeros((), device=device, dtype=torch.float32)
-
-            gate_reg_lambda = float(getattr(args, "delta_gate_reg_lambda", 0.0))
-            loss_gate_reg = gate_real.mean()
-            gate_null_lambda = float(getattr(args, "gate_null_lambda", 0.0))
-            struct_impact_weight = float(getattr(args, "struct_impact_weight", 0.0))
-
-            delta_cf_lambda = float(getattr(args, "delta_cf_lambda", 0.0))
-            delta_cf_margin = float(getattr(args, "delta_cf_margin", 0.0))
-            delta_null_lambda = float(getattr(args, "delta_null_lambda", 0.05))
-            null_step_scale = _step_ramp_scale(
-                step_idx=global_step,
-                warmup_steps=delta_null_warmup_steps,
-                ramp_steps=delta_null_ramp_steps,
-            )
-            gate_reg_lambda_eff = gate_reg_lambda * epoch_reg_scale
-            gate_null_lambda_eff = gate_null_lambda * epoch_reg_scale
-            delta_cf_lambda_eff = delta_cf_lambda * epoch_reg_scale
-            delta_null_lambda_eff = delta_null_lambda * epoch_reg_scale * null_step_scale
-            if _all_gates_disabled(args):
-                delta_null_lambda_eff = 0.0
-            loss_cf = torch.zeros((), device=device, dtype=torch.float32)
-            loss_null = torch.zeros((), device=device, dtype=torch.float32)
-            loss_gate_null = torch.zeros((), device=device, dtype=torch.float32)
-            gate_targets = None
-
-            if (
-                delta_cf_lambda_eff > 0.0
-                or delta_null_lambda_eff > 0.0
-                or gate_null_lambda_eff > 0.0
-            ):
-                out_null = delta_model(
-                    ts_patches=ts_p,
-                    ts_patch_mask=ts_pm,
-                    refined_news_input_ids=refined_news_ids_b,
-                    refined_news_attention_mask=refined_news_attn_b,
-                    refined_news_doc_input_ids=refined_news_doc_ids_b,
-                    refined_news_doc_attention_mask=refined_news_doc_attn_b,
-                    refined_news_doc_mask=refined_news_doc_mask_b,
-                    targets=None,
-                    head_mode="delta",
-                    rel_targets=None,
-                    rel_lambda=0.0,
-                    structured_feats=structured_feats_b,
-                )
-                delta_pred_null_model = out_null["pred"].to(torch.float32)
-                gate_logits_null = out_null.get("gate_logits", out_null["rel_logits"]).to(torch.float32)
-                gate_null = out_null.get("gate", torch.sigmoid(gate_logits_null)).to(torch.float32)
-                magnitude_null = out_null.get("magnitude", delta_pred_null_model.abs()).to(torch.float32)
-                if external_sign_enabled:
-                    with torch.no_grad():
-                        sign_logits_null, sign_soft_null = _run_external_signnet(
-                            signnet_model=external_signnet_model,
-                            history_z=signnet_history_z,
-                            base_pred_z=base_pred,
-                            structured_feats=structured_feats_b,
-                            news_counts=news_counts_b,
-                            tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
-                            signnet_text_ids=signnet_text_ids_b,
-                            signnet_text_attn=signnet_text_attn_b,
-                            signnet_text_mask=signnet_text_mask_b,
-                        )
-                    delta_pred_null, gate_null_h = _compose_delta_with_external_sign(
-                        gate=gate_null,
-                        magnitude=magnitude_null,
-                        sign_soft=sign_soft_null,
-                        delta_clip=float(getattr(delta_model, "delta_clip", getattr(args, "delta_clip", 0.0))),
-                    )
-                else:
-                    delta_pred_null = delta_pred_null_model
-                    gate_null_h = _match_gate_shape(gate_null, delta_pred_null)
-                pred_null_z = _fuse_base_and_delta(
-                    base_pred_z=base_pred,
-                    delta_pred=delta_pred_null,
-                    gate_h=gate_null_h,
-                    args=args,
-                    mu_global=float(global_zstats["mu_global"]),
-                    sigma_global=float(global_zstats["sigma_global"]),
-                )
-
-                err_null = torch.abs(pred_null_z - targets_z_typed).mean(dim=1)
-                loss_cf = torch.relu(delta_cf_margin + err_real - err_null).mean()
-                loss_null = delta_pred_null.pow(2).mean() + 0.25 * magnitude_null.pow(2).mean()
-                if gate_null_lambda_eff > 0.0:
-                    null_targets = torch.zeros_like(gate_logits_null, dtype=torch.float32)
-                    loss_gate_null = F.binary_cross_entropy_with_logits(
-                        gate_logits_null,
-                        null_targets,
+            loss_total = loss_final
+            if relative_mode:
+                loss_relative_mag = _point_loss(magnitude_real, abs_residual_target, mode=residual_mode)
+                loss_total = loss_total + loss_relative_mag
+                if not external_sign_enabled:
+                    state_ce = F.cross_entropy(
+                        state_logits_real.reshape(-1, state_logits_real.size(-1)),
+                        relative_state_targets.reshape(-1),
                         reduction="mean",
                     )
-
-            loss_struct_consistency, struct_loss_parts = _structured_consistency_losses(
-                out_delta=out_delta,
-                structured_feats=structured_feats_d,
-                sample_weight=sample_weight,
-                gate_targets=gate_targets,
-            )
-
-            loss_total = (
-                loss_final
-                + delta_init_aux_weight * loss_delta_aux
-                + delta_gate_loss_weight * loss_gate_sup
-                + delta_sign_loss_weight * loss_delta_sign
-                + delta_mag_loss_weight * loss_delta_mag
-                + delta_non_degrade_lambda * loss_non_degrade
-                + struct_impact_weight * loss_struct_consistency
-                + gate_reg_lambda_eff * loss_gate_reg
-                + gate_null_lambda_eff * loss_gate_null
-                + delta_cf_lambda_eff * loss_cf
-                + delta_null_lambda_eff * loss_null
-            )
+                    loss_total = loss_total + state_ce
+                else:
+                    state_ce = None
+            else:
+                loss_relative_mag = None
+                state_ce = None
 
             if hard_reflect_mode not in {"off", "none"} and len(prompt_texts_d) > 0:
                 err_real_batch = torch.abs(pred_real_z - targets_z_typed).mean(dim=1).detach().cpu().numpy()
@@ -1207,10 +1046,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             loss_window.append(float(loss.detach().cpu()))
             if global_step % 10 == 0:
                 avg_train_loss = sum(loss_window) / len(loss_window)
-                gate_mean = float(gate_real_h.mean().detach().cpu())
-                gate_frac = float((gate_real_h > 0.5).to(torch.float32).mean().detach().cpu())
                 sign_acc = float(
-                    _masked_binary_accuracy_from_logits(sign_logits_real, sign_target_bin, valid_sign_mask)
+                    (
+                        _masked_multiclass_accuracy_from_logits(state_logits_real, relative_state_targets, valid_sign_mask)
+                        if relative_mode
+                        else _masked_binary_accuracy_from_logits(sign_logits_real, sign_target_bin, valid_sign_mask)
+                    )
                     .detach()
                     .cpu()
                 )
@@ -1218,22 +1059,19 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 mag_true_mean = float(abs_residual_target.mean().detach().cpu())
                 delta_abs_mean = float(delta_pred_real.abs().mean().detach().cpu())
                 news_frac = float(usable_news.mean().detach().cpu())
-                pbar.set_postfix(
-                    train_loss=f"{avg_train_loss:.6f}",
-                    gate=gate_mean,
-                    g50=gate_frac,
-                    final=float(loss_final.detach().cpu()),
-                    aux=float(loss_delta_aux.detach().cpu()),
-                    gsup=float(loss_gate_sup.detach().cpu()),
-                    sgn=sign_acc,
-                    mag=mag_mean,
-                    true=mag_true_mean,
-                    delta=delta_abs_mean,
-                    ndg=float(loss_non_degrade.detach().cpu()),
-                    news=news_frac,
-                    gnull=float(loss_gate_null.detach().cpu()),
-                    cf=float(loss_cf.detach().cpu()),
-                )
+                postfix = {
+                    "train_loss": f"{avg_train_loss:.6f}",
+                    "final": float(loss_final.detach().cpu()),
+                    "mag": mag_mean,
+                    "true": mag_true_mean,
+                    "delta": delta_abs_mean,
+                    "news": news_frac,
+                }
+                if relative_mode:
+                    postfix["state_acc"] = sign_acc
+                else:
+                    postfix["sgn"] = sign_acc
+                pbar.set_postfix(**postfix)
 
             if (global_step + 1) % args.grad_accum == 0:
                 grad_clip = float(getattr(args, "delta_grad_clip", 0.0))
@@ -1253,6 +1091,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 delta_model=delta_model,
                 external_signnet=external_signnet_model,
                 tokenizer=tokenizer,
+                temporal_text_tokenizer=temporal_text_tokenizer,
                 data_loader=val_loader,
                 templates=templates,
                 tpl_id=tpl_id,
@@ -1357,6 +1196,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 delta_model=delta_model,
                 external_signnet=external_signnet_model,
                 tokenizer=tokenizer,
+                temporal_text_tokenizer=temporal_text_tokenizer,
                 data_loader=val_loader,
                 templates=templates,
                 tpl_id=tpl_id,
@@ -1419,6 +1259,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 delta_model=delta_model,
                 external_signnet=external_signnet_model,
                 tokenizer=tokenizer,
+                temporal_text_tokenizer=temporal_text_tokenizer,
                 data_loader=val_loader,
                 templates=templates,
                 tpl_id=tpl_id,
@@ -1509,7 +1350,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 "global_zstats": global_zstats,
             }
 
-        tok_d, model_best = load_checkpoint(
+        tok_d, temporal_tok_d, model_best = load_checkpoint(
             best_delta_path,
             _single_device_map(args),
             False,
@@ -1521,6 +1362,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         )
 
         tokenizer = tok_d
+        temporal_text_tokenizer = temporal_tok_d
         model_best.to(device)
         model_best.eval()
 
@@ -1560,6 +1402,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             delta_model=model_best,
             external_signnet=external_signnet_model,
             tokenizer=tokenizer,
+            temporal_text_tokenizer=temporal_text_tokenizer,
             data_loader=test_loader,
             templates=templates,
             tpl_id=tpl_for_test,

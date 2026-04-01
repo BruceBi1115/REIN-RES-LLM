@@ -64,23 +64,27 @@ def draw_pred_true(live_logger, args, true_pred_csv_path):
         live_logger.error(f"Failed to draw Pred vs True plot: {e}")
 
 
+def build_experiment_task_name(args) -> str:
+    base_task_name = str(
+        getattr(args, "_raw_task_name", None)
+        or getattr(args, "taskName", "task1")
+        or "task1"
+    ).strip()
+    delta_residual_mode = str(getattr(args, "delta_residual_mode", "additive") or "additive").strip()
+    delta_sign_mode = str(getattr(args, "delta_sign_mode", "signnet_binary") or "signnet_binary").strip()
+    return (
+        f"{base_task_name}_{args.stage}_s{args.stride}_h{args.horizon}_news_{args.news_path}"
+        f"_DELTA_RESIDUAL_MODE_{delta_residual_mode}"
+        f"_DELTA_SIGN_MODE_{delta_sign_mode}"
+    )
+
+
 def record_test_results_csv(args, live_logger, mse, mae):
     try:
         p = f"./results"
         os.makedirs(p, exist_ok=True)
         csv_path = os.path.join(p, f"test_results.csv")
-        task = (
-            f"{args.taskName}_{args.stage}_s{args.stride}_h{args.horizon}_news_{args.news_path}"
-            f"_sel{args.select_metric}_{args.patch_dropout}_{args.head_dropout}_{args.news_dropout}"
-            f"_{args.delta_null_lambda}_{args.delta_cf_lambda}_{args.delta_cf_margin}"
-            f"_base_{args.base_epochs}_delta_{args.delta_epochs}_lr_{args.lr}"
-            f"_gradacc_{args.grad_accum}_sche_{args.scheduler}"
-            f"_lookback_{args.news_window_days}_topK_{args.news_topK}"
-            f"_frz_{int(getattr(args, 'delta_freeze_feature_modules', 0))}"
-            f"_ndl_{float(getattr(args, 'delta_non_degrade_lambda', 0.0))}"
-            f"_ndm_{float(getattr(args, 'delta_non_degrade_margin', 0.0))}"
-            f"_dgib_{float(getattr(args, 'delta_gate_init_bias', 0.0))}"
-        )
+        task = build_experiment_task_name(args)
         new_row = pd.DataFrame([{"Task": task, "MSE": float(mse), "MAE": float(mae)}])
         if os.path.exists(csv_path):
             df = pd.read_csv(csv_path)
@@ -105,6 +109,7 @@ def record_test_results_csv(args, live_logger, mse, mae):
         else:
             out_df = new_row
         out_df.to_csv(csv_path, index=False)
+        live_logger.info(f"[RESULT_TASK] {task}")
         live_logger.info(f"Saved test results to {csv_path} (upsert by Task)")
     except Exception as e:
         live_logger.error(f"Failed to save test results to CSV: {e}")

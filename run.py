@@ -9,19 +9,12 @@ if __name__ == '__main__':
 
     
     parser.add_argument('--rel_lambda', type=float, default=0.3, help='weight for relative loss')
-    parser.add_argument('--delta_null_lambda', type=float, default=0.05)
-    parser.add_argument('--delta_non_degrade_lambda', type=float, default=1.0, help='weight for non-degradation guard vs base')
-    parser.add_argument('--delta_non_degrade_margin', type=float, default=0.0, help='margin in z-space: err_real <= err_base - margin')
-    parser.add_argument('--delta_sign_lambda', type=float, default=0.0,
-                        help='weight for explicit delta sign-consistency loss against signed residual target')
     parser.add_argument('--delta_sign_eps', type=float, default=0.03,
-                        help='ignore sign supervision where |delta_target| <= eps')
-    parser.add_argument('--delta_gate_eps', type=float, default=0.05,
-                        help='gate target threshold on true residual magnitude in z-space')
+                        help='additive mode: ignore sign supervision where |delta_target| <= eps; relative mode: neutral band for q-state labels')
     parser.add_argument('--delta_sign_tau', type=float, default=1.0,
-                        help='temperature for soft sign = tanh(sign_logits / tau)')
-    parser.add_argument('--delta_sign_mode', type=str, default='signnet_binary', choices=['signnet_binary'],
-                        help='sign mode for DELTA residual direction (external signnet binary classifier only)')
+                        help='temperature for additive-mode internal soft sign = tanh(sign_logits / tau)')
+    parser.add_argument('--delta_sign_mode', type=str, default='signnet_binary', choices=['signnet_binary', 'internal'],
+                        help='residual-state mode for DELTA: external SignNet state classifier or internal DELTA state head')
     parser.add_argument('--delta_sign_external_epochs', type=int, default=60,
                         help='epochs for external signnet pretraining when delta_sign_mode=signnet_binary')
     parser.add_argument('--delta_sign_external_hidden', type=int, default=128,
@@ -47,48 +40,29 @@ if __name__ == '__main__':
     parser.add_argument('--delta_sign_external_min_lr', type=float, default=1e-5,
                         help='minimum learning rate for external signnet scheduler')
     parser.add_argument('--delta_sign_external_calibrate_bias', type=int, default=1, choices=[0, 1],
-                        help='calibrate external signnet decision bias on validation set after pretraining')
+                        help='calibrate external signnet decision bias on validation set after pretraining (additive mode only)')
     parser.add_argument('--delta_sign_external_bias_clip', type=float, default=2.0,
                         help='absolute clip bound for calibrated decision bias')
     parser.add_argument('--delta_sign_external_news_dropout', type=int, default=0, choices=[0, 1],
                         help='apply news dropout during external signnet training (0 recommended for stability)')
     parser.add_argument('--delta_sign_external_use_news_weighting', type=int, default=0, choices=[0, 1],
-                        help='apply news usefulness weights in external signnet BCE loss')
+                        help='apply news usefulness weights in external signnet supervision loss')
     parser.add_argument('--delta_sign_external_use_residual_weighting', type=int, default=0, choices=[0, 1],
-                        help='apply residual-magnitude position weights in external signnet BCE loss')
+                        help='apply residual-magnitude position weights in external signnet supervision loss')
     parser.add_argument('--delta_sign_external_use_pos_weight', type=int, default=1, choices=[0, 1],
-                        help='enable masked dynamic pos_weight (neg/pos) for external signnet BCE')
+                        help='enable masked dynamic pos_weight for additive-mode external signnet BCE')
     parser.add_argument('--delta_sign_external_pos_weight_floor', type=float, default=0.5,
-                        help='lower bound for dynamic pos_weight in external signnet BCE')
+                        help='lower bound for additive-mode dynamic pos_weight in external signnet BCE')
     parser.add_argument('--delta_sign_external_pos_weight_clip', type=float, default=3.0,
-                        help='upper bound for dynamic pos_weight in external signnet BCE')
+                        help='upper bound for additive-mode dynamic pos_weight in external signnet BCE')
     parser.add_argument('--delta_sign_external_tau', type=float, default=1.0,
-                        help='temperature for mapping external signnet logits to soft sign via tanh')
-    parser.add_argument('--delta_sign_external_variant', type=str, default='mlp',
-                        choices=['mlp', 'dual_stream_tcn'],
-                        help='external signnet architecture: legacy mlp or dual-stream temporal-text TCN')
-    parser.add_argument('--delta_sign_external_text_dim', type=int, default=64,
-                        help='compressed text feature width for dual_stream_tcn signnet branch')
-    parser.add_argument('--delta_sign_external_text_max_len', type=int, default=64,
-                        help='max token length per aligned history-step refined news text for dual_stream_tcn signnet')
-    parser.add_argument('--delta_gate_loss_weight', type=float, default=0.2,
-                        help='weight for BCE supervision on factorized residual gate logits')
-    parser.add_argument('--delta_sign_loss_weight', type=float, default=0.1,
-                        help='weight for masked BCE supervision on true residual sign logits')
-    parser.add_argument('--delta_mag_loss_weight', type=float, default=0.5,
-                        help='weight for magnitude regression loss on |true residual|')
+                        help='temperature for mapping external additive-mode signnet logits to soft sign via tanh')
     parser.add_argument('--delta_mag_target', type=str, default='log1p', choices=['raw', 'log1p'],
                         help='target transform used for magnitude regression')
     parser.add_argument('--delta_mag_max', type=float, default=0.0,
                         help='optional clamp for predicted magnitude in z-space; <=0 disables')
     parser.add_argument('--delta_residual_weight_scale', type=float, default=1.0,
                         help='bounded extra weight for larger true residual positions')
-    parser.add_argument('--delta_init_aux_weight', type=float, default=0.2,
-                        help='weight for auxiliary supervision on delta_init vs delta target')
-    parser.add_argument('--struct_impact_weight', type=float, default=0.05,
-                        help='weak consistency weight for structured impact sign/scale/decay/mask')
-    parser.add_argument('--final_gate_sup_weight', type=float, default=0.0,
-                        help='weak supervision weight for horizon-wise final gate pseudo targets')
     parser.add_argument('--news_usefulness_weighting', type=int, default=1, choices=[0, 1],
                         help='apply bounded per-sample usefulness weighting to news-specific losses')
     parser.add_argument('--delta_alpha_scale', type=float, default=0.75,
@@ -101,69 +75,14 @@ if __name__ == '__main__':
                         choices=['beta_only'],
                         help='document candidate construction mode for doc impact aggregation')
 
-    parser.add_argument('--news_gate_enable', type=int, default=1, choices=[0, 1], help='enable sample-wise news gate')
-    parser.add_argument('--disable_all_gates', type=int, default=0, choices=[0, 1],
-                        help='disable all gate effects at once: internal delta gate, final fusion gate, and text gate')
-    parser.add_argument('--news_gate_temperature', type=float, default=1.0, help='temperature for sigmoid news gate')
-    parser.add_argument('--news_gate_floor', type=float, default=0.0, help='lower bound for gate value to avoid over-shrink')
-    parser.add_argument('--gate_lambda', type=float, default=0.2, help='weight for gate pseudo-label BCE loss')
-    parser.add_argument('--gate_null_lambda', type=float, default=0.1, help='weight forcing no-news gate toward zero')
-    parser.add_argument('--delta_gate_init_bias', type=float, default=0.0, help='init bias for horizon-wise delta gate head')
-    parser.add_argument('--delta_internal_gate', type=int, default=1, choices=[0, 1],
-                        help='enable internal delta gating in model head (1=on, 0=bypass gate/rel/clip)')
-    parser.add_argument('--delta_internal_gate_in_model', type=int, default=1, choices=[0, 1],
-                        help='enable factorized residual gate inside the DELTA model output path')
     parser.add_argument('--delta_head_init_std', type=float, default=0.01, help='std for delta head weight init')
     parser.add_argument('--delta_clip', type=float, default=3.0, help='tanh clip for delta outputs in z-space (<=0 to disable)')
     parser.add_argument('--delta_news_tail_tokens', type=int, default=160, help='how many tail text tokens to pool as news context')
-    parser.add_argument('--delta_rel_floor', type=float, default=0.05, help='minimum multiplicative factor from relevance gate')
     parser.add_argument('--delta_model_variant', type=str, default='tiny_news_ts', choices=['tiny_news_ts'],
                         help='DELTA model branch')
-    parser.add_argument('--tiny_news_model', type=str, default='distilbert-base-uncased',
-                        help='HF model id/local path for small text encoder in tiny_news_ts branch')
-    parser.add_argument('--tiny_news_model_preset', type=str, default='custom',
-                        choices=['custom', 'distilbert', 'gpt2', 'bert_base', 'roberta_base', 'deberta_v3_base'],
-                        help='preset for tiny news encoder model; custom uses tiny_news_model/tiny_news_tokenizer')
-    parser.add_argument('--tiny_news_tokenizer', type=str, default='',
-                        help='HF tokenizer id for tiny_news_ts branch (default: tiny_news_model)')
     parser.add_argument('--tiny_news_hidden_size', type=int, default=256,
-                        help='fusion hidden size for tiny_news_ts branch')
-    parser.add_argument('--tiny_news_text_trainable', type=int, default=0, choices=[0, 1],
-                        help='whether to finetune tiny news text encoder during DELTA')
-    parser.add_argument('--tiny_news_loader', type=str, default='auto',
-                        choices=['auto', 'encoder', 'causal_lm'],
-                        help='loader type for tiny news encoder')
-    parser.add_argument('--delta_text_direct_enable', type=int, default=0, choices=[0, 1],
-                        help='enable refined-news text encoder branch directly predicting delta correction')
-    parser.add_argument('--delta_text_fuse_lambda', type=float, default=0.5,
-                        help='global fuse weight for text-direct delta correction branch')
-    parser.add_argument('--delta_text_gate_init_bias', type=float, default=-2.0,
-                        help='init bias for text-direct gate logits (negative keeps branch conservative initially)')
-    parser.add_argument('--delta_text_clip', type=float, default=1.5,
-                        help='tanh clip for text-direct correction branch (<=0 disables)')
-    parser.add_argument('--delta_text_max_len', type=int, default=160,
-                        help='max token length for refined-news text encoder inputs')
-    parser.add_argument('--delta_doc_direct_enable', type=int, default=0, choices=[0, 1],
-                        help='enable article-level refined-news branch with doc-aware aggregation')
-    parser.add_argument('--delta_doc_fuse_lambda', type=float, default=0.75,
-                        help='global fuse weight for article-level news correction branch')
-    parser.add_argument('--delta_doc_gate_init_bias', type=float, default=-2.0,
-                        help='init bias for article-level gate logits (negative keeps branch conservative initially)')
-    parser.add_argument('--delta_doc_clip', type=float, default=1.0,
-                        help='tanh clip for article-level correction branch (<=0 disables)')
-    parser.add_argument('--delta_doc_max_len', type=int, default=96,
-                        help='max token length for each refined-news document in article-level branch')
-    parser.add_argument('--delta_doc_max_docs', type=int, default=4,
-                        help='max number of refined-news documents kept per sample for article-level branch')
+                        help='hidden size for DELTA tiny_news_ts branch')
 
-    parser.add_argument('--cf_pseudo_margin', type=float, default=0.01, help='counterfactual gain margin for pseudo labels')
-    parser.add_argument('--cf_pseudo_temp', type=float, default=0.2, help='temperature for soft pseudo labels')
-    parser.add_argument('--cf_pseudo_hard', type=int, default=0, choices=[0, 1], help='use hard(1)/soft(0) pseudo labels')
-    parser.add_argument('--delta_null_warmup_steps', type=int, default=500, help='delay null loss for first N delta steps')
-    parser.add_argument('--delta_null_ramp_steps', type=int, default=500, help='ramp null loss weight for next N delta steps')
-    parser.add_argument('--delta_warmup_epochs', type=int, default=2,
-                        help='disable gate/counterfactual regularizers in first N delta epochs')
-    parser.add_argument('--delta_curriculum_epochs', type=int, default=3, help='ramp-up epochs for delta constraints')
     parser.add_argument('--delta_grad_clip', type=float, default=1.0, help='grad clip norm for delta stage (<=0 to disable)')
     parser.add_argument('--delta_head_lr_scale', type=float, default=1.0, help='lr scale for delta/rel heads in delta stage')
     parser.add_argument('--delta_other_lr_scale', type=float, default=0.5, help='lr scale for other trainable params in delta stage')
@@ -172,21 +91,17 @@ if __name__ == '__main__':
     parser.add_argument('--delta_target_clip', type=float, default=0.0,
                         help='optional clip for delta_target = target-base_pred in z-space; <=0 disables')
     parser.add_argument('--delta_residual_mode', type=str, default='additive', choices=['additive', 'relative'],
-                        help='delta branch target/fusion mode: additive residual or relative ratio residual')
-    parser.add_argument('--delta_relative_denom_floor', type=float, default=1.0,
-                        help='minimum absolute denominator (raw scale) when computing relative residual target/prior')
+                        help='delta branch target/fusion mode: additive residual or relative percentage residual')
+    parser.add_argument('--delta_relative_denom_floor', type=float, default=0.0,
+                        help='minimum absolute scale floor (raw scale) when computing relative percentage residual q')
     parser.add_argument('--delta_relative_ratio_clip', type=float, default=0.0,
-                        help='optional clip for relative ratio residual and fused factor; <=0 disables')
-    parser.add_argument('--delta_aux_lambda', type=float, default=0.0,
-                        help='weight for auxiliary delta regression loss on delta_pred vs delta_target')
-    parser.add_argument('--delta_aux_loss', type=str, default='mae', choices=['mse', 'mae', 'smooth_l1'],
-                        help='loss type for auxiliary delta regression')
-    parser.add_argument('--delta_gate_reg_lambda', type=float, default=0.0,
-                        help='weight for gate regularization to avoid overusing news')
-    parser.add_argument('--delta_cf_lambda', type=float, default=0.0,
-                        help='weight for counterfactual consistency loss (real-news vs null-news)')
-    parser.add_argument('--delta_cf_margin', type=float, default=0.0,
-                        help='counterfactual hinge margin in z-space')
+                        help='optional clip for relative percentage residual q; <=0 disables clipping')
+    parser.add_argument('--cleaned_residual_enable', type=int, default=1, choices=[0, 1],
+                        help='use cleaned residual targets for SignNet and DELTA auxiliary supervision')
+    parser.add_argument('--cleaned_residual_smooth_alpha', type=float, default=0.6,
+                        help='EWMA alpha for horizon-wise cleaned residual smoothing; higher means smoother')
+    parser.add_argument('--cleaned_residual_structured_mix', type=float, default=0.35,
+                        help='blend weight for structured-news residual template in cleaned residual construction')
     parser.add_argument('--news_refine_mode', type=str, default='local', choices=['local', 'api'],
                         help='news refinement backend; local is join+truncate fallback')
     parser.add_argument('--news_refine_cache_enable', type=int, default=1, choices=[0, 1],
@@ -221,6 +136,22 @@ if __name__ == '__main__':
                         help='allow DELTA to consume structured event features directly')
     parser.add_argument('--delta_structured_feature_dim', type=int, default=12,
                         help='feature dimension for structured event vector injected into DELTA')
+    parser.add_argument('--delta_temporal_text_enable', type=int, default=0, choices=[0, 1],
+                        help='enable time-aligned refined-text auxiliary sequence for DELTA')
+    parser.add_argument('--delta_temporal_text_source', type=str, default='refined', choices=['refined', 'raw'],
+                        help='source used by the temporal-text branch: refined cached snippets or original raw news text')
+    parser.add_argument('--temporal_text_model_id', type=str, default='',
+                        help='optional HF model id or local path for the temporal-text encoder/tokenizer; defaults to --tokenizer or --base_model')
+    parser.add_argument('--delta_temporal_text_dim', type=int, default=8,
+                        help='projected feature dimension for the time-aligned text auxiliary sequence')
+    parser.add_argument('--delta_temporal_text_max_len', type=int, default=96,
+                        help='maximum token length for each time-aligned auxiliary text snippet')
+    parser.add_argument('--delta_temporal_text_per_step_topk', type=int, default=3,
+                        help='maximum number of refined news snippets merged for each history step')
+    parser.add_argument('--delta_temporal_text_fuse_lambda', type=float, default=0.5,
+                        help='strength of patch-level fusion from time-aligned text auxiliary features into DELTA')
+    parser.add_argument('--delta_temporal_text_freeze_encoder', type=int, default=1, choices=[0, 1],
+                        help='freeze the pretrained text encoder used for the time-aligned text auxiliary sequence')
     parser.add_argument('--news_api_enable', type=int, default=0, choices=[0, 1],
                         help='caller-level switch recording whether API-backed news processing was requested')
     parser.add_argument('--news_api_model', type=str, default='gpt-5.1',

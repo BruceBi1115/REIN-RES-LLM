@@ -28,7 +28,14 @@ from ..refine.cache import (
 )
 from ..utils.logger import setup_live_logger
 from ..utils.residual_utils import split_two_stage_epochs
-from ..utils.utils import compute_volatility_bin, device_from_id, draw_pred_true, record_test_results_csv, set_seed
+from ..utils.utils import (
+    build_experiment_task_name,
+    compute_volatility_bin,
+    device_from_id,
+    draw_pred_true,
+    record_test_results_csv,
+    set_seed,
+)
 from .common import (
     _coerce_global_zstats,
     _compute_global_zstats_from_train_df,
@@ -68,6 +75,10 @@ def _parse_series_time_values(series, *, dayfirst: bool):
 
 
 def setup_env_and_data(args):
+    if not hasattr(args, "_raw_task_name"):
+        args._raw_task_name = str(getattr(args, "taskName", "task1") or "task1").strip()
+    args.taskName = build_experiment_task_name(args)
+
     stage = str(getattr(args, "stage", "all")).lower()
     base_backbone_name = str(getattr(args, "base_backbone", "dlinear"))
 
@@ -77,8 +88,7 @@ def setup_env_and_data(args):
         s = re.sub(r"\s+", "_", s)
         return s if s else "na"
 
-    # Base part stays concise: taskName + base backbone.
-    filename = f"{_safe_name(args.taskName)}_{_safe_name(base_backbone_name)}"
+    filename = _safe_name(args.taskName)
     log_filename = filename + ".log"
 
     live_logger, live_path, log_jsonl = setup_live_logger(
