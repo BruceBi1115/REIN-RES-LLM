@@ -152,6 +152,10 @@ if __name__ == '__main__':
                         help='strength of patch-level fusion from time-aligned text auxiliary features into DELTA')
     parser.add_argument('--delta_temporal_text_freeze_encoder', type=int, default=1, choices=[0, 1],
                         help='freeze the pretrained text encoder used for the time-aligned text auxiliary sequence')
+    parser.add_argument('--delta_multimodal_arch', type=str, default='summary_gated', choices=['summary_gated', 'plan_c_mvp'],
+                        help='residual architecture: legacy summary/gated branch or Plan-C-style regime router + expert mixture MVP')
+    parser.add_argument('--delta_multimodal_fuse_lambda', type=float, default=1.0,
+                        help='mixture strength for Plan C regime experts in DELTA and external SignNet')
     parser.add_argument('--news_api_enable', type=int, default=0, choices=[0, 1],
                         help='caller-level switch recording whether API-backed news processing was requested')
     parser.add_argument('--news_api_model', type=str, default='gpt-5.1',

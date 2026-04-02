@@ -47,7 +47,7 @@ def _signnet_task_type(args) -> str:
     return "relative_state" if _resolve_delta_residual_mode(args) == "relative" else "binary_sign"
 
 
-def _encode_text_summary_from_tower(
+def _encode_text_pack_from_tower(
     *,
     temporal_text_tower,
     ts_patches: torch.Tensor | None,
@@ -56,7 +56,7 @@ def _encode_text_summary_from_tower(
     temporal_text_step_mask: torch.Tensor | None,
     device,
     dtype: torch.dtype,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+) -> dict[str, torch.Tensor | None]:
     if (
         temporal_text_tower is None
         or ts_patches is None
@@ -64,7 +64,10 @@ def _encode_text_summary_from_tower(
         or temporal_text_attn is None
         or ts_patches.ndim < 2
     ):
-        return None, None
+        return {
+            "text_summary": None,
+            "text_strength": None,
+        }
     pack = temporal_text_tower(
         temporal_text_ids=temporal_text_ids,
         temporal_text_attn=temporal_text_attn,
@@ -73,7 +76,10 @@ def _encode_text_summary_from_tower(
         device=device,
         dtype=dtype,
     )
-    return pack.get("text_summary"), pack.get("text_strength")
+    return {
+        "text_summary": pack.get("text_summary"),
+        "text_strength": pack.get("text_strength"),
+    }
 
 
 def _run_external_signnet(
@@ -208,7 +214,7 @@ def _evaluate_external_signnet(
             temporal_text_attn = temporal_text_attn.to(device=device, dtype=torch.long)
         if temporal_text_step_mask is not None:
             temporal_text_step_mask = temporal_text_step_mask.to(device=device, dtype=torch.long)
-        text_summary, text_strength = _encode_text_summary_from_tower(
+        text_pack = _encode_text_pack_from_tower(
             temporal_text_tower=temporal_text_tower,
             ts_patches=ts_patches,
             temporal_text_ids=temporal_text_ids,
@@ -222,8 +228,8 @@ def _evaluate_external_signnet(
             history_z=history_z.to(torch.float32),
             base_pred_z=base_pred,
             structured_feats=structured_feats,
-            text_summary=text_summary,
-            text_strength=text_strength,
+            text_summary=text_pack.get("text_summary"),
+            text_strength=text_pack.get("text_strength"),
             tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
         )
 
@@ -435,6 +441,8 @@ def _train_external_signnet(
         hidden_size=int(max(32, getattr(args, "delta_sign_external_hidden", 256))),
         dropout=float(max(0.0, getattr(args, "delta_sign_external_dropout", 0.1))),
         task_type=signnet_task_type,
+        arch="plan_c_mvp" if str(getattr(args, "delta_multimodal_arch", "summary_gated")).lower().strip() == "plan_c_mvp" else "mlp",
+        multimodal_fuse_lambda=float(max(0.0, getattr(args, "delta_multimodal_fuse_lambda", 1.0))),
     ).to(device)
 
     lr = float(getattr(args, "delta_sign_external_lr", args.lr))
@@ -484,7 +492,7 @@ def _train_external_signnet(
     if live_logger is not None:
         live_logger.info(
             "[SIGNNET] pretrain start: "
-            f"variant=mlp task_type={signnet_task_type} "
+            f"variant={str(getattr(signnet, 'model_variant', 'mlp'))} task_type={signnet_task_type} "
             f"epochs={epochs} lr={lr:.3e} wd={wd:.3e} hidden={int(max(32, getattr(args, 'delta_sign_external_hidden', 256)))} "
             f"dropout={float(max(0.0, getattr(args, 'delta_sign_external_dropout', 0.1))):.3f} "
             f"patience={patience} select_metric={select_metric} min_delta={min_delta:.1e} "
@@ -492,7 +500,8 @@ def _train_external_signnet(
             f"news_dropout={int(signnet_news_dropout)} calibrate_bias={int(calibrate_bias)} bias_clip={bias_clip:.3f} "
             f"use_news_weighting={int(use_news_weighting)} use_residual_weighting={int(use_residual_weighting)} "
             f"use_pos_weight={int(use_pos_weight)} pos_weight_floor={pos_weight_floor:.3f} pos_weight_clip={pos_weight_clip:.3f} "
-            f"text_summary_dim={text_summary_dim} shared_tower_trainable={int(len(tower_trainable_params) > 0)}"
+            f"text_summary_dim={text_summary_dim} "
+            f"shared_tower_trainable={int(len(tower_trainable_params) > 0)}"
         )
         live_logger.info(
             "[SIGNNET] cleaned residual supervision: "
@@ -547,7 +556,7 @@ def _train_external_signnet(
                 temporal_text_attn = temporal_text_attn.to(device=device, dtype=torch.long)
             if temporal_text_step_mask is not None:
                 temporal_text_step_mask = temporal_text_step_mask.to(device=device, dtype=torch.long)
-            text_summary, text_strength = _encode_text_summary_from_tower(
+            text_pack = _encode_text_pack_from_tower(
                 temporal_text_tower=temporal_text_tower,
                 ts_patches=ts_patches,
                 temporal_text_ids=temporal_text_ids,
@@ -561,8 +570,8 @@ def _train_external_signnet(
                 history_z=history_z.to(torch.float32),
                 base_pred_z=base_pred,
                 structured_feats=structured_feats,
-                text_summary=text_summary,
-                text_strength=text_strength,
+                text_summary=text_pack.get("text_summary"),
+                text_strength=text_pack.get("text_strength"),
                 tau=float(getattr(args, "delta_sign_external_tau", 1.0)),
             )
 
@@ -637,7 +646,7 @@ def _train_external_signnet(
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if grad_clip > 0.0:
-                clip_grad_norm_(signnet.parameters(), grad_clip)
+                clip_grad_norm_(trainable_params, grad_clip)
             opt.step()
 
             bs = int(targets_z.size(0))
@@ -794,7 +803,7 @@ def _train_external_signnet(
     torch.save(
         {
             "state_dict": signnet.state_dict(),
-            "variant": "mlp",
+            "variant": str(getattr(signnet, "model_variant", "mlp")),
             "task_type": signnet_task_type,
             "history_len": int(max(1, getattr(args, "history_len", 1))),
             "horizon": int(max(1, getattr(args, "horizon", 1))),
@@ -802,6 +811,7 @@ def _train_external_signnet(
             "text_summary_dim": int(max(0, text_summary_dim)),
             "hidden_size": int(max(32, getattr(args, "delta_sign_external_hidden", 256))),
             "dropout": float(max(0.0, getattr(args, "delta_sign_external_dropout", 0.1))),
+            "multimodal_fuse_lambda": float(max(0.0, getattr(args, "delta_multimodal_fuse_lambda", 1.0))),
             "best_val_loss": float(best_val),
             "best_val_acc": float(best_acc),
             "best_val_bacc": float(best_bacc),

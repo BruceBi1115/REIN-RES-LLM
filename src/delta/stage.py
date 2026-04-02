@@ -558,10 +558,13 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         delta_temporal_text_dim=int(getattr(args, "delta_temporal_text_dim", 8)),
         delta_temporal_text_fuse_lambda=float(getattr(args, "delta_temporal_text_fuse_lambda", 0.5)),
         delta_temporal_text_freeze_encoder=int(getattr(args, "delta_temporal_text_freeze_encoder", 1)),
+        delta_multimodal_arch=str(getattr(args, "delta_multimodal_arch", "summary_gated")),
+        delta_multimodal_fuse_lambda=float(getattr(args, "delta_multimodal_fuse_lambda", 1.0)),
     )
     delta_model.to(device)
     live_logger.info(
-        f"[DELTA] model_variant={str(getattr(delta_model, 'model_variant', 'tiny_news_ts')).lower()}"
+        f"[DELTA] model_variant={str(getattr(delta_model, 'model_variant', 'tiny_news_ts')).lower()} "
+        f"multimodal_arch={str(getattr(delta_model, 'multimodal_arch', 'summary_gated'))}"
     )
 
     # when to run validation set
@@ -585,6 +588,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             "text2q",
             "temporal_text_tower",
             "temporal_text_gate",
+            "regime_router",
+            "regime_experts",
         ]
         for name in freeze_modules:
             if hasattr(delta_model, name):
@@ -606,7 +611,10 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         "delta_fuse",
         "delta_mag_head",
         "text_mag_head",
+        "route_mag_head",
+        "confidence_head",
         "text_summary_ln",
+        "route_summary_ln",
         "rel_head",
     ]
     for name in train_modules:
@@ -775,6 +783,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 "delta_sign_external_enable": int(external_sign_enabled),
                 "delta_sign_external_tau": float(getattr(args, "delta_sign_external_tau", 1.0)),
                 "delta_temporal_text_source": str(getattr(args, "delta_temporal_text_source", "refined") or "refined"),
+                "delta_multimodal_arch": str(getattr(args, "delta_multimodal_arch", "summary_gated") or "summary_gated"),
+                "delta_multimodal_fuse_lambda": float(max(0.0, getattr(args, "delta_multimodal_fuse_lambda", 1.0))),
             },
         )
         if external_sign_enabled:
@@ -790,6 +800,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     "task_type": str(getattr(external_signnet_model, "task_type", "binary_sign")),
                     "hidden_size": int(max(32, getattr(args, "delta_sign_external_hidden", 256))),
                     "dropout": float(max(0.0, getattr(args, "delta_sign_external_dropout", 0.1))),
+                    "multimodal_fuse_lambda": float(max(0.0, getattr(args, "delta_multimodal_fuse_lambda", 1.0))),
                     "tau": float(getattr(args, "delta_sign_external_tau", 1.0)),
                     "decision_bias": float(
                         external_signnet_model.decision_bias.detach().cpu().item()

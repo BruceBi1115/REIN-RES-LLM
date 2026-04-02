@@ -190,7 +190,10 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
   当前样本最终使用到的新闻数量
   这个值目前只保留给日志、诊断和部分 DELTA 侧权重逻辑，不再作为 SignNet 或 DELTA 模型的直接数值输入
 
-换句话说，refine 后的文本结果现在仍然会被生成、缓存和用于结构化抽取，但不会再经过单独的文本编码器直接送进 DELTA 或 SignNet。
+换句话说，refine 后的文本结果现在不只是给结构化抽取用。
+如果开启 `delta_temporal_text_enable`，这些文本还会进入共享 `TemporalTextTower`；
+在默认 `summary_gated` 架构下，它会给 DELTA 提供 `text_summary + patch_context`，也会给外部 `SignNet` 提供 `text_summary`；
+在 `delta_multimodal_arch=plan_c_mvp` 时，外部 `SignNet` 仍然只直接吃 `text_summary + text_strength`，但会在内部额外走一层 `RegimeRouter + ResidualExpertMixture` 做路由式方向推理。
 
 ## 关键节点输入清单
 
@@ -400,26 +403,30 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
 
 这一节最重要的一句话是：
 
-- `SignNet` 当前真正进入模型的输入只有三个：
+- `SignNet` 现在真正进入模型的主输入是：
   `history_z`
   `base_pred_z`
   `structured_feats`
+  以及可选的 temporal-text 特征
 
 也就是说，当前版本里：
 
 - 不输入 `history_raw`
-- 不输入新闻文本 token
 - 不输入新闻数量 `news_counts`
 - 不输入 prompt 文本
+- 不直接输入原始 prompt token 序列
 
 - 输入：
   `history_z`
   `base_pred_z`
   `structured_feats`
+  可选的 `text_summary / text_strength`
 - 关键输入格式：
   `history_z: torch.FloatTensor (B, L)`
   `base_pred_z: torch.FloatTensor (B, H)`
   `structured_feats: torch.FloatTensor (B, D)`
+  `text_summary: torch.FloatTensor (B, hidden_text)` 或 `None`
+  `text_strength: torch.FloatTensor (B, 1)` 或 `None`
   其中 `D = delta_structured_feature_dim`
 - 关键参数：
   `delta_sign_external_epochs`
@@ -433,6 +440,8 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
   `delta_sign_external_pos_weight_floor`
   `delta_sign_external_pos_weight_clip`
   `delta_sign_external_tau`
+  `delta_multimodal_arch`
+  `delta_multimodal_fuse_lambda`
 - 参数如何影响：
   `delta_sign_external_hidden/dropout` 决定 SignNet 宽度和正则强度
   `delta_sign_external_epochs/lr` 决定训练时长和学习率
@@ -441,6 +450,8 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
   `delta_sign_external_use_residual_weighting` 会根据残差幅度调节 horizon 位置权重
   `delta_sign_external_use_pos_weight` 以及 floor/clip 只在 additive 的二分类监督里有效
   `delta_sign_external_tau` 只在 additive 模式里影响 `logits -> tanh(sign_soft)` 的温度
+  `delta_multimodal_arch` 决定 SignNet 走原来的 summary-based MLP，还是切到 Plan C 的 `RegimeRouter + ResidualExpertMixture` 版本
+  `delta_multimodal_fuse_lambda` 决定 Plan C 下 expert mixture 对最终方向表征的注入强度
   `cleaned_residual_enable` 打开后，relative 模式下只会先对 `q_target` 做 horizon 平滑，再据此构造 3 类状态标签
   `cleaned_residual_smooth_alpha` 控制 cleaned residual 在 horizon 上的 EWMA 平滑强度
   `cleaned_residual_structured_mix` 主要影响 additive 模式的 cleaned residual 模板混合；relative 模式下不再把结构化模板直接写进监督目标
@@ -515,7 +526,8 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
   这些参数会影响 refined/structured 结果从哪里来、是否能读到、是否跳过缺失新闻，因此也会影响 `structured_feats` 的具体值。
 
 - `delta_temporal_text_enable`
-  决定 SignNet 是否还能额外看到一条来自共享 `TemporalTextTower` 的 `text_summary`。
+  决定 SignNet 是否还能额外看到一条来自共享 `TemporalTextTower` 的文本支路。
+  无论是默认架构还是 Plan C，直接进入 SignNet 的都主要是 `text_summary + text_strength`。
 
 - `delta_temporal_text_source`
   决定这条 `text_summary` 是从原新闻正文 `raw` 还是从 `refined` 摘要编码出来的。
@@ -526,6 +538,9 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
 - `delta_temporal_text_max_len / delta_temporal_text_per_step_topk`
   不会改变 `history_z / base_pred_z / structured_feats` 的形状，但会改变 `text_summary` 的信息密度和每步聚合到多少文本。
 
+- `delta_multimodal_arch / delta_multimodal_fuse_lambda`
+  这组参数决定 SignNet 是只做普通 summary-based MLP 融合，还是在 pooled summary 之上再做 Plan C 的 regime routing 和 expert mixture。
+
 #### SignNet 的输入不会再被什么影响
 
 当前版本里，下面这些东西已经不会再直接进入 SignNet：
@@ -535,7 +550,12 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
 - `temporal_text_ids / temporal_text_attn / temporal_text_step_mask` 这些逐 token 张量本身
 - 单条 doc 级文本 embedding 列表
 
-也就是说，SignNet 现在可以通过共享 tower 间接看到文本，但看到的是 pooled 过的 `text_summary`，不是原始 token 序列本身。
+也就是说，SignNet 现在可以通过共享 tower 间接看到文本：
+
+- 在默认 `summary_gated` 架构下，看到的是 pooled 过的 `text_summary`
+- 在 `plan_c_mvp` 架构下，仍然直接看到 pooled `text_summary + text_strength`，但会再基于历史波动、Base 分散度、文本强度和结构化新闻强度去做 route-aware 推理
+
+但它仍然不会直接吃原始新闻 token 序列本身。
 
 ### 节点 8：DELTA 样本输入 `build_delta_batch_inputs()`
 
@@ -648,6 +668,8 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
   `delta_temporal_text_dim`
   `delta_temporal_text_fuse_lambda`
   `delta_temporal_text_freeze_encoder`
+  `delta_multimodal_arch`
+  `delta_multimodal_fuse_lambda`
 - 参数如何影响：
   `tiny_news_hidden_size` 决定 DELTA 主隐藏维度
   `delta_clip` 决定最终 delta 修正是否做 `tanh` 截断
@@ -658,6 +680,8 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
   `delta_temporal_text_source` 决定时间对齐文本分支编码 `raw` 还是 `refined` 新闻文本
   `temporal_text_model_id` 决定这条文本辅助分支实际使用哪个 HF tokenizer/encoder；如果不单独指定，就回退到主 `tokenizer / base_model`
   `delta_temporal_text_dim / delta_temporal_text_fuse_lambda / delta_temporal_text_freeze_encoder` 决定这条文本辅助分支的投影维度、融合强度，以及编码器是冻结前向还是参与训练
+  `delta_multimodal_arch` 决定 DELTA 走原来的 summary/gated 路径，还是切到 Plan C 的 regime-router expert-mixture 路径
+  `delta_multimodal_fuse_lambda` 决定 Plan C 路径里各个 residual expert 对最终 residual_context 的注入强度
 - 最终影响到：
   `pred`
   `sign_logits`
@@ -721,15 +745,26 @@ Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
   把 step-level 文本向量继续聚成 patch-level 文本上下文，并再 pooled 成一个样本级 `text_summary`。
   所以这条分支最终不是直接对齐 horizon，也不是直接对齐整段 history，而是和 `ts_patches` 在 patch 轴上对齐。
 
-- 第七步，如果 patch-level 文本上下文存在，且 `delta_temporal_text_fuse_lambda > 0`，
-  模型现在不会再做固定加法，而是先学一个 patch-level gate，再做 gated fusion：
-  `ts_feat = ts_feat + lambda * gate(ts_feat, text_patch_context) * text_patch_context`
-  也就是说，这条分支并不会单独产出一个最终预测头；
-  它的作用是先改写 DELTA 的 patch 表征，再让后面的 pooling、structured news 融合、sign/state/magnitude head 在这个融合后的表征上继续工作。
+- 第七步，要看 `delta_multimodal_arch`：
 
-- 第八步，`text_summary` 不只影响 patch 表征。
-  当前实现里，它还会直接进入 DELTA 的 `residual_context`，并通过额外的 text-conditioned magnitude bias 直接影响 `magnitude_head`。
-  所以 temporal text 对 DELTA 的作用，已经不只是“改一改 `ts_feat`”，而是同时影响 patch context 和最终幅度路径。
+  - 如果是默认的 `summary_gated`，
+    patch-level 文本上下文会先过一个 gate，再做 residual add：
+    `ts_feat = ts_feat + lambda * gate(ts_feat, text_patch_context) * text_patch_context`
+
+  - 如果是 `plan_c_mvp`，
+    patch-level 文本上下文本身不再直接进入一个额外的 token-level 交互块。
+    当前实现会先照常得到 `pooled_ts`、`fused_news_context`、`text_summary * text_strength`，
+    再把它们拼成一个基础 `residual_base`；
+    然后根据历史波动、文本强度、结构化新闻强度和组合后的 news strength 构造 route scalars，
+    送进 `RegimeRouter` 输出 `none / trend / event / reversal / sparse` 五类路由概率；
+    再由 `ResidualExpertMixture` 对多个 residual experts 做加权混合，得到新的 `residual_context`。
+    这里的 `none` 路由本质上是 abstention 信号，会在后面压低修正置信度。
+
+- 第八步，`text_summary` 现在也不只影响 patch 表征。
+  无论哪种架构，它都会进入 DELTA 的 `residual_context`；
+  在 `plan_c_mvp` 下，还会额外形成一个 `route_summary`，并通过 `route_mag_head` 和 abstention-aware `confidence_head` 去调节最终 `magnitude`。
+  所以 temporal text 对 DELTA 的作用，已经从“辅助 patch-level 融合”扩展成：
+  patch 融合 + pooled residual context + route-aware magnitude/confidence 调节。
 
 - 这也解释了为什么它和 `structured_feats` 不是互斥关系：
   `temporal text` 分支是在 patch level 融合文本上下文，
@@ -1199,7 +1234,10 @@ DELTA 的目标不是重新做一次完整预测，而是学习：
 - `DELTA`
   负责回答“该不该修、修多少、修正后最终值是多少”
 
-而新闻在当前版本里的主要作用，是先被 refine 和结构化，再以 `structured_feats` 这种数值化形式去帮助 DELTA 和 SignNet 解释 Base 没看出来的那部分误差；如果开启 `delta_temporal_text_enable`，还会再生成一条按历史时间步对齐的文本辅助支路给 DELTA 使用。
+而新闻在当前版本里的主要作用，是先被 refine 和结构化，再以 `structured_feats` 这种数值化形式去帮助 DELTA 和 SignNet 解释 Base 没看出来的那部分误差；如果开启 `delta_temporal_text_enable`，还会再生成一条按历史时间步对齐的文本辅助支路。
+
+- 在默认 `summary_gated` 架构下，这条支路主要给 DELTA 提供 patch-level gated fusion，并给外部 SignNet 提供 pooled `text_summary`
+- 在 `plan_c_mvp` 架构下，这条支路仍然先压成 `text_summary + text_strength`，再和结构化新闻、时间序列统计一起参与 DELTA 与外部 SignNet 的 regime routing / expert mixture
 
 ## 用最通俗的话总结
 

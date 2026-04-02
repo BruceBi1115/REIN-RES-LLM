@@ -3,6 +3,31 @@ import json
 import logging
 from logging.handlers import WatchedFileHandler
 
+class ImmediateWatchedFileHandler(WatchedFileHandler):
+    """
+    Flush and sync each record so an already-open editor can observe updates
+    sooner without needing to reopen the file.
+    """
+
+    def _open(self):
+        return open(
+            self.baseFilename,
+            self.mode,
+            encoding=self.encoding,
+            errors=self.errors,
+            buffering=1,
+        )
+
+    def flush(self):
+        stream = self.stream
+        if stream is None:
+            return
+        stream.flush()
+        try:
+            os.fsync(stream.fileno())
+        except OSError:
+            pass
+
 def setup_live_logger(save_dir: str, filename: str = "train_live.log", reset = True):
     """
     单文件动态日志（人类可读）。支持 tail -f。
@@ -13,14 +38,19 @@ def setup_live_logger(save_dir: str, filename: str = "train_live.log", reset = T
 
     logger = logging.getLogger("train_live")
     logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
 
     if reset:
         # 以 'w' 打开并立即关闭 -> 清空文件
         open(log_path, "w", encoding="utf-8").close()
 
     # 用 WatchedFileHandler 便于 logrotate、tail -f 等
-    fh = WatchedFileHandler(log_path, encoding="utf-8")
+    fh = ImmediateWatchedFileHandler(log_path, encoding="utf-8")
     fmt = logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     fh.setFormatter(fmt)
     logger.addHandler(fh)

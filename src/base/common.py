@@ -181,7 +181,9 @@ def _log_prompt_stats_if_available(live_logger, data_statistic, title: str, skip
 
 def _mask_sensitive_arg(key: str, value):
     k = str(key).lower()
-    is_secret = any(tok in k for tok in ["api_key", "token", "secret", "password"])
+    is_secret = any(tok in k for tok in ["api_key", "access_token", "auth_token", "refresh_token", "secret", "password"])
+    if (not is_secret) and k.endswith("_token") and ("budget" not in k):
+        is_secret = True
     if not is_secret:
         return value
     s = str(value or "")
@@ -208,18 +210,139 @@ def _pair_rows_for_ascii_table(rows: list[list[str]], *, headers: list[str]) -> 
         body.append(left + right)
     return table_headers, body
 
+def _run_arg_section_name(key: str) -> str:
+    k = str(key or "").strip()
+    if not k:
+        return "Other"
+
+    if k in {
+        "taskName",
+        "stage",
+        "seed",
+        "gpu",
+        "save_dir",
+        "select_metric",
+        "early_stop_patience",
+        "eval_progress_bar",
+        "eval_progress_leave",
+        "run_name",
+    }:
+        return "Basic Setup"
+
+    if k.startswith("base_"):
+        return "Base Backbone"
+
+    if k.startswith("delta_temporal_text") or k == "temporal_text_model_id":
+        return "Temporal Text Input"
+
+    if (
+        k.startswith("delta_sign_external")
+        or k in {"delta_sign_mode", "delta_sign_eps", "delta_sign_tau"}
+    ):
+        return "DELTA / SignNet"
+
+    if (
+        k.startswith("delta_structured")
+        or k.startswith("cleaned_residual")
+        or k == "delta_include_structured_news"
+        or k.startswith("news_structured_")
+    ):
+        return "Structured News"
+
+    if (
+        k.startswith("news_")
+        or k.startswith("utility_")
+        or k.startswith("smart_")
+        or k == "default_policy"
+    ):
+        return "News / Cache / API"
+
+    if k in {
+        "train_file",
+        "val_file",
+        "test_file",
+        "time_col",
+        "value_col",
+        "id_col",
+        "freq_min",
+        "region",
+        "unit",
+        "description",
+        "dayFirst",
+        "history_len",
+        "horizon",
+        "stride",
+        "volatility_bin_tiers",
+        "token_budget",
+        "token_budget_news_frac",
+        "news_topM",
+        "news_topK",
+        "patch_len",
+    }:
+        return "Data & Window"
+
+    if (
+        k.startswith("delta_")
+        or k in {
+            "rel_lambda",
+            "residual_loss",
+            "residual_base_frac",
+            "doc_candidate_mode",
+            "patch_dropout",
+            "head_dropout",
+            "head_mlp",
+            "news_usefulness_weighting",
+        }
+    ):
+        return "DELTA Core"
+
+    if k in {"batch_size", "lr", "weight_decay"}:
+        return "Optimization"
+
+    return "Other"
+
+def _section_order_for_run_args() -> list[str]:
+    return [
+        "Basic Setup",
+        "Data & Window",
+        "Base Backbone",
+        "DELTA Core",
+        "DELTA / SignNet",
+        "Temporal Text Input",
+        "Structured News",
+        "News / Cache / API",
+        "Optimization",
+        "Other",
+    ]
+
+def _ordered_run_arg_sections(grouped_rows: dict[str, list[list[str]]]) -> list[str]:
+    ordered = []
+    seen = set()
+    for section in list(_section_order_for_run_args()) + sorted(grouped_rows.keys()):
+        if section in seen:
+            continue
+        seen.add(section)
+        if not grouped_rows.get(section):
+            continue
+        ordered.append(section)
+    return ordered
+
 def _log_run_args(args, live_logger):
     if live_logger is None:
         return
-    rows = []
+    grouped_rows = {}
     for key in sorted(k for k in vars(args).keys() if not str(k).startswith("_")):
         value = getattr(args, key)
         value = _mask_sensitive_arg(key, value)
-        rows.append([str(key), str(value)])
-    headers, body = _pair_rows_for_ascii_table(rows, headers=["Parameter", "Value"])
+        section = _run_arg_section_name(key)
+        grouped_rows.setdefault(section, []).append([str(key), str(value)])
     live_logger.info("-----------------------------------------------------")
     live_logger.info("[CONFIG] Parameters")
-    live_logger.info("\n" + _ascii_table(headers, body))
+    for section in _ordered_run_arg_sections(grouped_rows):
+        rows = grouped_rows.get(section, [])
+        headers, body = _pair_rows_for_ascii_table(rows, headers=["Parameter", "Value"])
+        live_logger.info(f"[CONFIG][SECTION] {section}")
+        live_logger.info("\n" + _ascii_table(headers, body, max_col_widths=[28, 36, 28, 36]))
     live_logger.info("-----------------------------------------------------")
 
 
@@ -230,7 +353,7 @@ def _log_cache_decision(args, live_logger):
     headers, body = _pair_rows_for_ascii_table(rows, headers=["Field", "Value"])
     live_logger.info("-----------------------------------------------------")
     live_logger.info("[CONFIG] Cache Decision")
-    live_logger.info("\n" + _ascii_table(headers, body))
+    live_logger.info("\n" + _ascii_table(headers, body, max_col_widths=[18, 42, 18, 42]))
     live_logger.info("-----------------------------------------------------")
 
 def _log_enabled_mechanisms(args, live_logger, stage: str):

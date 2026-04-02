@@ -70,10 +70,18 @@ def build_experiment_task_name(args) -> str:
         or getattr(args, "taskName", "task1")
         or "task1"
     ).strip()
+    temporal_text_enable = int(getattr(args, "delta_temporal_text_enable", 0) or 0)
+    temporal_text_source = str(getattr(args, "delta_temporal_text_source", "refined") or "refined").strip()
+    temporal_text_tag = (
+        f"DELTA_TEMPORAL_TEXT_on_{temporal_text_source}"
+        if temporal_text_enable == 1
+        else "DELTA_TEMPORAL_TEXT_off"
+    )
     delta_residual_mode = str(getattr(args, "delta_residual_mode", "additive") or "additive").strip()
     delta_sign_mode = str(getattr(args, "delta_sign_mode", "signnet_binary") or "signnet_binary").strip()
     return (
         f"{base_task_name}_{args.stage}_s{args.stride}_h{args.horizon}_news_{args.news_path}"
+        f"_{temporal_text_tag}"
         f"_DELTA_RESIDUAL_MODE_{delta_residual_mode}"
         f"_DELTA_SIGN_MODE_{delta_sign_mode}"
     )

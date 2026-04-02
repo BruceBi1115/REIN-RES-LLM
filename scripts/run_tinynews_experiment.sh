@@ -17,6 +17,7 @@ Examples:
 Notes:
   - `--profile additive` is only meaningful for `nsw_price`; it matches the old `_tinynews_2` defaults.
   - `--no-signnet` forces internal DELTA sign mode and appends `__nosignnet` to the task suffix when none is provided.
+  - Scripts now default to `DELTA_MULTIMODAL_ARCH=plan_c_mvp`; set `DELTA_MULTIMODAL_ARCH=summary_gated` if you want the older fallback path.
   - Environment overrides from the old scripts are still supported.
 EOF
 }
@@ -317,7 +318,7 @@ init_common_defaults() {
   UTILITY_RECENCY_WEIGHT="${UTILITY_RECENCY_WEIGHT:-0.25}"
   UTILITY_RATE_WEIGHT="${UTILITY_RATE_WEIGHT:-0.35}"
   UTILITY_SENTIMENT_WEIGHT="${UTILITY_SENTIMENT_WEIGHT:-0.05}"
-  UTILITY_RECENCY_TAU_HOURS="${UTILITY_RECENCY_TAU_HOURS:-24}"
+  UTILITY_RECENCY_TAU_HOURS="${UTILITY_RECENCY_TAU_HOURS:-6}"
   UTILITY_MMR_ENABLE="${UTILITY_MMR_ENABLE:-1}"
   UTILITY_MMR_LAMBDA="${UTILITY_MMR_LAMBDA:-0.8}"
   UTILITY_DEDUP_THRESHOLD="${UTILITY_DEDUP_THRESHOLD:-0.95}"
@@ -346,10 +347,12 @@ init_common_defaults() {
   DELTA_INCLUDE_STRUCTURED_NEWS="${DELTA_INCLUDE_STRUCTURED_NEWS:-0}"
   DELTA_STRUCTURED_ENABLE="${DELTA_STRUCTURED_ENABLE:-1}"
   DELTA_TEMPORAL_TEXT_SOURCE="${DELTA_TEMPORAL_TEXT_SOURCE:-refined}"
-  DELTA_TEMPORAL_TEXT_DIM="${DELTA_TEMPORAL_TEXT_DIM:-8}"
-  DELTA_TEMPORAL_TEXT_MAX_LEN="${DELTA_TEMPORAL_TEXT_MAX_LEN:-96}"
+  # DELTA_TEMPORAL_TEXT_DIM="${DELTA_TEMPORAL_TEXT_DIM:-8}"
+  # DELTA_TEMPORAL_TEXT_MAX_LEN="${DELTA_TEMPORAL_TEXT_MAX_LEN:-96}"
   DELTA_TEMPORAL_TEXT_FUSE_LAMBDA="${DELTA_TEMPORAL_TEXT_FUSE_LAMBDA:-0.5}"
   DELTA_TEMPORAL_TEXT_FREEZE_ENCODER="${DELTA_TEMPORAL_TEXT_FREEZE_ENCODER:-1}"
+  DELTA_MULTIMODAL_ARCH="${DELTA_MULTIMODAL_ARCH:-plan_c_mvp}"  # default to Plan C; set summary_gated to fall back to the older summary/gated path
+  DELTA_MULTIMODAL_FUSE_LAMBDA="${DELTA_MULTIMODAL_FUSE_LAMBDA:-1.0}"
   DELTA_MODEL_VARIANT="${DELTA_MODEL_VARIANT:-tiny_news_ts}"
   TINY_NEWS_HIDDEN_SIZE="${TINY_NEWS_HIDDEN_SIZE:-256}"
   DELTA_RELATIVE_DENOM_FLOOR="${DELTA_RELATIVE_DENOM_FLOOR:-0.0}"
@@ -359,7 +362,7 @@ init_common_defaults() {
   RUN_OR_NOT="${RUN_OR_NOT:-1}"
   LOOKBACK_WINDOWS=("1")
   SCHEDULERS=("1")
-  GRAD_ACCS=("1")
+  GRAD_ACCS=("8")
 
   ID_COL="${ID_COL:-}"
   FREQ_MIN="${FREQ_MIN:-}"
@@ -394,7 +397,14 @@ configure_dataset_defaults() {
       DELTA_SIGN_EXTERNAL_HIDDEN="${DELTA_SIGN_EXTERNAL_HIDDEN:-192}"
       DELTA_STRUCTURED_FEATURE_DIM="${DELTA_STRUCTURED_FEATURE_DIM:-12}"
 
-      DELTA_TEMPORAL_TEXT_ENABLE="${DELTA_TEMPORAL_TEXT_ENABLE:-0}"
+      DELTA_TEMPORAL_TEXT_ENABLE="${DELTA_TEMPORAL_TEXT_ENABLE:-1}"
+      DELTA_TEMPORAL_TEXT_DIM="${DELTA_TEMPORAL_TEXT_DIM:-32}"
+      DELTA_TEMPORAL_TEXT_MAX_LEN="${DELTA_TEMPORAL_TEXT_MAX_LEN:-196}"
+      # DELTA_TEMPORAL_TEXT_FREEZE_ENCODER=0
+      # DELTA_SIGN_EXTERNAL_USE_NEWS_WEIGHTING=1
+      # DELTA_SIGN_EXTERNAL_USE_RESIDUAL_WEIGHTING=1
+      DELTA_TEMPORAL_TEXT_FUSE_LAMBDA=1
+
       TEMPORAL_TEXT_MODEL_ID="${TEMPORAL_TEXT_MODEL_ID:-distilbert-base-uncased}"
       DELTA_TEMPORAL_TEXT_PER_STEP_TOPK="${DELTA_TEMPORAL_TEXT_PER_STEP_TOPK:-10}"
       DELTA_RESIDUAL_MODE="${DELTA_RESIDUAL_MODE:-relative}"
@@ -421,9 +431,10 @@ configure_dataset_defaults() {
       HORIZONS=("48" "96" "192" "336" "720")
       BASE_BACKBONES=("mlp")
       LRS=("5e-6" "1e-5")
-      DELTA_FREEZE_FEATURE_MODULES="${DELTA_FREEZE_FEATURE_MODULES:-1}"
+      DELTA_FREEZE_FEATURE_MODULES="${DELTA_FREEZE_FEATURE_MODULES:-0}"
       DELTA_SIGN_EXTERNAL_HIDDEN="${DELTA_SIGN_EXTERNAL_HIDDEN:-192}"
       DELTA_STRUCTURED_FEATURE_DIM="${DELTA_STRUCTURED_FEATURE_DIM:-12}"
+      
       DELTA_TEMPORAL_TEXT_ENABLE="${DELTA_TEMPORAL_TEXT_ENABLE:-0}"
       TEMPORAL_TEXT_MODEL_ID="${TEMPORAL_TEXT_MODEL_ID:-distilbert-base-uncased}"
       DELTA_TEMPORAL_TEXT_PER_STEP_TOPK="${DELTA_TEMPORAL_TEXT_PER_STEP_TOPK:-10}"
@@ -583,6 +594,8 @@ build_common_args() {
     --delta_temporal_text_per_step_topk "$DELTA_TEMPORAL_TEXT_PER_STEP_TOPK"
     --delta_temporal_text_fuse_lambda "$DELTA_TEMPORAL_TEXT_FUSE_LAMBDA"
     --delta_temporal_text_freeze_encoder "$DELTA_TEMPORAL_TEXT_FREEZE_ENCODER"
+    --delta_multimodal_arch "$DELTA_MULTIMODAL_ARCH"
+    --delta_multimodal_fuse_lambda "$DELTA_MULTIMODAL_FUSE_LAMBDA"
     --delta_model_variant "$DELTA_MODEL_VARIANT"
     --tiny_news_hidden_size "$TINY_NEWS_HIDDEN_SIZE"
     --residual_loss "$RESIDUAL_LOSS"
@@ -709,11 +722,17 @@ TASK_NAME_SUFFIX="${TASK_NAME_SUFFIX:-}"
 TASK_NAME="${TASK_NAME_BASE}${TASK_NAME_SUFFIX}"
 build_common_args
 
+if [[ "$DELTA_TEMPORAL_TEXT_ENABLE" == "1" ]]; then
+  TEMPORAL_TEXT_NAME_TAG="DELTA_TEMPORAL_TEXT_on_${DELTA_TEMPORAL_TEXT_SOURCE}"
+else
+  TEMPORAL_TEXT_NAME_TAG="DELTA_TEMPORAL_TEXT_off"
+fi
+
 if [[ "$DATASET_KEY" == "nas14" ]]; then
   prepare_chronological_timeseries_splits
 fi
 
-echo "[config] dataset=$DATASET_KEY profile=$PROFILE_KEY no_signnet=$NO_SIGNNET task_name=$TASK_NAME"
+echo "[config] dataset=$DATASET_KEY profile=$PROFILE_KEY no_signnet=$NO_SIGNNET task_name=$TASK_NAME temporal_text_tag=$TEMPORAL_TEXT_NAME_TAG"
 
 # =======================
 # 4) Run combinations
@@ -729,7 +748,7 @@ for news_path in "${NEWS_CHOICES[@]}"; do
                 continue
               fi
               run_task="${TASK_NAME}_${base_backbone}_h${horizon}"
-              display_task="${run_task}_all_s${STRIDE}_h${horizon}_news_${news_path}_DELTA_RESIDUAL_MODE_${DELTA_RESIDUAL_MODE}_DELTA_SIGN_MODE_${DELTA_SIGN_MODE}"
+              display_task="${run_task}_all_s${STRIDE}_h${horizon}_news_${news_path}_${TEMPORAL_TEXT_NAME_TAG}_DELTA_RESIDUAL_MODE_${DELTA_RESIDUAL_MODE}_DELTA_SIGN_MODE_${DELTA_SIGN_MODE}"
 
               prepare_news_cache_mode "$news_path" || exit 1
               args=( --taskName "$run_task" "${COMMON_ARGS[@]}" )

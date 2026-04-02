@@ -386,7 +386,12 @@ def _build_delta_optimizer(delta_model, args):
             or lname.startswith("delta_rel_head")
             or lname.startswith("rel_head")
             or lname.startswith("text_mag_head")
+            or lname.startswith("route_mag_head")
+            or lname.startswith("confidence_head")
             or lname.startswith("text_summary_ln")
+            or lname.startswith("route_summary_ln")
+            or lname.startswith("regime_router")
+            or lname.startswith("regime_experts")
             or lname.startswith("temporal_text_gate")
         ):
             head_params.append(p)

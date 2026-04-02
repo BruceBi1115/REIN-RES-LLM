@@ -6,6 +6,7 @@ import os
 import re
 import hashlib
 import sys
+import textwrap
 
 import numpy as np
 import pandas as pd
@@ -448,22 +449,73 @@ def _prime_news_api_key_state(args) -> dict:
     return state
 
 
-def _ascii_table(headers: list[str], rows: list[list[str]]) -> str:
+def _ascii_table(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    max_col_widths: list[int] | tuple[int, ...] | None = None,
+) -> str:
     hdr = [str(x) for x in headers]
-    body = [[str(x) for x in row] for row in rows]
-    widths = [len(x) for x in hdr]
-    for row in body:
-        for idx, cell in enumerate(row):
-            widths[idx] = max(widths[idx], len(cell))
+    ncols = len(hdr)
+    body = []
+    for row in rows:
+        norm = [str(x) for x in row[:ncols]]
+        if len(norm) < ncols:
+            norm.extend([""] * (ncols - len(norm)))
+        body.append(norm)
+
+    width_limits = [0] * ncols
+    if max_col_widths is not None:
+        for idx in range(min(ncols, len(max_col_widths))):
+            width_limits[idx] = int(max(1, int(max_col_widths[idx])))
+
+    def _cell_lines(text: str, idx: int) -> list[str]:
+        clean = str(text or "")
+        raw_lines = clean.splitlines() or [""]
+        limit = width_limits[idx]
+        out = []
+        for line in raw_lines:
+            if limit > 0 and len(line) > limit:
+                wrapped = textwrap.wrap(
+                    line,
+                    width=limit,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+                out.extend(wrapped or [""])
+            else:
+                out.append(line)
+        return out or [""]
+
+    wrapped_hdr = [_cell_lines(cell, idx) for idx, cell in enumerate(hdr)]
+    wrapped_rows = [[_cell_lines(cell, idx) for idx, cell in enumerate(row)] for row in body]
+
+    widths = [0] * ncols
+    for idx, lines in enumerate(wrapped_hdr):
+        widths[idx] = max(widths[idx], max(len(line) for line in lines))
+    for row in wrapped_rows:
+        for idx, lines in enumerate(row):
+            widths[idx] = max(widths[idx], max(len(line) for line in lines))
 
     def _rule(sep: str = "+", fill: str = "-") -> str:
         return sep + sep.join(fill * (w + 2) for w in widths) + sep
 
-    def _fmt(row: list[str]) -> str:
-        return "| " + " | ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(row)) + " |"
+    def _fmt_multiline(row_lines: list[list[str]]) -> list[str]:
+        height = max(len(lines) for lines in row_lines) if row_lines else 1
+        out = []
+        for line_idx in range(height):
+            rendered = []
+            for col_idx, lines in enumerate(row_lines):
+                cell = lines[line_idx] if line_idx < len(lines) else ""
+                rendered.append(cell.ljust(widths[col_idx]))
+            out.append("| " + " | ".join(rendered) + " |")
+        return out
 
-    lines = [_rule(), _fmt(hdr), _rule()]
-    lines.extend(_fmt(row) for row in body)
+    lines = [_rule()]
+    lines.extend(_fmt_multiline(wrapped_hdr))
+    lines.append(_rule())
+    for row in wrapped_rows:
+        lines.extend(_fmt_multiline(row))
     lines.append(_rule())
     return "\n".join(lines)
 
