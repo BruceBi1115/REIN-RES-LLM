@@ -57,6 +57,7 @@ class TinyNewsTSRegressor(nn.Module):
         temporal_text_freeze_encoder: bool = True,
         multimodal_arch: str = "summary_gated",
         multimodal_fuse_lambda: float = 1.0,
+        route_conf_floor: float = 0.25,
     ):
         super().__init__()
         self.model_variant = "tiny_news_ts"
@@ -106,6 +107,7 @@ class TinyNewsTSRegressor(nn.Module):
             multimodal_arch_norm = "summary_gated"
         self.multimodal_arch = multimodal_arch_norm
         self.multimodal_fuse_lambda = float(max(0.0, multimodal_fuse_lambda))
+        self.route_conf_floor = float(max(0.0, min(1.0, route_conf_floor)))
         self.regime_route_names = ("none", "trend", "event", "reversal", "sparse")
         residual_mode = str(delta_residual_mode or "additive").lower().strip()
         if residual_mode not in {"additive", "relative"}:
@@ -551,7 +553,10 @@ class TinyNewsTSRegressor(nn.Module):
             confidence_logits = self.confidence_head(self.delta_head_drop(residual_context))
             confidence = torch.sigmoid(confidence_logits)
             if route_abstain is not None:
-                confidence = confidence * (1.0 - route_abstain.to(device=confidence.device, dtype=confidence.dtype))
+                abstain_gate = 1.0 - route_abstain.to(device=confidence.device, dtype=confidence.dtype)
+                if self.route_conf_floor > 0.0:
+                    abstain_gate = self.route_conf_floor + (1.0 - self.route_conf_floor) * abstain_gate
+                confidence = confidence * abstain_gate
             magnitude = F.softplus(magnitude_raw)
             magnitude = magnitude * (0.5 + confidence)
             if self.delta_mag_max > 0.0:
@@ -719,6 +724,7 @@ def build_delta_model(
     delta_temporal_text_freeze_encoder: int = 1,
     delta_multimodal_arch: str = "summary_gated",
     delta_multimodal_fuse_lambda: float = 1.0,
+    delta_route_conf_floor: float = 0.25,
 ):
     del (
         head_mlp,
@@ -761,6 +767,7 @@ def build_delta_model(
         temporal_text_freeze_encoder=bool(int(delta_temporal_text_freeze_encoder)),
         multimodal_arch=str(delta_multimodal_arch or "summary_gated"),
         multimodal_fuse_lambda=float(max(0.0, delta_multimodal_fuse_lambda)),
+        route_conf_floor=float(max(0.0, min(1.0, delta_route_conf_floor))),
     )
     model.delta_tokenizer_id = str(tok_id)
     model.patch_stride = int(max(1, patch_stride))
@@ -785,6 +792,7 @@ def build_delta_model(
     model.temporal_text_model_id = temporal_text_model_id
     model.multimodal_arch = str(delta_multimodal_arch or "summary_gated")
     model.multimodal_fuse_lambda = float(max(0.0, delta_multimodal_fuse_lambda))
+    model.route_conf_floor = float(max(0.0, min(1.0, delta_route_conf_floor)))
     return tok, temporal_text_tok, model
 
 
@@ -836,6 +844,7 @@ def save_checkpoint(
             "temporal_text_model_id": str(getattr(model, "temporal_text_model_id", "")),
             "multimodal_arch": str(getattr(model, "multimodal_arch", "summary_gated")),
             "multimodal_fuse_lambda": float(getattr(model, "multimodal_fuse_lambda", 1.0)),
+            "route_conf_floor": float(getattr(model, "route_conf_floor", 0.25)),
         },
         reg_path,
     )
@@ -870,6 +879,7 @@ def save_checkpoint(
         "temporal_text_model_id": str(getattr(model, "temporal_text_model_id", "")),
         "multimodal_arch": str(getattr(model, "multimodal_arch", "summary_gated")),
         "multimodal_fuse_lambda": float(getattr(model, "multimodal_fuse_lambda", 1.0)),
+        "route_conf_floor": float(getattr(model, "route_conf_floor", 0.25)),
     }
     if isinstance(extra_meta, dict):
         for k, v in extra_meta.items():
@@ -950,6 +960,7 @@ def load_checkpoint(
         temporal_text_freeze_encoder=bool(int(meta.get("temporal_text_freeze_encoder", 1))),
         multimodal_arch=str(meta.get("multimodal_arch", "summary_gated")),
         multimodal_fuse_lambda=float(meta.get("multimodal_fuse_lambda", 1.0)),
+        route_conf_floor=float(meta.get("route_conf_floor", 0.25)),
     )
     model.delta_tokenizer_id = str(
         meta.get("delta_tokenizer_id", meta.get("tiny_text_tokenizer_id", ""))
@@ -976,6 +987,7 @@ def load_checkpoint(
     model.temporal_text_model_id = str(meta.get("temporal_text_model_id", meta.get("delta_tokenizer_id", "")))
     model.multimodal_arch = str(meta.get("multimodal_arch", "summary_gated"))
     model.multimodal_fuse_lambda = float(meta.get("multimodal_fuse_lambda", 1.0))
+    model.route_conf_floor = float(meta.get("route_conf_floor", 0.25))
 
     reg = torch.load(os.path.join(ckpt_dir, "regressor.pt"), map_location="cpu")
     state = reg.get("model_state", reg)

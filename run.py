@@ -156,6 +156,14 @@ if __name__ == '__main__':
                         help='residual architecture: legacy summary/gated branch or Plan-C-style regime router + expert mixture MVP')
     parser.add_argument('--delta_multimodal_fuse_lambda', type=float, default=1.0,
                         help='mixture strength for Plan C regime experts in DELTA and external SignNet')
+    parser.add_argument('--delta_route_balance_lambda', type=float, default=0.02,
+                        help='Plan C expert-route load balancing regularization weight; <=0 disables')
+    parser.add_argument('--delta_route_abstain_lambda', type=float, default=0.05,
+                        help='Plan C abstain regularization weight when usable news exists; <=0 disables')
+    parser.add_argument('--delta_route_abstain_target', type=float, default=0.35,
+                        help='Plan C abstain probability target before penalty activates')
+    parser.add_argument('--delta_route_conf_floor', type=float, default=0.25,
+                        help='minimum confidence multiplier retained after Plan C abstain gating')
     parser.add_argument('--news_api_enable', type=int, default=0, choices=[0, 1],
                         help='caller-level switch recording whether API-backed news processing was requested')
     parser.add_argument('--news_api_model', type=str, default='gpt-5.1',

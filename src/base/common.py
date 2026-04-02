@@ -33,6 +33,7 @@ from ..refine.cache import (
     _selected_news_meta_records,
     _structured_events_to_feature_vec,
 )
+from ..utils.batch_utils import _batch_time_seq_for_sample
 
 dataStatistic = DataStatistic()
 
@@ -94,8 +95,12 @@ def _open_residual_debug_csv(path: str | None):
         "target_z",
         "base_pred_z",
         "true_residual_z",
+        "residual_mode",
+        "true_delta_target",
         "delta_branch_output",
         "pred_residual_z",
+        "pred_delta_target",
+        "valid_sign_mask",
         "pred_residual_sign_match_pct_additive",
         "final_pred_z",
         "sign_logits",
@@ -104,6 +109,11 @@ def _open_residual_debug_csv(path: str | None):
         "state_score",
         "magnitude",
         "magnitude_raw",
+        "route_probs",
+        "route_top_idx",
+        "route_abstain",
+        "confidence",
+        "text_strength",
         "news_count",
         "policy",
         "template_id",
@@ -168,6 +178,19 @@ def _maybe_news_dropout(news_str: str, args) -> str:
     if np.random.rand() < p:
         return ""
     return news_str
+
+
+def _resolve_news_dropout_prob(news_dropout, args) -> float:
+    if isinstance(news_dropout, bool):
+        if not news_dropout:
+            return 0.0
+        return float(max(0.0, min(1.0, float(getattr(args, "news_dropout", 0.0) or 0.0))))
+    if news_dropout is None:
+        return 0.0
+    try:
+        return float(max(0.0, min(1.0, float(news_dropout))))
+    except Exception:
+        return 0.0
 
 def _log_prompt_stats_if_available(live_logger, data_statistic, title: str, skip_msg: str) -> None:
     if live_logger is None:
@@ -773,7 +796,14 @@ def _tokenize_temporal_text_series(
                     max_length=max_len,
                     return_attention_mask=False,
                 )
-                ids = enc.get("input_ids", []) if isinstance(enc, dict) else []
+                # HF tokenizers return BatchEncoding, which behaves like a mapping
+                # but is not necessarily an actual dict.
+                if hasattr(enc, "get"):
+                    ids = enc.get("input_ids", [])
+                elif isinstance(enc, dict):
+                    ids = enc.get("input_ids", [])
+                else:
+                    ids = []
             except Exception:
                 ids = []
             step_ids.append(list(ids or []))
@@ -795,7 +825,7 @@ def build_batch_inputs(
     record_train_prompt: bool = False,
     testing: bool = False,
     force_no_news: bool = False,
-    news_dropout: bool = False,
+    news_dropout: float | bool = False,
     prompt_path: str = None,
     api_adapter=None,
     temporal_text_tokenizer=None,
@@ -825,6 +855,7 @@ def build_batch_inputs(
     if temporal_text_source not in {"refined", "raw"}:
         temporal_text_source = "refined"
     B = len(batch["history_value"])
+    news_dropout_prob = _resolve_news_dropout_prob(news_dropout, args)
 
     targets_z_list = []
     patches_list = []
@@ -850,6 +881,8 @@ def build_batch_inputs(
         history = batch["history_value"][i].tolist()
         target = batch["target_value"][i].tolist()
         t_target = batch["target_time"][i]
+        history_times_i = _batch_time_seq_for_sample(batch.get("history_times"), i)
+        target_times_i = _batch_time_seq_for_sample(batch.get("target_times"), i)
 
         history_z = _zscore(history, mu_global, sigma_global)
         target_z = _zscore(target, mu_global, sigma_global)
@@ -887,6 +920,10 @@ def build_batch_inputs(
 
             if (not selected.empty) and ("rate" in selected.columns):
                 avg_rate = float(selected["rate"].mean())
+
+        if len(selected) > 0 and news_dropout_prob > 0.0 and np.random.rand() < news_dropout_prob:
+            selected = selected.iloc[0:0].copy()
+            avg_rate = 0.0
 
         len_selected_news.append(len(selected))
 
@@ -946,7 +983,7 @@ def build_batch_inputs(
             if int(getattr(args, "delta_temporal_text_enable", 0)) == 1:
                 temporal_text_docs = aligned_refined_news_docs if temporal_text_source == "refined" else raw_news_texts
                 temporal_text_series = _build_temporal_text_series_for_sample(
-                    history_times=list(batch["history_times"][i]),
+                    history_times=history_times_i,
                     news_metas=selected_news_metas,
                     news_docs=temporal_text_docs,
                     tokenizer=temporal_tok,
@@ -992,8 +1029,6 @@ def build_batch_inputs(
 
             if need_prompt_context:
                 news_str = "\n\n".join([p for p in pieces if str(p).strip()])
-                if news_dropout:
-                    news_str = _maybe_news_dropout(news_str, args)
 
         structured_feature_list.append(
             _structured_events_to_feature_vec(
@@ -1010,10 +1045,10 @@ def build_batch_inputs(
         # if len(selected) > 5:
         #     print(news_str)
         # time meta for prompt
-        start_date = batch["history_times"][0][i]
-        end_date = batch["history_times"][-1][i]
-        prediction_start = batch["target_times"][0][i]
-        prediction_end = batch["target_times"][-1][i]
+        start_date = history_times_i[0] if history_times_i else ""
+        end_date = history_times_i[-1] if history_times_i else ""
+        prediction_start = target_times_i[0] if target_times_i else ""
+        prediction_end = target_times_i[-1] if target_times_i else ""
 
         targets_z_list.append(np.asarray(target_z, dtype=np.float32))
         patches_list.append(p)
@@ -1144,7 +1179,7 @@ def build_delta_batch_inputs(
     volatility_bin,
     testing: bool = False,
     force_no_news: bool = False,
-    news_dropout: bool = False,
+    news_dropout: float | bool = False,
     api_adapter=None,
 ):
     (
@@ -1213,7 +1248,7 @@ def evaluate_metrics_single(
     volatility_bin,
     testing: bool = False,
     true_pred_csv_path: str | None = None,
-    news_dropout: bool = False,
+    news_dropout: float | bool = False,
     force_no_news: bool = False,
     filename: str = None,
     api_adapter=None,

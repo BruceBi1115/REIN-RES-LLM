@@ -10,6 +10,7 @@ from collections import deque
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
@@ -35,11 +36,13 @@ from ..base_backbone import load_base_backbone_checkpoint
 from ..delta_news_hooks import reflect_hard_samples
 from ..model2 import build_delta_model, load_checkpoint, save_checkpoint
 from ..refine.cache import _init_refine_cache, _init_structured_cache, _prewarm_refine_cache, _save_refine_cache, _save_structured_cache
+from ..signnet.model import ResidualSignNet
 from ..signnet.training import _compose_delta_with_external_sign, _run_external_signnet, _train_external_signnet
 from ..utils.batch_utils import _batch_time_seq_for_sample
 from ..utils.residual_utils import split_two_stage_epochs
 from ..utils.utils import draw_pred_true, record_test_results_csv
 from .core import (
+    _build_delta_residual_position_weights,
     _build_cleaned_residual_targets,
     _build_delta_optimizer,
     _build_delta_targets,
@@ -50,11 +53,44 @@ from .core import (
     _match_horizon_shape,
     _masked_binary_accuracy_from_logits,
     _masked_multiclass_accuracy_from_logits,
+    _masked_multiclass_inverse_freq_weights,
+    _masked_weighted_mean,
     _resolve_delta_residual_mode,
     _resolve_delta_sign_mode,
     _select_metric,
     _use_external_signnet,
 )
+
+
+def _load_external_signnet_checkpoint(
+    ckpt_dir: str,
+    *,
+    device,
+    live_logger=None,
+):
+    ext_sign_path = os.path.join(ckpt_dir, "external_signnet.pt")
+    if not os.path.isfile(ext_sign_path):
+        return None
+    payload = torch.load(ext_sign_path, map_location="cpu")
+    state_dict = payload.get("state_dict", payload)
+    signnet = ResidualSignNet(
+        history_len=int(max(1, payload.get("history_len", 1))),
+        horizon=int(max(1, payload.get("horizon", 1))),
+        structured_dim=int(max(0, payload.get("structured_dim", 0))),
+        text_summary_dim=int(max(0, payload.get("text_summary_dim", 0))),
+        hidden_size=int(max(32, payload.get("hidden_size", 256))),
+        dropout=float(max(0.0, payload.get("dropout", 0.1))),
+        task_type=str(payload.get("task_type", "binary_sign")),
+        arch=str(payload.get("variant", "mlp")),
+        multimodal_fuse_lambda=float(max(0.0, payload.get("multimodal_fuse_lambda", 1.0))),
+    ).to(device)
+    signnet.load_state_dict(state_dict, strict=False)
+    if hasattr(signnet, "decision_bias") and "decision_bias" in payload:
+        signnet.decision_bias.data.fill_(float(payload.get("decision_bias", 0.0)))
+    signnet.eval()
+    if live_logger is not None:
+        live_logger.info(f"[DELTA] loaded paired external signnet checkpoint: {ext_sign_path}")
+    return signnet
 
 def evaluate_metrics_residual(
     base_model,
@@ -111,6 +147,13 @@ def evaluate_metrics_residual(
     mag_pred_sum = 0.0
     mag_true_sum = 0.0
     delta_abs_sum = 0.0
+    route_abstain_sum = 0.0
+    route_abstain_count = 0
+    confidence_sum = 0.0
+    confidence_count = 0
+    text_strength_sum = 0.0
+    text_strength_count = 0
+    route_top_counts = None
 
     if testing:
         ckpt_dir = os.path.join("./checkpoints", args.taskName)
@@ -241,6 +284,10 @@ def evaluate_metrics_residual(
             delta_corr_f = delta_corr.to(torch.float32)
             magnitude_f = _match_horizon_shape(magnitude.to(torch.float32), delta_corr_f)
             magnitude_raw_f = _match_horizon_shape(magnitude_raw.to(torch.float32), delta_corr_f)
+            route_probs = out_delta.get("route_probs")
+            route_top_idx = out_delta.get("route_top_idx")
+            confidence = out_delta.get("confidence")
+            text_strength = out_delta.get("text_strength")
             if relative_mode:
                 state_logits_f = state_logits.to(torch.float32)
                 state_score_f = _match_horizon_shape(state_score.to(torch.float32), delta_corr_f)
@@ -274,7 +321,8 @@ def evaluate_metrics_residual(
             )
             if relative_mode:
                 abs_residual_batch = raw_residual_batch.abs()
-                valid_sign_mask = torch.ones_like(abs_residual_batch, dtype=torch.float32)
+                sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
+                valid_sign_mask = (abs_residual_batch > sign_eps).to(torch.float32)
                 state_targets = _build_relative_state_targets(
                     raw_residual_batch,
                     args,
@@ -291,6 +339,12 @@ def evaluate_metrics_residual(
             delta_corr_cpu = delta_corr_f.detach().cpu().numpy()
             magnitude_cpu = magnitude_f.detach().cpu().numpy()
             magnitude_raw_cpu = magnitude_raw_f.detach().cpu().numpy()
+            raw_residual_cpu = raw_residual_batch.detach().cpu().numpy()
+            valid_sign_mask_cpu = valid_sign_mask.detach().cpu().numpy()
+            route_probs_cpu = None if route_probs is None else route_probs.detach().cpu().numpy()
+            route_top_idx_cpu = None if route_top_idx is None else route_top_idx.detach().cpu().numpy()
+            confidence_cpu = None if confidence is None else confidence.detach().cpu().numpy()
+            text_strength_cpu = None if text_strength is None else text_strength.detach().cpu().numpy()
             if relative_mode:
                 state_logits_cpu = state_logits_f.detach().cpu().numpy()
                 state_score_cpu = state_score_f.detach().cpu().numpy()
@@ -321,6 +375,28 @@ def evaluate_metrics_residual(
             mag_pred_sum += float(magnitude_f.sum().detach().cpu())
             mag_true_sum += float(abs_residual_batch.sum().detach().cpu())
             delta_abs_sum += float(delta_corr_f.abs().sum().detach().cpu())
+            if route_probs is not None:
+                route_abstain_sum += float(route_probs[:, 0].mean().detach().cpu()) * bs
+                route_abstain_count += bs
+                if route_top_idx is not None:
+                    route_counts_batch = torch.bincount(
+                        route_top_idx.detach().cpu().to(torch.int64),
+                        minlength=int(route_probs.size(-1)),
+                    ).to(torch.float64)
+                    if route_top_counts is None:
+                        route_top_counts = route_counts_batch
+                    else:
+                        if route_top_counts.numel() < route_counts_batch.numel():
+                            padded = torch.zeros(route_counts_batch.numel(), dtype=torch.float64)
+                            padded[: route_top_counts.numel()] = route_top_counts
+                            route_top_counts = padded
+                        route_top_counts[: route_counts_batch.numel()] += route_counts_batch
+            if confidence is not None:
+                confidence_sum += float(confidence.mean().detach().cpu()) * bs
+                confidence_count += bs
+            if text_strength is not None:
+                text_strength_sum += float(text_strength.mean().detach().cpu()) * bs
+                text_strength_count += bs
             if use_pbar:
                 eval_loader.set_postfix(zMAE=f"{loss_sum / max(1, n_samples):.6f}")
 
@@ -383,8 +459,12 @@ def evaluate_metrics_residual(
                             "target_z": _json_csv_cell([float(x) for x in targets_z_cpu[i].tolist()]),
                             "base_pred_z": _json_csv_cell([float(x) for x in base_pred_cpu[i].tolist()]),
                             "true_residual_z": _json_csv_cell([float(x) for x in true_residual_z.tolist()]),
+                            "residual_mode": residual_mode,
+                            "true_delta_target": _json_csv_cell([float(x) for x in raw_residual_cpu[i].tolist()]),
                             "delta_branch_output": _json_csv_cell([float(x) for x in delta_corr_cpu[i].tolist()]),
                             "pred_residual_z": _json_csv_cell([float(x) for x in pred_residual_z.tolist()]),
+                            "pred_delta_target": _json_csv_cell([float(x) for x in delta_corr_cpu[i].tolist()]),
+                            "valid_sign_mask": _json_csv_cell([float(x) for x in valid_sign_mask_cpu[i].tolist()]),
                             "pred_residual_sign_match_pct_additive": sign_match_pct_additive,
                             "final_pred_z": _json_csv_cell([float(x) for x in pred_z_cpu[i].tolist()]),
                             "sign_logits": "" if sign_logits_cpu is None else _json_csv_cell([float(x) for x in sign_logits_cpu[i].tolist()]),
@@ -393,6 +473,11 @@ def evaluate_metrics_residual(
                             "state_score": "" if state_score_cpu is None else _json_csv_cell([float(x) for x in state_score_cpu[i].tolist()]),
                             "magnitude": _json_csv_cell([float(x) for x in magnitude_cpu[i].tolist()]),
                             "magnitude_raw": _json_csv_cell([float(x) for x in magnitude_raw_cpu[i].tolist()]),
+                            "route_probs": "" if route_probs_cpu is None else _json_csv_cell([float(x) for x in route_probs_cpu[i].tolist()]),
+                            "route_top_idx": "" if route_top_idx_cpu is None else int(route_top_idx_cpu[i]),
+                            "route_abstain": "" if route_probs_cpu is None else float(route_probs_cpu[i][0]),
+                            "confidence": "" if confidence_cpu is None else _json_csv_cell([float(x) for x in np.asarray(confidence_cpu[i]).reshape(-1).tolist()]),
+                            "text_strength": "" if text_strength_cpu is None else _json_csv_cell([float(x) for x in np.asarray(text_strength_cpu[i]).reshape(-1).tolist()]),
                             "news_count": int(float(news_counts_d[i])) if i < len(news_counts_d) else 0,
                             "policy": str(policy_name),
                             "template_id": int(tpl_id),
@@ -443,16 +528,21 @@ def evaluate_metrics_residual(
     base_loss_avg = base_loss_sum / max(1, n_samples)
     base_mse_avg = base_se_sum / max(1, n_elems) if n_elems > 0 else float("inf")
     base_mae_avg = base_ae_sum / max(1, n_elems) if n_elems > 0 else float("inf")
-    setattr(
-        args,
-        "_last_residual_eval_diag",
-        {
-            ("state_acc" if relative_mode else "sign_acc"): sign_correct_sum / max(1.0, sign_valid_sum),
-            "pred_mag_mean": mag_pred_sum / max(1, n_elems),
-            "true_abs_residual_mean": mag_true_sum / max(1, n_elems),
-            "delta_abs_mean": delta_abs_sum / max(1, n_elems),
-        },
-    )
+    eval_diag = {
+        ("state_acc" if relative_mode else "sign_acc"): sign_correct_sum / max(1.0, sign_valid_sum),
+        "pred_mag_mean": mag_pred_sum / max(1, n_elems),
+        "true_abs_residual_mean": mag_true_sum / max(1, n_elems),
+        "delta_abs_mean": delta_abs_sum / max(1, n_elems),
+    }
+    if route_abstain_count > 0:
+        eval_diag["route_abstain_mean"] = route_abstain_sum / max(1, route_abstain_count)
+    if confidence_count > 0:
+        eval_diag["confidence_mean"] = confidence_sum / max(1, confidence_count)
+    if text_strength_count > 0:
+        eval_diag["text_strength_mean"] = text_strength_sum / max(1, text_strength_count)
+    if route_top_counts is not None and float(route_top_counts.sum()) > 0.0:
+        eval_diag["route_top_mix"] = (route_top_counts / route_top_counts.sum().clamp_min(1.0)).tolist()
+    setattr(args, "_last_residual_eval_diag", eval_diag)
     return loss_avg, mse_avg, mae_avg, base_loss_avg, base_mse_avg, base_mae_avg
 
 def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
@@ -560,6 +650,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         delta_temporal_text_freeze_encoder=int(getattr(args, "delta_temporal_text_freeze_encoder", 1)),
         delta_multimodal_arch=str(getattr(args, "delta_multimodal_arch", "summary_gated")),
         delta_multimodal_fuse_lambda=float(getattr(args, "delta_multimodal_fuse_lambda", 1.0)),
+        delta_route_conf_floor=float(getattr(args, "delta_route_conf_floor", 0.25)),
     )
     delta_model.to(device)
     live_logger.info(
@@ -753,6 +844,13 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         f"fuse_lambda={float(getattr(args, 'delta_temporal_text_fuse_lambda', 0.5) or 0.0):.3f} "
         f"freeze_encoder={int(getattr(args, 'delta_temporal_text_freeze_encoder', 1))}"
     )
+    live_logger.info(
+        "[DELTA] Plan C routing regularization: "
+        f"balance_lambda={float(getattr(args, 'delta_route_balance_lambda', 0.0) or 0.0):.4f} "
+        f"abstain_lambda={float(getattr(args, 'delta_route_abstain_lambda', 0.0) or 0.0):.4f} "
+        f"abstain_target={float(getattr(args, 'delta_route_abstain_target', 0.35) or 0.0):.4f} "
+        f"conf_floor={float(getattr(args, 'delta_route_conf_floor', 0.25) or 0.0):.4f}"
+    )
 
     def _save_residual_best(epoch_idx: int, metric_now: float | None, tpl_id_now: int, policy_name_now: str):
         metric_value = None if metric_now is None else float(metric_now)
@@ -879,7 +977,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 volatility_bin=volatility_bin,
                 testing=False,
                 force_no_news=False,
-                news_dropout=True,
+                news_dropout=float(getattr(args, "news_dropout", 0.0) or 0.0),
                 api_adapter=news_api_adapter,
             )
             ts_p = delta_inputs["ts_patches"]
@@ -1011,23 +1109,40 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             targets_z_typed = targets_z.to(torch.float32)
             true_residual_z = delta_targets.to(torch.float32)
             abs_residual_target = true_residual_z.abs()
-            valid_sign_mask = torch.ones_like(abs_residual_target, dtype=torch.float32) if relative_mode else (
-                abs_residual_target > float(getattr(args, "delta_sign_eps", 0.03))
-            ).to(torch.float32)
+            sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
+            valid_sign_mask = (
+                (abs_residual_target > sign_eps).to(torch.float32)
+                if relative_mode
+                else (abs_residual_target > sign_eps).to(torch.float32)
+            )
+            position_weight = _build_delta_residual_position_weights(abs_residual_target, args)
+            sample_pos_weight = sample_weight.unsqueeze(1) * position_weight
             sign_target_bin = None if relative_mode else (true_residual_z > 0).to(torch.float32)
 
             residual_mode = str(getattr(args, "residual_loss", "mae")).lower()
             loss_final = _point_loss(pred_real_z, targets_z_typed, mode=residual_mode)
             err_real = torch.abs(pred_real_z - targets_z_typed).mean(dim=1)
             loss_total = loss_final
+            route_balance_loss = None
+            route_abstain_loss = None
             if relative_mode:
                 loss_relative_mag = _point_loss(magnitude_real, abs_residual_target, mode=residual_mode)
                 loss_total = loss_total + loss_relative_mag
                 if not external_sign_enabled:
-                    state_ce = F.cross_entropy(
+                    state_ce_per = F.cross_entropy(
                         state_logits_real.reshape(-1, state_logits_real.size(-1)),
                         relative_state_targets.reshape(-1),
-                        reduction="mean",
+                        reduction="none",
+                    ).reshape_as(relative_state_targets)
+                    class_weight = _masked_multiclass_inverse_freq_weights(
+                        relative_state_targets,
+                        valid_sign_mask,
+                        num_classes=int(state_logits_real.size(-1)),
+                    )
+                    state_ce = _masked_weighted_mean(
+                        state_ce_per,
+                        sample_pos_weight * class_weight,
+                        mask=valid_sign_mask,
                     )
                     loss_total = loss_total + state_ce
                 else:
@@ -1035,6 +1150,30 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             else:
                 loss_relative_mag = None
                 state_ce = None
+
+            route_probs_real = out_delta.get("route_probs")
+            if route_probs_real is not None:
+                route_probs_real = route_probs_real.to(torch.float32)
+                route_balance_lambda = float(getattr(args, "delta_route_balance_lambda", 0.0) or 0.0)
+                route_abstain_lambda = float(getattr(args, "delta_route_abstain_lambda", 0.0) or 0.0)
+                route_abstain_target = float(getattr(args, "delta_route_abstain_target", 0.35) or 0.0)
+                if route_balance_lambda > 0.0 and route_probs_real.size(-1) > 1:
+                    expert_mean = route_probs_real[:, 1:].mean(dim=0)
+                    expert_mean = expert_mean / expert_mean.sum().clamp_min(1e-6)
+                    uniform = torch.full_like(expert_mean, 1.0 / float(max(1, expert_mean.numel())))
+                    route_balance_loss = F.kl_div(expert_mean.clamp_min(1e-6).log(), uniform, reduction="sum")
+                    loss_total = loss_total + route_balance_lambda * route_balance_loss
+                if route_abstain_lambda > 0.0:
+                    route_abstain = route_probs_real[:, :1]
+                    residual_weight = abs_residual_target.mean(dim=1, keepdim=True).detach()
+                    residual_weight = residual_weight / residual_weight.mean().clamp_min(1e-6)
+                    abstain_excess = torch.relu(route_abstain - route_abstain_target)
+                    route_abstain_loss = (
+                        abstain_excess
+                        * usable_news.unsqueeze(1)
+                        * residual_weight
+                    ).mean()
+                    loss_total = loss_total + route_abstain_lambda * route_abstain_loss
 
             if hard_reflect_mode not in {"off", "none"} and len(prompt_texts_d) > 0:
                 err_real_batch = torch.abs(pred_real_z - targets_z_typed).mean(dim=1).detach().cpu().numpy()
@@ -1078,6 +1217,19 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     "delta": delta_abs_mean,
                     "news": news_frac,
                 }
+                route_abstain_mean = out_delta.get("route_abstain_mean")
+                confidence_mean = out_delta.get("confidence_mean")
+                text_strength_mean = out_delta.get("text_strength_mean")
+                if route_abstain_mean is not None:
+                    postfix["abstain"] = float(route_abstain_mean.detach().cpu())
+                if route_balance_loss is not None:
+                    postfix["route_bal"] = float(route_balance_loss.detach().cpu())
+                if route_abstain_loss is not None:
+                    postfix["abs_pen"] = float(route_abstain_loss.detach().cpu())
+                if confidence_mean is not None:
+                    postfix["conf"] = float(confidence_mean.detach().cpu())
+                if text_strength_mean is not None:
+                    postfix["text"] = float(text_strength_mean.detach().cpu())
                 if relative_mode:
                     postfix["state_acc"] = sign_acc
                 else:
@@ -1376,6 +1528,14 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         temporal_text_tokenizer = temporal_tok_d
         model_best.to(device)
         model_best.eval()
+        if _use_external_signnet(args):
+            loaded_external_signnet = _load_external_signnet_checkpoint(
+                best_delta_path,
+                device=device,
+                live_logger=live_logger,
+            )
+            if loaded_external_signnet is not None:
+                external_signnet_model = loaded_external_signnet
 
         delta_meta = {}
         delta_meta_path = os.path.join(best_delta_path, "meta.json")

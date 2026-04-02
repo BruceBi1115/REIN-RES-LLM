@@ -313,6 +313,32 @@ def _masked_multiclass_accuracy_from_logits(
     return (correct * m).sum() / denom.clamp_min(1.0)
 
 
+def _masked_multiclass_inverse_freq_weights(
+    targets: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    num_classes: int = 3,
+) -> torch.Tensor:
+    tgt = targets.to(torch.long)
+    if mask is None:
+        valid = torch.ones_like(tgt, dtype=torch.bool)
+    else:
+        valid = mask.to(torch.float32) > 0.5
+    if int(valid.sum().detach().cpu().item()) <= 0:
+        return torch.ones_like(tgt, dtype=torch.float32)
+
+    flat_tgt = tgt[valid].reshape(-1)
+    counts = torch.bincount(flat_tgt, minlength=int(max(1, num_classes))).to(torch.float32)
+    present = counts > 0
+    if int(present.sum().detach().cpu().item()) <= 0:
+        return torch.ones_like(tgt, dtype=torch.float32)
+
+    cls_w = torch.ones_like(counts, dtype=torch.float32)
+    total = counts[present].sum()
+    cls_w[present] = total / (counts[present].clamp_min(1.0) * float(present.sum().item()))
+    return cls_w[tgt].to(torch.float32)
+
+
 def _masked_multiclass_macro_balanced_accuracy_from_logits(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -424,9 +450,23 @@ def _log_last_residual_eval_diag(args, live_logger, tag: str):
     if not isinstance(diag, dict) or not diag:
         return
     acc_key = "state_acc" if "state_acc" in diag else "sign_acc"
-    live_logger.info(
+    msg = (
         f"{tag} {acc_key}={float(diag.get(acc_key, 0.0)):.4f} "
         f"pred_mag={float(diag.get('pred_mag_mean', 0.0)):.4f} "
         f"true_|res|={float(diag.get('true_abs_residual_mean', 0.0)):.4f} "
         f"|delta|={float(diag.get('delta_abs_mean', 0.0)):.4f}"
     )
+    extras = []
+    if "route_abstain_mean" in diag:
+        extras.append(f"route_abstain={float(diag.get('route_abstain_mean', 0.0)):.4f}")
+    if "confidence_mean" in diag:
+        extras.append(f"conf={float(diag.get('confidence_mean', 0.0)):.4f}")
+    if "text_strength_mean" in diag:
+        extras.append(f"text={float(diag.get('text_strength_mean', 0.0)):.4f}")
+    route_mix = diag.get("route_top_mix")
+    if isinstance(route_mix, (list, tuple)) and len(route_mix) > 0:
+        mix_str = ",".join(f"{float(x):.2f}" for x in route_mix)
+        extras.append(f"route_top_mix=[{mix_str}]")
+    if extras:
+        msg = f"{msg} {' '.join(extras)}"
+    live_logger.info(msg)
