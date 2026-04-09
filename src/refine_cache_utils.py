@@ -58,7 +58,9 @@ def resolve_refine_description(args) -> str:
     desc = str(getattr(args, "description", "") or "").strip()
     if desc:
         return desc
-
+    
+    
+    # if args.description isss not provided
     value_col = str(getattr(args, "value_col", "") or "").strip() or "target series"
     dataset_source = _dataset_source(args)
     dataset_name = _normalize_cache_name_part(dataset_source, fallback="dataset").replace("_", " ")

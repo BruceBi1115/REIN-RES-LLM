@@ -80,8 +80,6 @@ def setup_env_and_data(args):
     args.taskName = build_experiment_task_name(args)
 
     stage = str(getattr(args, "stage", "all")).lower()
-    base_backbone_name = str(getattr(args, "base_backbone", "dlinear"))
-
     def _safe_name(s: str) -> str:
         s = str(s).strip()
         s = s.replace("/", "-").replace("\\", "-")
@@ -111,7 +109,6 @@ def setup_env_and_data(args):
     os.makedirs(ckpt_dir, exist_ok=True)
 
     # fixed output paths (clearing controlled by main())
-    prompt_path = os.path.join(ckpt_dir, f"prompts_{filename}.json")
     ans_json_path = os.path.join(ckpt_dir, f"test_answers_{filename}.json")
     true_pred_csv_path = os.path.join(ckpt_dir, f"true_pred_{filename}.csv")
     val_residual_debug_csv_path = os.path.join(ckpt_dir, f"val_delta_residual_debug_{filename}.csv")
@@ -306,7 +303,6 @@ def setup_env_and_data(args):
         "live_path": live_path,
         "log_jsonl": log_jsonl,
         "ckpt_dir": ckpt_dir,
-        "prompt_path": prompt_path,
         "ans_json_path": ans_json_path,
         "true_pred_csv_path": true_pred_csv_path,
         "val_residual_debug_csv_path": val_residual_debug_csv_path,
@@ -326,7 +322,6 @@ def setup_env_and_data(args):
         "volatility_bin_test": volatility_bin_test,
         "global_zstats": global_zstats,
         "news_api_adapter": news_api_adapter,
-        "prompt_path": prompt_path,
         "test_filename": filename,
     }
 
@@ -503,7 +498,7 @@ def train_base_stage(args, bundle):
         "global_zstats": global_zstats,
     }
 
-def testing_base(test_loader, args, device, live_logger, templates, volatility_bin_test, true_pred_csv_path, global_zstats):
+def testing_base(test_loader, args, device, live_logger, true_pred_csv_path, global_zstats):
     if test_loader is not None:
         gc.collect()
         torch.cuda.empty_cache()
@@ -551,15 +546,11 @@ def main(args):
     bundle = setup_env_and_data(args)
     stage = bundle["stage"]
 
-    ckpt_dir = bundle["ckpt_dir"]
-    prompt_path = bundle["prompt_path"]
     ans_json_path = bundle["ans_json_path"]
     true_pred_csv_path = bundle["true_pred_csv_path"]
     val_residual_debug_csv_path = bundle.get("val_residual_debug_csv_path")
     test_residual_debug_csv_path = bundle.get("test_residual_debug_csv_path")
 
-    with open(prompt_path, "w", encoding="utf-8"):
-        pass
     with open(ans_json_path, "w", encoding="utf-8"):
         pass
     with open(true_pred_csv_path, "w", newline="") as f:
@@ -581,8 +572,6 @@ def main(args):
             args,
             bundle["device"],
             bundle["live_logger"],
-            cfg["templates"],
-            bundle["volatility_bin_test"],
             bundle["true_pred_csv_path"],
             cfg.get("global_zstats", bundle.get("global_zstats")),
         )
@@ -592,12 +581,14 @@ def main(args):
         best_base_path = _resolve_base_ckpt()
         if not os.path.exists(best_base_path):
             raise FileNotFoundError(f"Base checkpoint not found: {best_base_path}")
+
         train_delta_stage(args, bundle, best_base_path=best_base_path, best_base_metric=float("inf"))
         return
 
     # stage == "all"
     if stage == "all":
         cfg_base = train_base_stage(args, bundle)
+
         train_delta_stage(
             args,
             bundle,

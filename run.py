@@ -13,8 +13,14 @@ if __name__ == '__main__':
                         help='additive mode: ignore sign supervision where |delta_target| <= eps; relative mode: neutral band for q-state labels')
     parser.add_argument('--delta_sign_tau', type=float, default=1.0,
                         help='temperature for additive-mode internal soft sign = tanh(sign_logits / tau)')
-    parser.add_argument('--delta_sign_mode', type=str, default='signnet_binary', choices=['signnet_binary', 'internal'],
+    parser.add_argument('--delta_sign_mode', type=str, default='signnet_binary', choices=['signnet_binary', 'internal', 'none'],
                         help='residual-state mode for DELTA: external SignNet state classifier or internal DELTA state head')
+    parser.add_argument('--sign_label_mode', type=str, default='hard', choices=['hard', 'soft', 'windowed'],
+                        help='label construction mode for sign supervision')
+    parser.add_argument('--sign_soft_temperature', type=float, default=1.0,
+                        help='temperature used for soft sign labels')
+    parser.add_argument('--sign_window_size', type=int, default=8,
+                        help='window size used for smoothed sign labels')
     parser.add_argument('--delta_sign_external_epochs', type=int, default=60,
                         help='epochs for external signnet pretraining when delta_sign_mode=signnet_binary')
     parser.add_argument('--delta_sign_external_hidden', type=int, default=128,
@@ -76,16 +82,25 @@ if __name__ == '__main__':
                         help='document candidate construction mode for doc impact aggregation')
 
     parser.add_argument('--delta_head_init_std', type=float, default=0.01, help='std for delta head weight init')
+    parser.add_argument('--delta_mag_init_bias', type=float, default=-2.0,
+                        help='initial bias for delta magnitude head in log-space; larger values allow less conservative DELTA updates')
+    parser.add_argument('--delta_text_gate_init_bias', type=float, default=-2.0,
+                        help='initial bias for temporal-text fusion gate')
     parser.add_argument('--delta_clip', type=float, default=3.0, help='tanh clip for delta outputs in z-space (<=0 to disable)')
     parser.add_argument('--delta_news_tail_tokens', type=int, default=160, help='how many tail text tokens to pool as news context')
     parser.add_argument('--delta_model_variant', type=str, default='tiny_news_ts', choices=['tiny_news_ts'],
                         help='DELTA model branch')
     parser.add_argument('--tiny_news_hidden_size', type=int, default=256,
                         help='hidden size for DELTA tiny_news_ts branch')
+    parser.add_argument('--residual_arch', type=str, default='unified',
+                        choices=['current', 'unified', 'simple_concat', 'base_only_delta'],
+                        help='residual architecture variant for DELTA ablation and unified trunk experiments')
 
     parser.add_argument('--delta_grad_clip', type=float, default=1.0, help='grad clip norm for delta stage (<=0 to disable)')
     parser.add_argument('--delta_head_lr_scale', type=float, default=1.0, help='lr scale for delta/rel heads in delta stage')
     parser.add_argument('--delta_other_lr_scale', type=float, default=0.5, help='lr scale for other trainable params in delta stage')
+    parser.add_argument('--delta_warmup_epochs', type=int, default=2,
+                        help='warmup epochs for DELTA training (linear LR ramp)')
     parser.add_argument('--delta_freeze_feature_modules', type=int, default=0, choices=[0, 1],
                         help='freeze patch/pooling feature modules in delta stage (legacy behavior)')
     parser.add_argument('--delta_target_clip', type=float, default=0.0,
@@ -152,10 +167,22 @@ if __name__ == '__main__':
                         help='strength of patch-level fusion from time-aligned text auxiliary features into DELTA')
     parser.add_argument('--delta_temporal_text_freeze_encoder', type=int, default=1, choices=[0, 1],
                         help='freeze the pretrained text encoder used for the time-aligned text auxiliary sequence')
+    parser.add_argument('--delta_temporal_text_unfreeze_last_n', type=int, default=0,
+                        help='unfreeze the last N layers of the temporal text encoder when freeze mode is enabled')
+    parser.add_argument('--delta_text_fuse_mode', type=str, default='gated_add', choices=['gated_add', 'cross_attention'],
+                        help='how temporal text features are fused into TS patch features')
+    parser.add_argument('--batch_news_debug_enable', type=int, default=0, choices=[0, 1],
+                        help='log per-batch history/news/temporal-text alignment diagnostics during the delta stage')
+    parser.add_argument('--batch_news_debug_max_batches', type=int, default=-1,
+                        help='maximum number of delta-stage batches to emit batch debug logs for; <=0 means all')
     parser.add_argument('--delta_multimodal_arch', type=str, default='summary_gated', choices=['summary_gated', 'plan_c_mvp'],
                         help='residual architecture: legacy summary/gated branch or Plan-C-style regime router + expert mixture MVP')
     parser.add_argument('--delta_multimodal_fuse_lambda', type=float, default=1.0,
                         help='mixture strength for Plan C regime experts in DELTA and external SignNet')
+    parser.add_argument('--unified_direction_loss_weight', type=float, default=0.3,
+                        help='weight for unified trunk direction supervision')
+    parser.add_argument('--unified_confidence_loss_weight', type=float, default=0.1,
+                        help='weight for unified trunk confidence consistency supervision')
     parser.add_argument('--news_api_enable', type=int, default=0, choices=[0, 1],
                         help='caller-level switch recording whether API-backed news processing was requested')
     parser.add_argument('--news_api_model', type=str, default='gpt-5.1',
@@ -248,11 +275,12 @@ if __name__ == '__main__':
     parser.add_argument('--region', type=str, default='', help='region/state/country code')
     parser.add_argument('--unit', type=str, default='', help='unit string')
     parser.add_argument('--volatility_bin_tiers', type=int, default=100, help='the tiers to bin volatility')
-    parser.add_argument('--token_budget', type=int, default=700, help='max tokens for composed prompt')
+    parser.add_argument('--token_budget', type=int, default=1280, help='max tokens for composed prompt')
     # ===== Task windowing =====
     parser.add_argument('--history_len', type=int, default=48, help='steps for history window L')
     parser.add_argument('--horizon', type=int, default=48, help='steps to predict H')
     parser.add_argument('--stride', type=int, default=48, help='sliding stride for training')
+
     # ===== News retrieval (rule-based) =====
     parser.add_argument('--news_path', type=str, default='', help='path to news store (should be a JSON file)')
     parser.add_argument('--news_time_col', type=str, default='date', help='news timestamp column name')
@@ -267,7 +295,7 @@ if __name__ == '__main__':
                         help='YAML/JSON templates with placeholders')
 
     #===== Token budget fractions =====
-    parser.add_argument('--token_budget_news_frac', type=float, default=0.9, help='budget frac for news')
+    parser.add_argument('--token_budget_news_frac', type=float, default=1, help='budget frac for news')
 
     # ===== Text Model Tokenizer =====
     parser.add_argument('--base_model', type=str, default='distilbert-base-uncased', help='HF model id or local path')

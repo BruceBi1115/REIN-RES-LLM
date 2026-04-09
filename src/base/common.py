@@ -1,13 +1,8 @@
 from __future__ import annotations
 
 import csv
-import gc
 import json
-import math
 import os
-import re
-import shutil
-from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -20,6 +15,7 @@ from ..data_construction.prompt import build_prompt
 from ..delta_news_hooks import extract_structured_events, format_structured_events_for_prompt, refine_news_text
 from ..news_rules import get_candidates, rerank_selected_news_by_utility, select_news
 from ..refine_cache_utils import build_refine_context
+from ..utils.batch_utils import _batch_time_seq_for_sample
 from ..utils.utils import print_prompt_stats
 from ..delta.core import _resolve_delta_sign_mode
 from ..refine.cache import (
@@ -105,6 +101,26 @@ def _open_residual_debug_csv(path: str | None):
         "magnitude",
         "magnitude_raw",
         "news_count",
+        "candidate_news_count",
+        "history_range_news_count",
+        "selected_news_in_history_range_count",
+        "news_max_utility",
+        "temporal_text_source",
+        "temporal_text_doc_total",
+        "temporal_text_doc_nonempty",
+        "temporal_text_doc_attached_any_step",
+        "temporal_text_doc_pre_history",
+        "temporal_text_doc_in_history_range",
+        "temporal_text_doc_post_history_pre_target",
+        "temporal_text_step_nonempty_count",
+        "temporal_text_step_tokenized_count",
+        "temporal_text_step_total",
+        "temporal_text_all_nonempty_docs_attached",
+        "base_residual_abs",
+        "delta_helped",
+        "direction_correct",
+        "confidence_value",
+        "regime_route",
         "policy",
         "template_id",
     ]
@@ -430,9 +446,9 @@ def _split_time_order_issues(
     time_col: str,
 ) -> list[str]:
     issues = []
-    train_min, train_max = _df_series_time_range(train_df, time_col)
+    _, train_max = _df_series_time_range(train_df, time_col)
     val_min, val_max = _df_series_time_range(val_df, time_col)
-    test_min, test_max = _df_series_time_range(test_df, time_col)
+    test_min, _ = _df_series_time_range(test_df, time_col)
 
     if train_max is not None and val_min is not None and pd.Timestamp(train_max) >= pd.Timestamp(val_min):
         issues.append(
@@ -691,6 +707,98 @@ def _pad_patches(
         ts_patch_mask[i, :P_i] = torch.tensor(pm, dtype=torch.long)
     return ts_patches, ts_patch_mask
 
+
+def _count_news_rows_in_time_range(news_df, time_col: str, start_time, end_time) -> int:
+    if news_df is None or len(news_df) == 0 or time_col not in news_df.columns:
+        return 0
+    ts_series = news_df[time_col]
+    start_ts = _align_ts_to_ref_tz(start_time, ts_series)
+    end_ts = _align_ts_to_ref_tz(end_time, ts_series)
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return 0
+    lo = min(start_ts, end_ts)
+    hi = max(start_ts, end_ts)
+    return int(((ts_series >= lo) & (ts_series <= hi)).sum())
+
+
+def _count_selected_news_in_history_range(selected: pd.DataFrame, *, time_col: str, history_times: list[str]) -> int:
+    if selected is None or len(selected) == 0 or time_col not in selected.columns or len(history_times) == 0:
+        return 0
+    hist_series = pd.Series(pd.to_datetime(history_times, errors="coerce"))
+    hist_valid = hist_series.dropna()
+    if len(hist_valid) == 0:
+        return 0
+    selected_ts = pd.to_datetime(selected[time_col], errors="coerce")
+    if getattr(hist_series.dt, "tz", None) is not None:
+        selected_ts = selected_ts.apply(
+            lambda x: _align_ts_to_ref_tz(x, hist_series) if not pd.isna(x) else x
+        )
+    lo = hist_valid.min()
+    hi = hist_valid.max()
+    return int(((selected_ts >= lo) & (selected_ts <= hi)).sum())
+
+
+def _summarize_temporal_text_alignment(
+    *,
+    history_times: list[str],
+    target_time,
+    news_metas: list[dict],
+    news_docs: list[str],
+) -> dict[str, int]:
+    hist_series = pd.Series(pd.to_datetime(history_times, errors="coerce"))
+    hist_valid = hist_series.dropna()
+    if len(hist_valid) == 0:
+        history_start = pd.NaT
+        history_end = pd.NaT
+    else:
+        history_start = hist_valid.min()
+        history_end = hist_valid.max()
+    target_ts = _align_ts_to_ref_tz(target_time, hist_series) if len(hist_series) > 0 else pd.to_datetime(target_time, errors="coerce")
+    step_times = hist_series.tolist()
+
+    doc_total = 0
+    doc_nonempty = 0
+    doc_attached_any_step = 0
+    doc_pre_history = 0
+    doc_in_history_range = 0
+    doc_post_history_pre_target = 0
+
+    for meta, doc_txt in zip(list(news_metas or []), list(news_docs or [])):
+        doc_total += 1
+        clean = str(doc_txt or "").strip()
+        if not clean:
+            continue
+        doc_nonempty += 1
+        raw_ts = meta.get("date", "") if isinstance(meta, dict) else ""
+        doc_ts = _align_ts_to_ref_tz(raw_ts, hist_series)
+
+        if not pd.isna(doc_ts):
+            if not pd.isna(history_start) and doc_ts < history_start:
+                doc_pre_history += 1
+            elif not pd.isna(history_end) and doc_ts <= history_end:
+                doc_in_history_range += 1
+            elif not pd.isna(target_ts) and doc_ts < target_ts:
+                doc_post_history_pre_target += 1
+
+        attached = False
+        for step_ts in step_times:
+            if pd.isna(step_ts):
+                continue
+            if pd.isna(doc_ts) or doc_ts <= step_ts:
+                attached = True
+                break
+        if attached:
+            doc_attached_any_step += 1
+
+    return {
+        "temporal_text_doc_total": int(doc_total),
+        "temporal_text_doc_nonempty": int(doc_nonempty),
+        "temporal_text_doc_attached_any_step": int(doc_attached_any_step),
+        "temporal_text_doc_pre_history": int(doc_pre_history),
+        "temporal_text_doc_in_history_range": int(doc_in_history_range),
+        "temporal_text_doc_post_history_pre_target": int(doc_post_history_pre_target),
+    }
+
 def _build_temporal_text_series_for_sample(
     *,
     history_times: list[str],
@@ -773,7 +881,7 @@ def _tokenize_temporal_text_series(
                     max_length=max_len,
                     return_attention_mask=False,
                 )
-                ids = enc.get("input_ids", []) if isinstance(enc, dict) else []
+                ids = enc.get("input_ids", []) if hasattr(enc, "get") else []
             except Exception:
                 ids = []
             step_ids.append(list(ids or []))
@@ -791,12 +899,9 @@ def build_batch_inputs(
     policy_name,
     policy_kw,
     volatility_bin,
-    epoch: int = -1,
-    record_train_prompt: bool = False,
     testing: bool = False,
     force_no_news: bool = False,
     news_dropout: bool = False,
-    prompt_path: str = None,
     api_adapter=None,
     temporal_text_tokenizer=None,
     build_prompt_inputs: bool = True,
@@ -817,13 +922,13 @@ def build_batch_inputs(
 
     patch_len = int(getattr(args, "patch_len", 4))
     patch_stride = int(getattr(args, "patch_stride", patch_len))
-    need_prompt_context = bool(build_prompt_inputs or record_train_prompt)
+    need_prompt_context = bool(build_prompt_inputs)
 
     tpl_text = templates[tpl_id]["text"]
     temporal_tok = temporal_text_tokenizer if temporal_text_tokenizer is not None else tokenizer
-    temporal_text_source = str(getattr(args, "delta_temporal_text_source", "refined") or "refined").strip().lower()
+    temporal_text_source = str(getattr(args, "delta_temporal_text_source")).lower().strip()
     if temporal_text_source not in {"refined", "raw"}:
-        temporal_text_source = "refined"
+        raise ValueError(f"Invalid delta_temporal_text_source: {temporal_text_source}")
     B = len(batch["history_value"])
 
     targets_z_list = []
@@ -838,6 +943,7 @@ def build_batch_inputs(
     structured_feature_list = []
     rel_labels_list = []
     temporal_text_series_list = []
+    sample_debug_records = []
 
     start_dates = []
     end_dates = []
@@ -845,30 +951,31 @@ def build_batch_inputs(
     pred_ends = []
 
     len_selected_news = []
+    news_max_utility_list = []
 
     for i in range(B):
         history = batch["history_value"][i].tolist()
         target = batch["target_value"][i].tolist()
         t_target = batch["target_time"][i]
+        history_times_i = _batch_time_seq_for_sample(batch.get("history_times"), i)
+        target_times_i = _batch_time_seq_for_sample(batch.get("target_times"), i)
 
         history_z = _zscore(history, mu_global, sigma_global)
         target_z = _zscore(target, mu_global, sigma_global)
 
         p, pm = _make_patches(history_z, patch_len=patch_len, stride=patch_stride)
         news_text_col = args.news_text_col
-        if policy_name == "no_sum":
-            news_text_col = "no_sum"
-        elif policy_name == "sum_v0":
-            news_text_col = "sum_v0"
+        cand = pd.DataFrame(columns=[args.news_time_col, news_text_col])
+        candidate_news_count = 0
         # news
-        avg_rate = 0.0
         if force_no_news or (news_df is None) or (len(news_df) == 0):
             selected = pd.DataFrame(columns=[args.news_time_col, news_text_col])
         else:
             cand = get_candidates(news_df, args.news_time_col, t_target, args.news_window_days, args.news_topM)
+            candidate_news_count = int(len(cand))
             policy_k = int(args.news_topK)
 
-            selected, avg_rate = select_news(
+            selected = select_news(
                 cand, policy_name, news_text_col, policy_kw, policy_k, args=args
             )
 
@@ -885,17 +992,33 @@ def build_batch_inputs(
                     args=args,
                 )
 
-            if (not selected.empty) and ("rate" in selected.columns):
-                avg_rate = float(selected["rate"].mean())
-
         len_selected_news.append(len(selected))
+        if len(selected) > 0 and "utility_score" in selected.columns:
+            try:
+                max_utility = float(pd.to_numeric(selected["utility_score"], errors="coerce").max())
+            except Exception:
+                max_utility = float("nan")
+        else:
+            max_utility = float("nan")
+        news_max_utility_list.append(max_utility if np.isfinite(max_utility) else 0.0)
 
+
+        # <<<<<<< refine news text and extract structured events for prompt and features >>>>>
         news_str = ""
         refined_news = ""
         refined_news_docs = []
         structured_events = {}
         structured_doc_events = []
         temporal_text_series = [""] * L
+        temporal_text_docs = []
+        temporal_text_debug = {
+            "temporal_text_doc_total": 0,
+            "temporal_text_doc_nonempty": 0,
+            "temporal_text_doc_attached_any_step": 0,
+            "temporal_text_doc_pre_history": 0,
+            "temporal_text_doc_in_history_range": 0,
+            "temporal_text_doc_post_history_pre_target": 0,
+        }
         if (not force_no_news) and len(selected) > 0:
             raw_news_texts = selected[news_text_col].fillna("").astype(str).tolist()
             selected_news_metas = _selected_news_meta_records(
@@ -904,6 +1027,8 @@ def build_batch_inputs(
                 text_col=news_text_col,
                 time_col=args.news_time_col,
             )
+
+            # target time, region, dataset description
             refine_context = build_refine_context(args, target_time=t_target)
             aligned_refined_news_docs = _refine_news_docs_aligned_from_doc_cache(
                 raw_news_texts=raw_news_texts,
@@ -946,12 +1071,18 @@ def build_batch_inputs(
             if int(getattr(args, "delta_temporal_text_enable", 0)) == 1:
                 temporal_text_docs = aligned_refined_news_docs if temporal_text_source == "refined" else raw_news_texts
                 temporal_text_series = _build_temporal_text_series_for_sample(
-                    history_times=list(batch["history_times"][i]),
+                    history_times=history_times_i,
                     news_metas=selected_news_metas,
                     news_docs=temporal_text_docs,
                     tokenizer=temporal_tok,
                     max_tokens=int(max(1, getattr(args, "delta_temporal_text_max_len", 96))),
                     per_step_topk=int(max(1, getattr(args, "delta_temporal_text_per_step_topk", 3))),
+                )
+                temporal_text_debug = _summarize_temporal_text_alignment(
+                    history_times=history_times_i,
+                    target_time=t_target,
+                    news_metas=selected_news_metas,
+                    news_docs=temporal_text_docs,
                 )
 
             pieces = [refined_news] if need_prompt_context and refined_news else []
@@ -1001,19 +1132,12 @@ def build_batch_inputs(
                 dim=int(max(1, getattr(args, "delta_structured_feature_dim", 12))),
             )
         )
+        rel_labels_list.append(0.0)
 
-
-        rel = float(avg_rate) if np.isfinite(avg_rate) else 0.0
-        rel = max(0.0, min(1.0, rel))
-        rel_labels_list.append(rel)
-
-        # if len(selected) > 5:
-        #     print(news_str)
-        # time meta for prompt
-        start_date = batch["history_times"][0][i]
-        end_date = batch["history_times"][-1][i]
-        prediction_start = batch["target_times"][0][i]
-        prediction_end = batch["target_times"][-1][i]
+        start_date = history_times_i[0] if len(history_times_i) > 0 else ""
+        end_date = history_times_i[-1] if len(history_times_i) > 0 else ""
+        prediction_start = target_times_i[0] if len(target_times_i) > 0 else ""
+        prediction_end = target_times_i[-1] if len(target_times_i) > 0 else ""
 
         targets_z_list.append(np.asarray(target_z, dtype=np.float32))
         patches_list.append(p)
@@ -1034,6 +1158,43 @@ def build_batch_inputs(
         structured_events_list.append(dict(structured_events) if isinstance(structured_events, dict) else {})
         structured_doc_events_list.append(list(structured_doc_events))
         temporal_text_series_list.append(list(temporal_text_series))
+        sample_debug_records.append(
+            {
+                "history_start": start_date,
+                "history_end": end_date,
+                "target_start": prediction_start,
+                "target_end": prediction_end,
+                "candidate_news_count": int(candidate_news_count),
+                "history_range_news_count": int(
+                    _count_news_rows_in_time_range(
+                        news_df,
+                        args.news_time_col,
+                        start_date,
+                        end_date,
+                    )
+                ),
+                "selected_news_in_history_range_count": int(
+                    _count_selected_news_in_history_range(
+                        selected,
+                        time_col=args.news_time_col,
+                        history_times=history_times_i,
+                    )
+                ),
+                "temporal_text_source": temporal_text_source if int(getattr(args, "delta_temporal_text_enable", 0)) == 1 else "disabled",
+                "temporal_text_doc_total": int(temporal_text_debug["temporal_text_doc_total"]),
+                "temporal_text_doc_nonempty": int(temporal_text_debug["temporal_text_doc_nonempty"]),
+                "temporal_text_doc_attached_any_step": int(temporal_text_debug["temporal_text_doc_attached_any_step"]),
+                "temporal_text_doc_pre_history": int(temporal_text_debug["temporal_text_doc_pre_history"]),
+                "temporal_text_doc_in_history_range": int(temporal_text_debug["temporal_text_doc_in_history_range"]),
+                "temporal_text_doc_post_history_pre_target": int(temporal_text_debug["temporal_text_doc_post_history_pre_target"]),
+                "temporal_text_step_nonempty_count": int(sum(1 for step_text in temporal_text_series if str(step_text or "").strip())),
+                "temporal_text_step_tokenized_count": 0,
+                "temporal_text_step_total": int(len(temporal_text_series)),
+                "temporal_text_all_nonempty_docs_attached": int(
+                    int(temporal_text_debug["temporal_text_doc_nonempty"]) == int(temporal_text_debug["temporal_text_doc_attached_any_step"])
+                ),
+            }
+        )
 
         if need_prompt_context:
             start_dates.append(start_date)
@@ -1078,24 +1239,6 @@ def build_batch_inputs(
                 ids_list[i] = enc["input_ids"]
             prompt_texts.append(prompt)
 
-            if record_train_prompt and epoch == 0:
-                ckpt_dir = os.path.join("./checkpoints", args.taskName)
-                os.makedirs(ckpt_dir, exist_ok=True)
-
-                rec = {
-                    "batch_idx": i,
-                    "epoch_num": epoch + 1,
-                    "template_id": int(tpl_id),
-                    "policy": str(policy_name),
-                    "force_no_news": bool(force_no_news),
-                    "prompt": prompt,
-                    "mu_global": float(metas[i]["mu_global"]),
-                    "sigma_global": float(metas[i]["sigma_global"]),
-                    "mu": float(metas[i]["mu"]),
-                    "sigma": float(metas[i]["sigma"]),
-                }
-                with open(prompt_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     input_ids, attn = _pad_2d_int(ids_list, pad_id=tokenizer.pad_token_id)
     ts_patches, ts_patch_mask = _pad_patches(patches_list, patchmask_list, patch_len=patch_len)
     targets_z = torch.stack([torch.tensor(t, dtype=torch.float32) for t in targets_z_list], dim=0)
@@ -1109,6 +1252,9 @@ def build_batch_inputs(
             tokenizer=temporal_tok,
             max_length=int(max(1, getattr(args, "delta_temporal_text_max_len", 96))),
         )
+        step_tokenized = (temporal_text_attn.sum(dim=-1) > 0).to(torch.int64)
+        for i in range(min(len(sample_debug_records), int(step_tokenized.size(0)))):
+            sample_debug_records[i]["temporal_text_step_tokenized_count"] = int(step_tokenized[i].sum().item())
     else:
         temporal_text_ids, temporal_text_attn, temporal_text_step_mask = None, None, None
     return (
@@ -1121,12 +1267,14 @@ def build_batch_inputs(
         prompt_texts,
         rel_labels,
         news_counts,
+        torch.tensor(news_max_utility_list, dtype=torch.float32),
         structured_events_list,
         structured_doc_events_list,
         structured_feats,
         temporal_text_ids,
         temporal_text_attn,
         temporal_text_step_mask,
+        sample_debug_records,
     )
 
 def build_delta_batch_inputs(
@@ -1157,12 +1305,14 @@ def build_delta_batch_inputs(
         prompt_texts,
         rel_labels,
         news_counts,
+        news_max_utility,
         structured_events_list,
         structured_doc_events_list,
         structured_feats,
         temporal_text_ids,
         temporal_text_attn,
         temporal_text_step_mask,
+        sample_debug_records,
     ) = build_batch_inputs(
         batch=batch,
         tokenizer=tokenizer,
@@ -1175,8 +1325,6 @@ def build_delta_batch_inputs(
         policy_name=policy_name,
         policy_kw=policy_kw,
         volatility_bin=volatility_bin,
-        epoch=-1,
-        record_train_prompt=False,
         testing=testing,
         force_no_news=force_no_news,
         news_dropout=news_dropout,
@@ -1190,12 +1338,14 @@ def build_delta_batch_inputs(
         "prompt_texts": prompt_texts,
         "rel_labels": rel_labels,
         "news_counts": news_counts,
+        "news_max_utility": news_max_utility,
         "structured_events": structured_events_list,
         "structured_doc_events": structured_doc_events_list,
         "structured_feats": structured_feats,
         "temporal_text_ids": temporal_text_ids,
         "temporal_text_attn": temporal_text_attn,
         "temporal_text_step_mask": temporal_text_step_mask,
+        "sample_debug_records": sample_debug_records,
     }
 
 def evaluate_metrics_single(
@@ -1247,16 +1397,18 @@ def evaluate_metrics_single(
             ts_patches,
             ts_patch_mask,
             targets_z,
-            metas,
+            _metas,
             prompt_texts,
             rel_labels,
-            n_selected,
+            _n_selected,
+            _news_max_utility,
             _structured_events,
             _structured_doc_events,
             _structured_feats,
             _temporal_text_ids,
             _temporal_text_attn,
             _temporal_text_step_mask,
+            _sample_debug_records,
         ) = build_batch_inputs(
             batch=batch,
             tokenizer=tokenizer,
@@ -1268,8 +1420,6 @@ def evaluate_metrics_single(
             policy_name=policy_name,
             policy_kw=policy_kw,
             volatility_bin=volatility_bin,
-            epoch=-1,
-            record_train_prompt=False,
             testing=testing,
             force_no_news=force_no_news,
             news_dropout=news_dropout,
@@ -1369,7 +1519,7 @@ def evaluate_metrics_backbone(
     eval_desc = "[EVAL][BACKBONE][TEST]" if testing else "[EVAL][BACKBONE][VAL]"
     eval_loader, use_pbar = _eval_iter(data_loader, args, desc=eval_desc)
     for _, batch in enumerate(eval_loader):
-        history_z, targets_z, metas = _z_batch_tensors(batch, args, global_zstats=stats)
+        history_z, targets_z, _metas = _z_batch_tensors(batch, args, global_zstats=stats)
         history_z = history_z.to(device)
         targets_z = targets_z.to(device)
 

@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 
 from .regime_blocks import RegimeRouter, ResidualExpertMixture
 from .temporal_text import TemporalTextTower
+from .unified_trunk import UnifiedResidualTrunk
 
 
 def _load_hf_tokenizer(tokenizer_id: str):
@@ -17,6 +18,27 @@ def _load_hf_tokenizer(tokenizer_id: str):
         if tok.pad_token_id is None and tok.eos_token_id is not None:
             tok.pad_token_id = tok.eos_token_id
     return tok
+
+
+def _normalize_delta_sign_mode(mode: str | None) -> str:
+    sign_mode = str(mode or "signnet_binary").lower().strip()
+    if sign_mode not in {"signnet_binary", "internal", "none"}:
+        sign_mode = "signnet_binary"
+    return sign_mode
+
+
+def _normalize_residual_arch(arch: str | None) -> str:
+    residual_arch = str(arch or "current").lower().strip()
+    if residual_arch not in {"current", "unified", "simple_concat", "base_only_delta"}:
+        residual_arch = "current"
+    return residual_arch
+
+
+def _normalize_text_fuse_mode(mode: str | None) -> str:
+    fuse_mode = str(mode or "gated_add").lower().strip()
+    if fuse_mode not in {"gated_add", "cross_attention"}:
+        fuse_mode = "gated_add"
+    return fuse_mode
 
 
 class TinyNewsTSRegressor(nn.Module):
@@ -30,12 +52,15 @@ class TinyNewsTSRegressor(nn.Module):
     def __init__(
         self,
         horizon: int,
+        history_len: int,
         patch_dim: int,
         patch_stride: int,
         hidden_size: int,
         patch_dropout: float,
         head_dropout: float,
         delta_head_init_std: float = 0.01,
+        delta_mag_init_bias: float = -2.0,
+        delta_text_gate_init_bias: float = -2.0,
         delta_clip: float = 3.0,
         structured_feat_dim: int = 0,
         huber_beta: float = 0.5,
@@ -55,12 +80,16 @@ class TinyNewsTSRegressor(nn.Module):
         temporal_text_dim: int = 8,
         temporal_text_fuse_lambda: float = 0.5,
         temporal_text_freeze_encoder: bool = True,
+        temporal_text_unfreeze_last_n: int = 0,
+        text_fuse_mode: str = "gated_add",
         multimodal_arch: str = "summary_gated",
         multimodal_fuse_lambda: float = 1.0,
+        residual_arch: str = "current",
     ):
         super().__init__()
         self.model_variant = "tiny_news_ts"
         self.horizon = int(horizon)
+        self.history_len = int(max(1, history_len))
         self.patch_dim = int(patch_dim)
         self.patch_stride = int(max(1, patch_stride))
         self.hidden_size = int(hidden_size)
@@ -97,10 +126,9 @@ class TinyNewsTSRegressor(nn.Module):
         self.delta_head = nn.Linear(self.hidden_size, self.horizon)
         nn.init.normal_(self.delta_head.weight, mean=0.0, std=float(delta_head_init_std))
         nn.init.zeros_(self.delta_head.bias)
-        sign_mode = str(delta_sign_mode or "signnet_binary").lower().strip()
-        if sign_mode not in {"signnet_binary", "internal"}:
-            sign_mode = "signnet_binary"
+        sign_mode = _normalize_delta_sign_mode(delta_sign_mode)
         self.delta_sign_mode = sign_mode
+        self.residual_arch = _normalize_residual_arch(residual_arch)
         multimodal_arch_norm = str(multimodal_arch or "summary_gated").lower().strip()
         if multimodal_arch_norm not in {"summary_gated", "plan_c_mvp"}:
             multimodal_arch_norm = "summary_gated"
@@ -122,6 +150,8 @@ class TinyNewsTSRegressor(nn.Module):
         self.delta_sign_tau = float(max(1e-6, delta_sign_tau))
         self.delta_mag_max = float(max(0.0, delta_mag_max))
         self.doc_candidate_mode = str(doc_candidate_mode or "beta_only")
+        self.delta_mag_init_bias = float(delta_mag_init_bias)
+        self.delta_text_gate_init_bias = float(delta_text_gate_init_bias)
         delta_fuse_in = self.hidden_size * 3
         self.delta_fuse = nn.Sequential(
             nn.Linear(delta_fuse_in, self.hidden_size),
@@ -135,7 +165,7 @@ class TinyNewsTSRegressor(nn.Module):
         nn.init.zeros_(self.delta_state_head.bias)
         self.delta_mag_head = nn.Linear(self.hidden_size, self.horizon)
         nn.init.normal_(self.delta_mag_head.weight, mean=0.0, std=float(delta_head_init_std))
-        nn.init.constant_(self.delta_mag_head.bias, -2.0)
+        nn.init.constant_(self.delta_mag_head.bias, float(delta_mag_init_bias))
         self.text_mag_head = nn.Linear(self.hidden_size, self.horizon)
         nn.init.zeros_(self.text_mag_head.weight)
         nn.init.zeros_(self.text_mag_head.bias)
@@ -145,6 +175,27 @@ class TinyNewsTSRegressor(nn.Module):
         self.confidence_head = nn.Linear(self.hidden_size, self.horizon)
         nn.init.zeros_(self.confidence_head.weight)
         nn.init.zeros_(self.confidence_head.bias)
+        self.direct_residual_head = nn.Linear(self.hidden_size, self.horizon)
+        nn.init.normal_(self.direct_residual_head.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.direct_residual_head.bias)
+        if self.residual_arch == "simple_concat":
+            self.simple_delta_head = nn.Linear(self.hidden_size * 2, self.horizon)
+        elif self.residual_arch == "base_only_delta":
+            self.simple_delta_head = nn.Linear(self.hidden_size, self.horizon)
+        else:
+            self.simple_delta_head = None
+        if self.simple_delta_head is not None:
+            nn.init.normal_(self.simple_delta_head.weight, mean=0.0, std=float(delta_head_init_std))
+            nn.init.zeros_(self.simple_delta_head.bias)
+        if self.residual_arch == "unified":
+            self.unified_trunk = UnifiedResidualTrunk(
+                hidden_size=self.hidden_size,
+                horizon=self.horizon,
+                history_len=self.history_len,
+                dropout=float(head_dropout),
+            )
+        else:
+            self.unified_trunk = None
 
         self.structured_feat_dim = int(max(0, structured_feat_dim))
         if self.structured_feat_dim > 0:
@@ -214,7 +265,9 @@ class TinyNewsTSRegressor(nn.Module):
         self.temporal_text_dim = int(max(1, temporal_text_dim))
         self.temporal_text_fuse_lambda = float(max(0.0, temporal_text_fuse_lambda))
         self.temporal_text_freeze_encoder = bool(temporal_text_freeze_encoder)
+        self.temporal_text_unfreeze_last_n = int(max(0, temporal_text_unfreeze_last_n))
         self.temporal_text_model_id = str(temporal_text_model_id or "").strip()
+        self.text_fuse_mode = _normalize_text_fuse_mode(text_fuse_mode)
         if self.temporal_text_enable:
             if not self.temporal_text_model_id:
                 raise ValueError("temporal_text_model_id must be provided when temporal text auxiliary input is enabled.")
@@ -225,6 +278,7 @@ class TinyNewsTSRegressor(nn.Module):
                 patch_dim=self.patch_dim,
                 patch_stride=self.patch_stride,
                 freeze_encoder=self.temporal_text_freeze_encoder,
+                unfreeze_last_n=self.temporal_text_unfreeze_last_n,
             )
             self.temporal_text_gate = nn.Sequential(
                 nn.Linear(self.hidden_size * 2, self.hidden_size),
@@ -232,10 +286,20 @@ class TinyNewsTSRegressor(nn.Module):
                 nn.Linear(self.hidden_size, self.hidden_size),
             )
             nn.init.zeros_(self.temporal_text_gate[-1].weight)
-            nn.init.constant_(self.temporal_text_gate[-1].bias, -2.0)
+            nn.init.constant_(self.temporal_text_gate[-1].bias, float(delta_text_gate_init_bias))
+            if self.text_fuse_mode == "cross_attention":
+                self.text_cross_attn = nn.MultiheadAttention(
+                    embed_dim=self.hidden_size,
+                    num_heads=4,
+                    dropout=float(head_dropout),
+                    batch_first=True,
+                )
+            else:
+                self.text_cross_attn = None
         else:
             self.temporal_text_tower = None
             self.temporal_text_gate = None
+            self.text_cross_attn = None
 
         # trainer may override this field dynamically
         self.patch_mask_p = 0.0
@@ -383,6 +447,8 @@ class TinyNewsTSRegressor(nn.Module):
         self,
         ts_patches: torch.Tensor,
         ts_patch_mask: torch.Tensor,
+        history_z: torch.Tensor | None = None,
+        base_pred_z: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
         head_mode: str = "base",
         rel_targets: torch.Tensor | None = None,
@@ -429,6 +495,8 @@ class TinyNewsTSRegressor(nn.Module):
         expert_outputs = None
         confidence = None
         confidence_logits = None
+        direction_logits = None
+        direction_score = None
 
         if head_mode == "base":
             pooled = self._pool_ts(ts_feat, ts_patch_mask=ts_patch_mask)
@@ -452,17 +520,32 @@ class TinyNewsTSRegressor(nn.Module):
                 and temporal_text_patch_context is not None
                 and self.temporal_text_fuse_lambda > 0.0
             ):
-                if self.temporal_text_gate is not None:
-                    temporal_text_gate = torch.sigmoid(
-                        self.temporal_text_gate(torch.cat([ts_feat, temporal_text_patch_context], dim=-1))
+                if self.text_fuse_mode == "cross_attention" and self.text_cross_attn is not None:
+                    key_padding_mask = None
+                    if temporal_text_patch_mask is not None:
+                        key_padding_mask = temporal_text_patch_mask.to(device=ts_feat.device) <= 0
+                    attn_out, _ = self.text_cross_attn(
+                        query=ts_feat,
+                        key=temporal_text_patch_context,
+                        value=temporal_text_patch_context,
+                        key_padding_mask=key_padding_mask,
+                        need_weights=False,
                     )
                     if temporal_text_patch_mask is not None:
-                        gate_mask = temporal_text_patch_mask.to(device=ts_feat.device, dtype=ts_feat.dtype).unsqueeze(-1)
-                        temporal_text_gate = temporal_text_gate * gate_mask
-                    gated_temporal_text = temporal_text_gate * temporal_text_patch_context
+                        attn_out = attn_out * temporal_text_patch_mask.to(device=ts_feat.device, dtype=ts_feat.dtype).unsqueeze(-1)
+                    ts_feat = ts_feat + (self.temporal_text_fuse_lambda * attn_out)
                 else:
-                    gated_temporal_text = temporal_text_patch_context
-                ts_feat = ts_feat + (self.temporal_text_fuse_lambda * gated_temporal_text)
+                    if self.temporal_text_gate is not None:
+                        temporal_text_gate = torch.sigmoid(
+                            self.temporal_text_gate(torch.cat([ts_feat, temporal_text_patch_context], dim=-1))
+                        )
+                        if temporal_text_patch_mask is not None:
+                            gate_mask = temporal_text_patch_mask.to(device=ts_feat.device, dtype=ts_feat.dtype).unsqueeze(-1)
+                            temporal_text_gate = temporal_text_gate * gate_mask
+                        gated_temporal_text = temporal_text_gate * temporal_text_patch_context
+                    else:
+                        gated_temporal_text = temporal_text_patch_context
+                    ts_feat = ts_feat + (self.temporal_text_fuse_lambda * gated_temporal_text)
 
             structured_pack = self._build_structured_pack(
                 structured_feats=structured_feats,
@@ -514,7 +597,12 @@ class TinyNewsTSRegressor(nn.Module):
             )
             residual_context = residual_base
 
-            if self.multimodal_arch == "plan_c_mvp" and self.regime_router is not None and self.regime_experts is not None:
+            if (
+                self.residual_arch not in {"simple_concat", "base_only_delta"}
+                and self.multimodal_arch == "plan_c_mvp"
+                and self.regime_router is not None
+                and self.regime_experts is not None
+            ):
                 route_scalars = self._build_route_scalars(
                     ts_patches=ts_patches.to(device=pooled.device, dtype=pooled.dtype),
                     ts_patch_mask=ts_patch_mask,
@@ -541,45 +629,95 @@ class TinyNewsTSRegressor(nn.Module):
                     mix_scale=self.multimodal_fuse_lambda,
                 )
                 route_summary = self.route_summary_ln(residual_context + route_pack["scalar_hidden"])
-
-            magnitude_raw = self.delta_mag_head(self.delta_head_drop(residual_context))
-            magnitude_raw = magnitude_raw + (
-                self.text_mag_head(self.delta_head_drop(temporal_text_summary)) * temporal_text_strength
-            )
-            if self.multimodal_arch == "plan_c_mvp" and route_summary is not None:
-                magnitude_raw = magnitude_raw + self.route_mag_head(self.delta_head_drop(route_summary))
-            confidence_logits = self.confidence_head(self.delta_head_drop(residual_context))
-            confidence = torch.sigmoid(confidence_logits)
-            if route_abstain is not None:
-                confidence = confidence * (1.0 - route_abstain.to(device=confidence.device, dtype=confidence.dtype))
-            magnitude = F.softplus(magnitude_raw)
-            magnitude = magnitude * (0.5 + confidence)
-            if self.delta_mag_max > 0.0:
-                magnitude = magnitude.clamp(max=self.delta_mag_max)
             state_logits = None
             state_probs = None
             state_score = None
             sign_logits = None
             sign_soft = None
 
-            if self.delta_residual_mode == "relative":
-                delta_init = magnitude
-                state_logits = self.delta_state_head(self.delta_head_drop(residual_context)).view(
-                    residual_context.size(0), self.horizon, 3
+            if self.residual_arch == "simple_concat" and self.simple_delta_head is not None:
+                concat = torch.cat([pooled, temporal_text_summary], dim=-1)
+                pred = self.simple_delta_head(self.head_drop(concat))
+                pred = self._clip_delta_tensor(pred, dtype=pred.dtype, device=pred.device)
+                delta_init = pred
+                magnitude_raw = pred
+                magnitude = pred.abs()
+                rel_input = pooled
+                confidence = torch.ones_like(pred)
+                confidence_logits = torch.zeros_like(pred)
+            elif self.residual_arch == "base_only_delta" and self.simple_delta_head is not None:
+                pred = self.simple_delta_head(self.head_drop(pooled))
+                pred = self._clip_delta_tensor(pred, dtype=pred.dtype, device=pred.device)
+                delta_init = pred
+                magnitude_raw = pred
+                magnitude = pred.abs()
+                rel_input = pooled
+                confidence = torch.ones_like(pred)
+                confidence_logits = torch.zeros_like(pred)
+            elif self.residual_arch == "unified" and self.unified_trunk is not None:
+                trunk_out = self.unified_trunk(
+                    residual_context=residual_context,
+                    history_z=history_z,
+                    base_pred_z=base_pred_z,
+                    text_summary=temporal_text_summary,
+                    text_strength=temporal_text_strength,
                 )
-                state_probs = torch.softmax(state_logits, dim=-1)
-                state_score = state_probs[..., 2] - state_probs[..., 0]
-                if self.delta_sign_mode == "internal":
-                    pred = delta_init * state_score
-                else:
-                    pred = delta_init
+                direction_logits = trunk_out["direction_logits"]
+                direction_score = trunk_out["direction_score"]
+                magnitude_raw = trunk_out["magnitude_raw"]
+                magnitude = trunk_out["magnitude"]
+                if self.delta_mag_max > 0.0:
+                    magnitude = magnitude.clamp(max=self.delta_mag_max)
+                confidence_logits = trunk_out["confidence_logits"]
+                confidence = trunk_out["confidence"]
+                if route_abstain is not None:
+                    confidence = confidence * (1.0 - route_abstain.to(device=confidence.device, dtype=confidence.dtype))
+                pred = confidence * direction_score * magnitude
+                pred = self._clip_delta_tensor(pred, dtype=pred.dtype, device=pred.device)
+                delta_init = pred
+                sign_logits = direction_logits
+                sign_soft = direction_score
+                rel_input = residual_context
             else:
-                sign_logits = self.delta_head(self.delta_head_drop(residual_context))
-                sign_soft = torch.tanh(sign_logits / self.delta_sign_tau)
-                delta_init = sign_soft * magnitude
-                pred = delta_init
-            pred = self._clip_delta_tensor(pred, dtype=pred.dtype, device=pred.device)
-            rel_input = residual_context
+                magnitude_raw = self.delta_mag_head(self.delta_head_drop(residual_context))
+                magnitude_raw = magnitude_raw + (
+                    self.text_mag_head(self.delta_head_drop(temporal_text_summary)) * temporal_text_strength
+                )
+                if self.multimodal_arch == "plan_c_mvp" and route_summary is not None:
+                    magnitude_raw = magnitude_raw + self.route_mag_head(self.delta_head_drop(route_summary))
+                confidence_logits = self.confidence_head(self.delta_head_drop(residual_context))
+                confidence = torch.sigmoid(confidence_logits)
+                if route_abstain is not None:
+                    confidence = confidence * (1.0 - route_abstain.to(device=confidence.device, dtype=confidence.dtype))
+                magnitude = F.softplus(magnitude_raw)
+                magnitude = magnitude * (0.5 + confidence)
+                if self.delta_mag_max > 0.0:
+                    magnitude = magnitude.clamp(max=self.delta_mag_max)
+
+                if self.delta_sign_mode == "none":
+                    pred = self.direct_residual_head(self.delta_head_drop(residual_context))
+                    pred = self._clip_delta_tensor(pred, dtype=pred.dtype, device=pred.device)
+                    delta_init = pred
+                    magnitude_raw = pred
+                    magnitude = pred.abs()
+                elif self.delta_residual_mode == "relative":
+                    delta_init = magnitude
+                    state_logits = self.delta_state_head(self.delta_head_drop(residual_context)).view(
+                        residual_context.size(0), self.horizon, 3
+                    )
+                    state_probs = torch.softmax(state_logits, dim=-1)
+                    state_score = state_probs[..., 2] - state_probs[..., 0]
+                    if self.delta_sign_mode == "internal":
+                        pred = delta_init * state_score
+                    else:
+                        pred = delta_init
+                    pred = self._clip_delta_tensor(pred, dtype=pred.dtype, device=pred.device)
+                else:
+                    sign_logits = self.delta_head(self.delta_head_drop(residual_context))
+                    sign_soft = torch.tanh(sign_logits / self.delta_sign_tau)
+                    delta_init = sign_soft * magnitude
+                    pred = self._clip_delta_tensor(delta_init, dtype=delta_init.dtype, device=delta_init.device)
+                rel_input = residual_context
         else:
             raise ValueError(f"Unknown head_mode={head_mode}")
 
@@ -604,6 +742,7 @@ class TinyNewsTSRegressor(nn.Module):
             out["magnitude_raw"] = magnitude_raw.to(torch.float32)
             out["delta_sign_mode"] = str(self.delta_sign_mode)
             out["delta_residual_mode"] = str(self.delta_residual_mode)
+            out["residual_arch"] = str(self.residual_arch)
             out["alpha_news"] = torch.ones_like(pred, dtype=torch.float32)
             out["beta_news"] = torch.zeros_like(pred, dtype=torch.float32)
             out["doc_impact"] = torch.zeros_like(pred, dtype=torch.float32)
@@ -635,6 +774,10 @@ class TinyNewsTSRegressor(nn.Module):
                 out["confidence_mean"] = confidence.mean().detach()
             if confidence_logits is not None:
                 out["confidence_logits"] = confidence_logits.to(torch.float32)
+            if direction_logits is not None:
+                out["direction_logits"] = direction_logits.to(torch.float32)
+            if direction_score is not None:
+                out["direction_score"] = direction_score.to(torch.float32)
             if structured_weight is not None:
                 out["structured_weight_mean"] = structured_weight.mean().detach()
                 out["structured_weight"] = structured_weight.to(torch.float32)
@@ -690,6 +833,7 @@ def build_delta_model(
     base_model: str,
     tokenizer_id: str,
     horizon: int = 48,
+    history_len: int = 48,
     patch_dim: int = 4,
     patch_stride: int = 4,
     patch_dropout: float = 0.0,
@@ -699,6 +843,8 @@ def build_delta_model(
     use_horizon_weight: bool = True,
     horizon_weight_end: float = 0.5,
     delta_head_init_std: float = 0.01,
+    delta_mag_init_bias: float = -2.0,
+    delta_text_gate_init_bias: float = -2.0,
     delta_clip: float = 3.0,
     delta_news_tail_tokens: int = 160,
     delta_structured_feature_dim: int = 0,
@@ -717,8 +863,11 @@ def build_delta_model(
     delta_temporal_text_dim: int = 8,
     delta_temporal_text_fuse_lambda: float = 0.5,
     delta_temporal_text_freeze_encoder: int = 1,
+    delta_temporal_text_unfreeze_last_n: int = 0,
+    delta_text_fuse_mode: str = "gated_add",
     delta_multimodal_arch: str = "summary_gated",
     delta_multimodal_fuse_lambda: float = 1.0,
+    residual_arch: str = "current",
 ):
     del (
         head_mlp,
@@ -735,12 +884,15 @@ def build_delta_model(
 
     model = TinyNewsTSRegressor(
         horizon=int(horizon),
+        history_len=int(max(1, history_len)),
         patch_dim=int(patch_dim),
         patch_stride=int(max(1, patch_stride)),
         hidden_size=int(hidden_size),
         patch_dropout=float(patch_dropout),
         head_dropout=float(head_dropout),
         delta_head_init_std=float(delta_head_init_std),
+        delta_mag_init_bias=float(delta_mag_init_bias),
+        delta_text_gate_init_bias=float(delta_text_gate_init_bias),
         delta_clip=float(delta_clip),
         structured_feat_dim=int(delta_structured_feature_dim),
         huber_beta=float(huber_beta),
@@ -759,10 +911,14 @@ def build_delta_model(
         temporal_text_dim=int(max(1, delta_temporal_text_dim)),
         temporal_text_fuse_lambda=float(max(0.0, delta_temporal_text_fuse_lambda)),
         temporal_text_freeze_encoder=bool(int(delta_temporal_text_freeze_encoder)),
+        temporal_text_unfreeze_last_n=int(max(0, delta_temporal_text_unfreeze_last_n)),
+        text_fuse_mode=str(delta_text_fuse_mode or "gated_add"),
         multimodal_arch=str(delta_multimodal_arch or "summary_gated"),
         multimodal_fuse_lambda=float(max(0.0, delta_multimodal_fuse_lambda)),
+        residual_arch=str(residual_arch or "current"),
     )
     model.delta_tokenizer_id = str(tok_id)
+    model.history_len = int(max(1, history_len))
     model.patch_stride = int(max(1, patch_stride))
     model.delta_alpha_scale = float(delta_alpha_scale)
     model.delta_patch_prototypes = int(max(0, delta_patch_prototypes))
@@ -772,19 +928,21 @@ def build_delta_model(
     if delta_residual_mode_norm not in {"additive", "relative"}:
         delta_residual_mode_norm = "additive"
     model.delta_residual_mode = delta_residual_mode_norm
-    delta_sign_mode_norm = str(delta_sign_mode or "signnet_binary").lower().strip()
-    if delta_sign_mode_norm not in {"signnet_binary", "internal"}:
-        delta_sign_mode_norm = "signnet_binary"
-    model.delta_sign_mode = delta_sign_mode_norm
+    model.delta_sign_mode = _normalize_delta_sign_mode(delta_sign_mode)
     model.delta_mag_max = float(max(0.0, delta_mag_max))
     model.doc_candidate_mode = str(doc_candidate_mode or "beta_only")
     model.temporal_text_enable = bool(int(delta_temporal_text_enable))
     model.temporal_text_dim = int(max(1, delta_temporal_text_dim))
     model.temporal_text_fuse_lambda = float(max(0.0, delta_temporal_text_fuse_lambda))
     model.temporal_text_freeze_encoder = bool(int(delta_temporal_text_freeze_encoder))
+    model.temporal_text_unfreeze_last_n = int(max(0, delta_temporal_text_unfreeze_last_n))
     model.temporal_text_model_id = temporal_text_model_id
+    model.text_fuse_mode = _normalize_text_fuse_mode(delta_text_fuse_mode)
     model.multimodal_arch = str(delta_multimodal_arch or "summary_gated")
     model.multimodal_fuse_lambda = float(max(0.0, delta_multimodal_fuse_lambda))
+    model.residual_arch = _normalize_residual_arch(residual_arch)
+    model.delta_mag_init_bias = float(delta_mag_init_bias)
+    model.delta_text_gate_init_bias = float(delta_text_gate_init_bias)
     return tok, temporal_text_tok, model
 
 
@@ -812,6 +970,7 @@ def save_checkpoint(
             "model_variant": "tiny_news_ts",
             "model_state": model.state_dict(),
             "horizon": int(model.horizon),
+            "history_len": int(getattr(model, "history_len", model.patch_dim)),
             "patch_dim": int(model.patch_dim),
             "patch_stride": int(getattr(model, "patch_stride", model.patch_dim)),
             "hidden_size": int(model.hidden_size),
@@ -828,14 +987,19 @@ def save_checkpoint(
             "delta_residual_mode": str(getattr(model, "delta_residual_mode", "additive")),
             "delta_sign_mode": str(getattr(model, "delta_sign_mode", "signnet_binary")),
             "delta_mag_max": float(getattr(model, "delta_mag_max", 0.0)),
+            "delta_mag_init_bias": float(getattr(model, "delta_mag_init_bias", -2.0)),
+            "delta_text_gate_init_bias": float(getattr(model, "delta_text_gate_init_bias", -2.0)),
             "doc_candidate_mode": str(getattr(model, "doc_candidate_mode", "beta_only")),
             "temporal_text_enable": int(bool(getattr(model, "temporal_text_enable", False))),
             "temporal_text_dim": int(getattr(model, "temporal_text_dim", 8)),
             "temporal_text_fuse_lambda": float(getattr(model, "temporal_text_fuse_lambda", 0.5)),
             "temporal_text_freeze_encoder": int(bool(getattr(model, "temporal_text_freeze_encoder", True))),
+            "temporal_text_unfreeze_last_n": int(getattr(model, "temporal_text_unfreeze_last_n", 0)),
             "temporal_text_model_id": str(getattr(model, "temporal_text_model_id", "")),
+            "text_fuse_mode": str(getattr(model, "text_fuse_mode", "gated_add")),
             "multimodal_arch": str(getattr(model, "multimodal_arch", "summary_gated")),
             "multimodal_fuse_lambda": float(getattr(model, "multimodal_fuse_lambda", 1.0)),
+            "residual_arch": str(getattr(model, "residual_arch", "current")),
         },
         reg_path,
     )
@@ -846,6 +1010,7 @@ def save_checkpoint(
         "tokenizer_id": tokenizer_id or base_model_id,
         "train_cfg": train_cfg,
         "horizon": int(model.horizon),
+        "history_len": int(getattr(model, "history_len", model.patch_dim)),
         "patch_dim": int(model.patch_dim),
         "patch_stride": int(getattr(model, "patch_stride", model.patch_dim)),
         "hidden_size": int(model.hidden_size),
@@ -862,14 +1027,19 @@ def save_checkpoint(
         "delta_residual_mode": str(getattr(model, "delta_residual_mode", "additive")),
         "delta_sign_mode": str(getattr(model, "delta_sign_mode", "signnet_binary")),
         "delta_mag_max": float(getattr(model, "delta_mag_max", 0.0)),
+        "delta_mag_init_bias": float(getattr(model, "delta_mag_init_bias", -2.0)),
+        "delta_text_gate_init_bias": float(getattr(model, "delta_text_gate_init_bias", -2.0)),
         "doc_candidate_mode": str(getattr(model, "doc_candidate_mode", "beta_only")),
         "temporal_text_enable": int(bool(getattr(model, "temporal_text_enable", False))),
         "temporal_text_dim": int(getattr(model, "temporal_text_dim", 8)),
         "temporal_text_fuse_lambda": float(getattr(model, "temporal_text_fuse_lambda", 0.5)),
         "temporal_text_freeze_encoder": int(bool(getattr(model, "temporal_text_freeze_encoder", True))),
+        "temporal_text_unfreeze_last_n": int(getattr(model, "temporal_text_unfreeze_last_n", 0)),
         "temporal_text_model_id": str(getattr(model, "temporal_text_model_id", "")),
+        "text_fuse_mode": str(getattr(model, "text_fuse_mode", "gated_add")),
         "multimodal_arch": str(getattr(model, "multimodal_arch", "summary_gated")),
         "multimodal_fuse_lambda": float(getattr(model, "multimodal_fuse_lambda", 1.0)),
+        "residual_arch": str(getattr(model, "residual_arch", "current")),
     }
     if isinstance(extra_meta, dict):
         for k, v in extra_meta.items():
@@ -925,11 +1095,14 @@ def load_checkpoint(
 
     model = TinyNewsTSRegressor(
         horizon=int(meta.get("horizon", 48)),
+        history_len=int(meta.get("history_len", meta.get("patch_dim", 4))),
         patch_dim=int(meta.get("patch_dim", 4)),
         patch_stride=int(meta.get("patch_stride", meta.get("patch_dim", 4))),
         hidden_size=int(meta.get("hidden_size", 256)),
         patch_dropout=float(pd),
         head_dropout=float(hd),
+        delta_mag_init_bias=float(meta.get("delta_mag_init_bias", -2.0)),
+        delta_text_gate_init_bias=float(meta.get("delta_text_gate_init_bias", -2.0)),
         delta_clip=float(meta.get("delta_clip", 3.0)),
         structured_feat_dim=int(meta.get("structured_feat_dim", 0)),
         huber_beta=float(meta.get("huber_beta", 0.5)),
@@ -948,12 +1121,16 @@ def load_checkpoint(
         temporal_text_dim=int(meta.get("temporal_text_dim", 8)),
         temporal_text_fuse_lambda=float(meta.get("temporal_text_fuse_lambda", 0.5)),
         temporal_text_freeze_encoder=bool(int(meta.get("temporal_text_freeze_encoder", 1))),
+        temporal_text_unfreeze_last_n=int(meta.get("temporal_text_unfreeze_last_n", 0)),
+        text_fuse_mode=str(meta.get("text_fuse_mode", "gated_add")),
         multimodal_arch=str(meta.get("multimodal_arch", "summary_gated")),
         multimodal_fuse_lambda=float(meta.get("multimodal_fuse_lambda", 1.0)),
+        residual_arch=str(meta.get("residual_arch", "current")),
     )
     model.delta_tokenizer_id = str(
         meta.get("delta_tokenizer_id", meta.get("tiny_text_tokenizer_id", ""))
     )
+    model.history_len = int(meta.get("history_len", meta.get("patch_dim", 4)))
     model.patch_stride = int(meta.get("patch_stride", meta.get("patch_dim", 4)))
     model.delta_alpha_scale = float(meta.get("delta_alpha_scale", 0.75))
     model.delta_patch_prototypes = int(max(0, meta.get("delta_patch_prototypes", 0) or 0))
@@ -963,19 +1140,21 @@ def load_checkpoint(
     if delta_residual_mode not in {"additive", "relative"}:
         delta_residual_mode = "additive"
     model.delta_residual_mode = delta_residual_mode
-    delta_sign_mode = str(meta.get("delta_sign_mode", "signnet_binary")).lower().strip()
-    if delta_sign_mode not in {"signnet_binary", "internal"}:
-        delta_sign_mode = "signnet_binary"
-    model.delta_sign_mode = delta_sign_mode
+    model.delta_sign_mode = _normalize_delta_sign_mode(meta.get("delta_sign_mode", "signnet_binary"))
     model.delta_mag_max = float(max(0.0, meta.get("delta_mag_max", 0.0) or 0.0))
+    model.delta_mag_init_bias = float(meta.get("delta_mag_init_bias", -2.0))
+    model.delta_text_gate_init_bias = float(meta.get("delta_text_gate_init_bias", -2.0))
     model.doc_candidate_mode = str(meta.get("doc_candidate_mode", "beta_only"))
     model.temporal_text_enable = bool(int(meta.get("temporal_text_enable", 0)))
     model.temporal_text_dim = int(meta.get("temporal_text_dim", 8))
     model.temporal_text_fuse_lambda = float(meta.get("temporal_text_fuse_lambda", 0.5))
     model.temporal_text_freeze_encoder = bool(int(meta.get("temporal_text_freeze_encoder", 1)))
+    model.temporal_text_unfreeze_last_n = int(meta.get("temporal_text_unfreeze_last_n", 0))
     model.temporal_text_model_id = str(meta.get("temporal_text_model_id", meta.get("delta_tokenizer_id", "")))
+    model.text_fuse_mode = _normalize_text_fuse_mode(meta.get("text_fuse_mode", "gated_add"))
     model.multimodal_arch = str(meta.get("multimodal_arch", "summary_gated"))
     model.multimodal_fuse_lambda = float(meta.get("multimodal_fuse_lambda", 1.0))
+    model.residual_arch = _normalize_residual_arch(meta.get("residual_arch", "current"))
 
     reg = torch.load(os.path.join(ckpt_dir, "regressor.pt"), map_location="cpu")
     state = reg.get("model_state", reg)

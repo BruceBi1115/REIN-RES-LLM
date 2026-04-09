@@ -79,21 +79,47 @@ def build_experiment_task_name(args) -> str:
     )
     delta_residual_mode = str(getattr(args, "delta_residual_mode", "additive") or "additive").strip()
     delta_sign_mode = str(getattr(args, "delta_sign_mode", "signnet_binary") or "signnet_binary").strip()
-    return (
+    residual_arch = str(getattr(args, "residual_arch", "current") or "current").strip()
+    task = (
         f"{base_task_name}_{args.stage}_s{args.stride}_h{args.horizon}_news_{args.news_path}"
         f"_{temporal_text_tag}"
+        f"_RESIDUAL_ARCH_{residual_arch}"
         f"_DELTA_RESIDUAL_MODE_{delta_residual_mode}"
-        f"_DELTA_SIGN_MODE_{delta_sign_mode}"
     )
+    if residual_arch == "current":
+        task += f"_DELTA_SIGN_MODE_{delta_sign_mode}"
+    return task
 
 
-def record_test_results_csv(args, live_logger, mse, mae):
+def record_test_results_csv(args, live_logger, mse, mae, base_mse=None, base_mae=None):
     try:
         p = f"./results"
         os.makedirs(p, exist_ok=True)
         csv_path = os.path.join(p, f"test_results.csv")
         task = build_experiment_task_name(args)
-        new_row = pd.DataFrame([{"Task": task, "MSE": float(mse), "MAE": float(mae)}])
+        residual_diag = getattr(args, "_last_residual_eval_diag", {}) or {}
+        signnet_metrics = getattr(args, "_last_signnet_metrics", {}) or {}
+        final_mse = float(mse)
+        final_mae = float(mae)
+        base_mse_v = float(base_mse) if base_mse is not None else float(residual_diag.get("base_mse", np.nan))
+        base_mae_v = float(base_mae) if base_mae is not None else float(residual_diag.get("base_mae", np.nan))
+        row = {
+            "Task": task,
+            "MSE": final_mse,
+            "MAE": final_mae,
+            "Base_MSE": base_mse_v,
+            "Base_MAE": base_mae_v,
+            "Skill_Score_MSE": float(residual_diag.get("skill_score_mse", np.nan)),
+            "Skill_Score_MAE": float(residual_diag.get("skill_score_mae", np.nan)),
+            "Delta_Helped_Rate": float(residual_diag.get("delta_helped_rate", np.nan)),
+            "NoNews_MAE": float(((residual_diag.get("news_slices", {}) or {}).get("no_news", {}) or {}).get("final_mae", np.nan)),
+            "SparseNews_MAE": float(((residual_diag.get("news_slices", {}) or {}).get("sparse_news", {}) or {}).get("final_mae", np.nan)),
+            "DenseNews_MAE": float(((residual_diag.get("news_slices", {}) or {}).get("dense_news", {}) or {}).get("final_mae", np.nan)),
+            "SignNet_Acc": float(signnet_metrics.get("test_acc", np.nan)),
+            "SignNet_BalancedAcc": float(signnet_metrics.get("test_bacc", np.nan)),
+        }
+        new_row = pd.DataFrame([row])
+        ordered_cols = list(row.keys())
         if os.path.exists(csv_path):
             df = pd.read_csv(csv_path)
             rename_map = {}
@@ -108,7 +134,10 @@ def record_test_results_csv(args, live_logger, mse, mae):
             if rename_map:
                 df = df.rename(columns=rename_map)
             if set(["Task", "MSE", "MAE"]).issubset(df.columns):
-                df = df[["Task", "MSE", "MAE"]]
+                for col in ordered_cols:
+                    if col not in df.columns:
+                        df[col] = np.nan
+                df = df[ordered_cols]
                 # Keep only the latest row for each experiment signature.
                 df = df[df["Task"] != task]
                 out_df = pd.concat([df, new_row], ignore_index=True)
@@ -116,6 +145,7 @@ def record_test_results_csv(args, live_logger, mse, mae):
                 out_df = new_row
         else:
             out_df = new_row
+        out_df = out_df[ordered_cols]
         out_df.to_csv(csv_path, index=False)
         live_logger.info(f"[RESULT_TASK] {task}")
         live_logger.info(f"Saved test results to {csv_path} (upsert by Task)")

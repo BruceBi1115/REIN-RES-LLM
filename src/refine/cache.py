@@ -13,6 +13,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from ..delta_news_hooks import discover_news_api_key, extract_structured_events, merge_structured_events, refine_news_text
+from ..news_datetime import normalize_news_datetime
 from ..refine_cache_utils import (
     build_refine_context,
     make_refine_doc_cache_key,
@@ -52,7 +53,7 @@ def _truncate_with_tokenizer(text: str, tokenizer, max_tokens: int) -> str:
             max_length=n,
             return_attention_mask=False,
         )
-        ids = enc.get("input_ids", []) if isinstance(enc, dict) else []
+        ids = enc.get("input_ids", []) if hasattr(enc, "get") else []
         if len(ids) == 0:
             return s[: n * 4]
         return tokenizer.decode(ids, skip_special_tokens=True).strip()
@@ -246,28 +247,10 @@ def _normalize_news_identity_title(text: str) -> str:
 
 
 def _normalize_news_identity_time(value, *, dayfirst: bool) -> str:
-    if isinstance(value, pd.Timestamp):
-        ts = value
-    else:
-        clean = str(value or "").strip()
-        if not clean:
-            return ""
-        iso_match = re.fullmatch(
-            r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?",
-            clean,
-        )
-        date_match = re.fullmatch(r"\d{4}-\d{2}-\d{2}", clean)
-        if iso_match:
-            fmt = "%Y-%m-%dT%H:%M:%S" if "T" in clean else "%Y-%m-%d %H:%M:%S"
-            if "." in clean:
-                fmt += ".%f"
-            if clean.endswith("Z") or re.search(r"[+-]\d{2}:\d{2}$", clean):
-                fmt += "%z"
-            ts = pd.to_datetime(clean, errors="coerce", format=fmt)
-        elif date_match:
-            ts = pd.to_datetime(clean, errors="coerce", format="%Y-%m-%d")
-        else:
-            ts = pd.to_datetime(clean, errors="coerce", dayfirst=bool(dayfirst))
+    norm = normalize_news_datetime(value, dayfirst=dayfirst, floor="s")
+    if norm:
+        return norm
+    ts = pd.to_datetime(value, errors="coerce", dayfirst=bool(dayfirst))
     if pd.isna(ts):
         return ""
     if isinstance(ts, pd.Timestamp):

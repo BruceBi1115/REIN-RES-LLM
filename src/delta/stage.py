@@ -37,24 +37,85 @@ from ..model2 import build_delta_model, load_checkpoint, save_checkpoint
 from ..refine.cache import _init_refine_cache, _init_structured_cache, _prewarm_refine_cache, _save_refine_cache, _save_structured_cache
 from ..signnet.training import _compose_delta_with_external_sign, _run_external_signnet, _train_external_signnet
 from ..utils.batch_utils import _batch_time_seq_for_sample
+from ..utils.metrics import skill_score
 from ..utils.residual_utils import split_two_stage_epochs
 from ..utils.utils import draw_pred_true, record_test_results_csv
 from .core import (
+    _build_consistency_loss,
     _build_cleaned_residual_targets,
     _build_delta_optimizer,
     _build_delta_targets,
-    _build_news_usefulness_weights,
     _build_relative_state_targets,
+    _build_soft_sign_targets,
+    _build_windowed_sign_targets,
     _fuse_base_and_delta,
     _log_last_residual_eval_diag,
     _match_horizon_shape,
     _masked_binary_accuracy_from_logits,
     _masked_multiclass_accuracy_from_logits,
+    _resolve_residual_arch,
     _resolve_delta_residual_mode,
     _resolve_delta_sign_mode,
     _select_metric,
     _use_external_signnet,
 )
+
+
+def _direct_signed_delta_mode(args, delta_model=None) -> bool:
+    arch = _resolve_residual_arch(args)
+    if delta_model is not None:
+        arch = str(getattr(delta_model, "residual_arch", arch) or arch).lower().strip()
+    if arch in {"unified", "simple_concat", "base_only_delta"}:
+        return True
+    return _resolve_delta_sign_mode(args) == "none"
+
+
+def _build_direction_target_pack(delta_target: torch.Tensor, args) -> tuple[torch.Tensor, torch.Tensor]:
+    mode = str(getattr(args, "sign_label_mode", "hard") or "hard").lower().strip()
+    target = delta_target.to(torch.float32)
+    if mode == "soft":
+        loss_target = _build_soft_sign_targets(target, temperature=float(getattr(args, "sign_soft_temperature", 1.0)))
+    elif mode == "windowed":
+        loss_target = _build_windowed_sign_targets(target, window_size=int(getattr(args, "sign_window_size", 8)))
+    else:
+        loss_target = (target > 0).to(torch.float32)
+    eval_target = (target > 0).to(torch.float32)
+    return loss_target, eval_target
+
+
+def _maybe_log_batch_news_debug(live_logger, args, *, split: str, epoch_idx: int | None, batch_idx: int, sample_debug_records: list[dict] | None):
+    if live_logger is None:
+        return
+    if int(getattr(args, "batch_news_debug_enable", 0)) != 1:
+        return
+    records = list(sample_debug_records or [])
+    if len(records) == 0:
+        return
+    max_batches = int(getattr(args, "batch_news_debug_max_batches", -1))
+    if max_batches > 0 and batch_idx >= max_batches:
+        return
+
+    history_starts = [str(rec.get("history_start", "") or "") for rec in records if str(rec.get("history_start", "") or "").strip()]
+    history_ends = [str(rec.get("history_end", "") or "") for rec in records if str(rec.get("history_end", "") or "").strip()]
+    cand_counts = [int(rec.get("candidate_news_count", 0) or 0) for rec in records]
+    hist_news_counts = [int(rec.get("history_range_news_count", 0) or 0) for rec in records]
+    selected_news_counts = [int(rec.get("news_count", 0) or 0) for rec in records]
+    doc_total = sum(int(rec.get("temporal_text_doc_total", 0) or 0) for rec in records)
+    doc_attached = sum(int(rec.get("temporal_text_doc_attached_any_step", 0) or 0) for rec in records)
+    step_total = sum(int(rec.get("temporal_text_step_total", 0) or 0) for rec in records)
+    step_tokenized = sum(int(rec.get("temporal_text_step_tokenized_count", 0) or 0) for rec in records)
+    epoch_label = "na" if epoch_idx is None else str(int(epoch_idx) + 1)
+
+    live_logger.info(
+        "[DELTA][BATCH_DEBUG] "
+        f"split={split} epoch={epoch_label} batch={batch_idx + 1} "
+        f"history_span=[{history_starts[0] if history_starts else ''} -> {history_ends[-1] if history_ends else ''}] "
+        f"candidate_news_sum={sum(cand_counts)} "
+        f"history_range_news_sum={sum(hist_news_counts)} "
+        f"selected_news_sum={sum(selected_news_counts)} "
+        f"temporal_docs_attached={doc_attached}/{doc_total} "
+        f"temporal_steps_tokenized={step_tokenized}/{step_total}"
+    )
 
 def evaluate_metrics_residual(
     base_model,
@@ -111,6 +172,16 @@ def evaluate_metrics_residual(
     mag_pred_sum = 0.0
     mag_true_sum = 0.0
     delta_abs_sum = 0.0
+    sample_final_abs = []
+    sample_base_abs = []
+    sample_news_count = []
+    sample_news_max_utility = []
+    sample_base_residual_abs = []
+    sample_delta_helped = []
+    sample_direction_correct = []
+    sample_confidence = []
+    sample_route_idx = []
+    sample_route_names = tuple(getattr(delta_model, "regime_route_names", ("none", "trend", "event", "reversal", "sparse")))
 
     if testing:
         ckpt_dir = os.path.join("./checkpoints", args.taskName)
@@ -124,7 +195,7 @@ def evaluate_metrics_residual(
     ).strip() or ("test" if testing else "val")
     sample_idx = 0
     try:
-        for _, batch in enumerate(eval_loader):
+        for bidx, batch in enumerate(eval_loader):
             history_z, _, _ = _z_batch_tensors(batch, args, global_zstats=stats)
             history_z = history_z.to(device)
             base_pred = base_model(history_z).to(torch.float32)  # (B,H)
@@ -151,19 +222,33 @@ def evaluate_metrics_residual(
             ts_p = delta_inputs["ts_patches"]
             ts_pm = delta_inputs["ts_patch_mask"]
             targets_z = delta_inputs["targets_z"]
-            rel_labels_d = delta_inputs["rel_labels"]
             news_counts_d = delta_inputs["news_counts"]
+            news_max_utility_d = delta_inputs.get("news_max_utility")
             structured_events_d = delta_inputs["structured_events"]
             structured_doc_events_d = delta_inputs["structured_doc_events"]
             structured_feats_d = delta_inputs["structured_feats"]
             temporal_text_ids_d = delta_inputs.get("temporal_text_ids")
             temporal_text_attn_d = delta_inputs.get("temporal_text_attn")
             temporal_text_step_mask_d = delta_inputs.get("temporal_text_step_mask")
+            sample_debug_records = list(delta_inputs.get("sample_debug_records") or [])
+            for i_debug, rec in enumerate(sample_debug_records):
+                if i_debug < len(news_counts_d):
+                    rec["news_count"] = int(float(news_counts_d[i_debug]))
+            _maybe_log_batch_news_debug(
+                live_logger=getattr(args, "_live_logger", None),
+                args=args,
+                split=debug_split,
+                epoch_idx=None,
+                batch_idx=bidx,
+                sample_debug_records=sample_debug_records,
+            )
 
             ts_p = ts_p.to(device)
             ts_pm = ts_pm.to(device)
             targets_z = targets_z.to(device)
             structured_feats_d = structured_feats_d.to(device=device, dtype=torch.float32)
+            if news_max_utility_d is not None:
+                news_max_utility_d = news_max_utility_d.to(device=device, dtype=torch.float32)
             if temporal_text_ids_d is not None:
                 temporal_text_ids_d = temporal_text_ids_d.to(device=device, dtype=torch.long)
             if temporal_text_attn_d is not None:
@@ -176,6 +261,8 @@ def evaluate_metrics_residual(
             out_delta = delta_model(
                 ts_patches=ts_p,
                 ts_patch_mask=ts_pm,
+                history_z=history_z,
+                base_pred_z=base_pred,
                 targets=None,
                 head_mode="delta",
                 rel_targets=None,
@@ -217,7 +304,8 @@ def evaluate_metrics_residual(
                     state_score = None
             else:
                 delta_corr = delta_corr_model
-                if relative_mode:
+                direct_signed_mode = _direct_signed_delta_mode(args, delta_model)
+                if relative_mode and not direct_signed_mode:
                     state_logits = out_delta.get(
                         "state_logits",
                         torch.zeros(delta_corr.size(0), delta_corr.size(1), 3, device=delta_corr.device, dtype=torch.float32),
@@ -226,8 +314,14 @@ def evaluate_metrics_residual(
                     sign_logits = None
                     sign_soft = None
                 else:
-                    sign_logits = out_delta.get("sign_logits", torch.zeros_like(delta_corr)).to(torch.float32)
-                    sign_soft = out_delta.get("sign_soft", torch.zeros_like(delta_corr)).to(torch.float32)
+                    sign_logits = out_delta.get(
+                        "sign_logits",
+                        out_delta.get("direction_logits", delta_corr),
+                    ).to(torch.float32)
+                    sign_soft = out_delta.get(
+                        "sign_soft",
+                        out_delta.get("direction_score", torch.tanh(sign_logits)),
+                    ).to(torch.float32)
                     state_logits = None
                     state_score = None
 
@@ -241,7 +335,13 @@ def evaluate_metrics_residual(
             delta_corr_f = delta_corr.to(torch.float32)
             magnitude_f = _match_horizon_shape(magnitude.to(torch.float32), delta_corr_f)
             magnitude_raw_f = _match_horizon_shape(magnitude_raw.to(torch.float32), delta_corr_f)
-            if relative_mode:
+            confidence_f = _match_horizon_shape(
+                out_delta.get("confidence", torch.ones_like(delta_corr_f)).to(torch.float32),
+                delta_corr_f,
+            )
+            route_top_idx_tensor = out_delta.get("route_top_idx")
+            direct_signed_mode = _direct_signed_delta_mode(args, delta_model)
+            if relative_mode and not direct_signed_mode:
                 state_logits_f = state_logits.to(torch.float32)
                 state_score_f = _match_horizon_shape(state_score.to(torch.float32), delta_corr_f)
                 sign_logits_f = None
@@ -272,7 +372,7 @@ def evaluate_metrics_residual(
                 structured_feats=structured_feats_d,
                 args=args,
             )
-            if relative_mode:
+            if relative_mode and not direct_signed_mode:
                 abs_residual_batch = raw_residual_batch.abs()
                 valid_sign_mask = torch.ones_like(abs_residual_batch, dtype=torch.float32)
                 state_targets = _build_relative_state_targets(
@@ -291,7 +391,7 @@ def evaluate_metrics_residual(
             delta_corr_cpu = delta_corr_f.detach().cpu().numpy()
             magnitude_cpu = magnitude_f.detach().cpu().numpy()
             magnitude_raw_cpu = magnitude_raw_f.detach().cpu().numpy()
-            if relative_mode:
+            if relative_mode and not direct_signed_mode:
                 state_logits_cpu = state_logits_f.detach().cpu().numpy()
                 state_score_cpu = state_score_f.detach().cpu().numpy()
                 sign_logits_cpu = None
@@ -304,7 +404,7 @@ def evaluate_metrics_residual(
             loss_sum += float(loss.detach().cpu()) * bs
             base_loss_sum += float(base_loss.detach().cpu()) * bs
             n_samples += bs
-            if relative_mode:
+            if relative_mode and not direct_signed_mode:
                 sign_correct_sum += float(
                     (_masked_multiclass_accuracy_from_logits(state_logits_f, state_targets, valid_sign_mask) * valid_sign_mask.sum())
                     .detach()
@@ -339,6 +439,43 @@ def evaluate_metrics_residual(
                 base_se_sum += float(((base_only - true) ** 2).sum())
                 base_ae_sum += float(np.abs(base_only - true).sum())
                 n_elems += int(args.horizon)
+                final_abs_err = float(np.abs(pred - true).mean())
+                base_abs_err = float(np.abs(base_only - true).mean())
+                base_residual_abs = float(
+                    np.abs(np.asarray(targets_z_cpu[i], dtype=np.float32) - np.asarray(base_pred_cpu[i], dtype=np.float32)).mean()
+                )
+                if relative_mode and not direct_signed_mode:
+                    direction_correct = float(
+                        (_match_horizon_shape(state_score_f[i : i + 1], delta_corr_f[i : i + 1]) > 0).to(torch.float32)
+                        .eq((raw_residual_batch[i : i + 1] > 0).to(torch.float32))
+                        .to(torch.float32)
+                        .mean()
+                        .detach()
+                        .cpu()
+                    )
+                else:
+                    direction_correct = float(
+                        ((sign_soft_f[i] > 0).to(torch.float32) == sign_target_bin[i].to(torch.float32))
+                        .to(torch.float32)
+                        .mean()
+                        .detach()
+                        .cpu()
+                    )
+                confidence_value = float(confidence_f[i].mean().detach().cpu())
+                route_idx_val = -1
+                if route_top_idx_tensor is not None and i < int(route_top_idx_tensor.size(0)):
+                    route_idx_val = int(route_top_idx_tensor[i].detach().cpu().item())
+                news_count_i = int(float(news_counts_d[i])) if i < len(news_counts_d) else 0
+                news_max_utility_i = float(news_max_utility_d[i].detach().cpu()) if news_max_utility_d is not None and i < len(news_max_utility_d) else 0.0
+                sample_final_abs.append(final_abs_err)
+                sample_base_abs.append(base_abs_err)
+                sample_news_count.append(news_count_i)
+                sample_news_max_utility.append(news_max_utility_i)
+                sample_base_residual_abs.append(base_residual_abs)
+                sample_delta_helped.append(float(final_abs_err < base_abs_err))
+                sample_direction_correct.append(direction_correct)
+                sample_confidence.append(confidence_value)
+                sample_route_idx.append(route_idx_val)
 
                 if true_pred_csv_path is not None:
                     with open(true_pred_csv_path, "a", newline="") as f:
@@ -348,6 +485,7 @@ def evaluate_metrics_residual(
                 if debug_writer is not None:
                     history_times_i = _batch_time_seq_for_sample(batch.get("history_times"), i)
                     target_times_i = _batch_time_seq_for_sample(batch.get("target_times"), i)
+                    sample_debug_i = sample_debug_records[i] if i < len(sample_debug_records) else {}
                     true_residual_z = (
                         np.asarray(targets_z_cpu[i], dtype=np.float32)
                         - np.asarray(base_pred_cpu[i], dtype=np.float32)
@@ -393,7 +531,31 @@ def evaluate_metrics_residual(
                             "state_score": "" if state_score_cpu is None else _json_csv_cell([float(x) for x in state_score_cpu[i].tolist()]),
                             "magnitude": _json_csv_cell([float(x) for x in magnitude_cpu[i].tolist()]),
                             "magnitude_raw": _json_csv_cell([float(x) for x in magnitude_raw_cpu[i].tolist()]),
-                            "news_count": int(float(news_counts_d[i])) if i < len(news_counts_d) else 0,
+                            "news_count": news_count_i,
+                            "candidate_news_count": int(sample_debug_i.get("candidate_news_count", 0) or 0),
+                            "history_range_news_count": int(sample_debug_i.get("history_range_news_count", 0) or 0),
+                            "selected_news_in_history_range_count": int(sample_debug_i.get("selected_news_in_history_range_count", 0) or 0),
+                            "news_max_utility": news_max_utility_i,
+                            "temporal_text_source": str(sample_debug_i.get("temporal_text_source", "disabled") or "disabled"),
+                            "temporal_text_doc_total": int(sample_debug_i.get("temporal_text_doc_total", 0) or 0),
+                            "temporal_text_doc_nonempty": int(sample_debug_i.get("temporal_text_doc_nonempty", 0) or 0),
+                            "temporal_text_doc_attached_any_step": int(sample_debug_i.get("temporal_text_doc_attached_any_step", 0) or 0),
+                            "temporal_text_doc_pre_history": int(sample_debug_i.get("temporal_text_doc_pre_history", 0) or 0),
+                            "temporal_text_doc_in_history_range": int(sample_debug_i.get("temporal_text_doc_in_history_range", 0) or 0),
+                            "temporal_text_doc_post_history_pre_target": int(sample_debug_i.get("temporal_text_doc_post_history_pre_target", 0) or 0),
+                            "temporal_text_step_nonempty_count": int(sample_debug_i.get("temporal_text_step_nonempty_count", 0) or 0),
+                            "temporal_text_step_tokenized_count": int(sample_debug_i.get("temporal_text_step_tokenized_count", 0) or 0),
+                            "temporal_text_step_total": int(sample_debug_i.get("temporal_text_step_total", 0) or 0),
+                            "temporal_text_all_nonempty_docs_attached": int(sample_debug_i.get("temporal_text_all_nonempty_docs_attached", 0) or 0),
+                            "base_residual_abs": base_residual_abs,
+                            "delta_helped": int(final_abs_err < base_abs_err),
+                            "direction_correct": direction_correct,
+                            "confidence_value": confidence_value,
+                            "regime_route": (
+                                sample_route_names[route_idx_val]
+                                if 0 <= route_idx_val < len(sample_route_names)
+                                else ""
+                            ),
                             "policy": str(policy_name),
                             "template_id": int(tpl_id),
                         }
@@ -417,7 +579,8 @@ def evaluate_metrics_residual(
                         "pred": [float(x) for x in pred_denorm],
                         "base_pred": [float(x) for x in base_denorm],
                         "true": [float(x) for x in true_vals],
-                        "news_count": int(float(news_counts_d[i])) if i < len(news_counts_d) else 0,
+                        "news_count": news_count_i,
+                        "news_max_utility": news_max_utility_i,
                         "structured_events": structured_merged,
                         "structured_events_per_doc": structured_docs,
                         "structured_doc_count": int(len(structured_docs)),
@@ -443,20 +606,87 @@ def evaluate_metrics_residual(
     base_loss_avg = base_loss_sum / max(1, n_samples)
     base_mse_avg = base_se_sum / max(1, n_elems) if n_elems > 0 else float("inf")
     base_mae_avg = base_ae_sum / max(1, n_elems) if n_elems > 0 else float("inf")
+    news_slice_summary = {}
+    event_slice_summary = {}
+    if len(sample_final_abs) > 0:
+        final_abs_arr = np.asarray(sample_final_abs, dtype=np.float32)
+        base_abs_arr = np.asarray(sample_base_abs, dtype=np.float32)
+        news_count_arr = np.asarray(sample_news_count, dtype=np.int64)
+        base_residual_arr = np.asarray(sample_base_residual_abs, dtype=np.float32)
+        direction_arr = np.asarray(sample_direction_correct, dtype=np.float32)
+        confidence_arr = np.asarray(sample_confidence, dtype=np.float32)
+        route_arr = np.asarray(sample_route_idx, dtype=np.int64)
+
+        news_slices = {
+            "no_news": news_count_arr == 0,
+            "sparse_news": (news_count_arr >= 1) & (news_count_arr <= 3),
+            "dense_news": news_count_arr >= 4,
+        }
+        for slice_name, mask in news_slices.items():
+            if bool(mask.any()):
+                news_slice_summary[slice_name] = {
+                    "n": int(mask.sum()),
+                    "final_mae": float(final_abs_arr[mask].mean()),
+                    "base_mae": float(base_abs_arr[mask].mean()),
+                }
+
+        threshold = float(np.median(base_residual_arr)) if base_residual_arr.size > 0 else 0.0
+        event_slices = {
+            "event_period": base_residual_arr > threshold,
+            "calm_period": base_residual_arr <= threshold,
+        }
+        for slice_name, mask in event_slices.items():
+            if bool(mask.any()):
+                event_slice_summary[slice_name] = {
+                    "n": int(mask.sum()),
+                    "final_mae": float(final_abs_arr[mask].mean()),
+                    "base_mae": float(base_abs_arr[mask].mean()),
+                }
+
+        route_summary = {}
+        valid_route_mask = route_arr >= 0
+        if bool(valid_route_mask.any()):
+            unique_routes = np.unique(route_arr[valid_route_mask])
+            for route_idx in unique_routes.tolist():
+                route_mask = route_arr == route_idx
+                route_name = sample_route_names[route_idx] if 0 <= route_idx < len(sample_route_names) else str(route_idx)
+                route_summary[route_name] = {
+                    "count": int(route_mask.sum()),
+                    "final_mae": float(final_abs_arr[route_mask].mean()),
+                }
+        else:
+            route_summary = {}
+    else:
+        direction_arr = np.asarray([], dtype=np.float32)
+        confidence_arr = np.asarray([], dtype=np.float32)
+        route_summary = {}
+
+    diag = {
+        ("state_acc" if relative_mode and not _direct_signed_delta_mode(args, delta_model) else "sign_acc"): sign_correct_sum / max(1.0, sign_valid_sum),
+        "pred_mag_mean": mag_pred_sum / max(1, n_elems),
+        "true_abs_residual_mean": mag_true_sum / max(1, n_elems),
+        "delta_abs_mean": delta_abs_sum / max(1, n_elems),
+        "base_mse": base_mse_avg,
+        "base_mae": base_mae_avg,
+        "skill_score_mse": skill_score(mse_avg, base_mse_avg),
+        "skill_score_mae": skill_score(mae_avg, base_mae_avg),
+        "delta_helped_rate": float(np.mean(sample_delta_helped)) if len(sample_delta_helped) > 0 else 0.0,
+        "direction_acc": float(direction_arr.mean()) if direction_arr.size > 0 else 0.0,
+        "mean_confidence": float(confidence_arr.mean()) if confidence_arr.size > 0 else 0.0,
+        "news_slices": news_slice_summary,
+        "event_slices": event_slice_summary,
+        "route_summary": route_summary,
+    }
     setattr(
         args,
         "_last_residual_eval_diag",
-        {
-            ("state_acc" if relative_mode else "sign_acc"): sign_correct_sum / max(1.0, sign_valid_sum),
-            "pred_mag_mean": mag_pred_sum / max(1, n_elems),
-            "true_abs_residual_mean": mag_true_sum / max(1, n_elems),
-            "delta_abs_mean": delta_abs_sum / max(1, n_elems),
-        },
+        diag,
     )
     return loss_avg, mse_avg, mae_avg, base_loss_avg, base_mse_avg, base_mae_avg
 
 def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     live_logger = bundle["live_logger"]
+    setattr(args, "_live_logger", live_logger)
     device = bundle["device"]
     train_loader = bundle["train_loader"]
     val_loader = bundle["val_loader"]
@@ -529,12 +759,15 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         base_model=args.base_model,
         tokenizer_id=args.tokenizer,
         horizon=args.horizon,
+        history_len=args.history_len,
         patch_dim=patch_len,
         patch_stride=int(getattr(args, "patch_stride", patch_len)),
         patch_dropout=args.patch_dropout,
         head_dropout=args.head_dropout,
         head_mlp=args.head_mlp,
         delta_head_init_std=float(getattr(args, "delta_head_init_std", 0.01)),
+        delta_mag_init_bias=float(getattr(args, "delta_mag_init_bias", -2.0)),
+        delta_text_gate_init_bias=float(getattr(args, "delta_text_gate_init_bias", -2.0)),
         delta_clip=float(getattr(args, "delta_clip", 3.0)),
         delta_news_tail_tokens=int(getattr(args, "delta_news_tail_tokens", 160)),
         delta_structured_feature_dim=(
@@ -558,14 +791,24 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         delta_temporal_text_dim=int(getattr(args, "delta_temporal_text_dim", 8)),
         delta_temporal_text_fuse_lambda=float(getattr(args, "delta_temporal_text_fuse_lambda", 0.5)),
         delta_temporal_text_freeze_encoder=int(getattr(args, "delta_temporal_text_freeze_encoder", 1)),
+        delta_temporal_text_unfreeze_last_n=int(getattr(args, "delta_temporal_text_unfreeze_last_n", 0)),
+        delta_text_fuse_mode=str(getattr(args, "delta_text_fuse_mode", "gated_add")),
         delta_multimodal_arch=str(getattr(args, "delta_multimodal_arch", "summary_gated")),
         delta_multimodal_fuse_lambda=float(getattr(args, "delta_multimodal_fuse_lambda", 1.0)),
+        residual_arch=str(getattr(args, "residual_arch", "current")),
     )
     delta_model.to(device)
     live_logger.info(
         f"[DELTA] model_variant={str(getattr(delta_model, 'model_variant', 'tiny_news_ts')).lower()} "
-        f"multimodal_arch={str(getattr(delta_model, 'multimodal_arch', 'summary_gated'))}"
+        f"multimodal_arch={str(getattr(delta_model, 'multimodal_arch', 'summary_gated'))} "
+        f"residual_arch={str(getattr(delta_model, 'residual_arch', 'current'))}"
     )
+    if _resolve_residual_arch(args) != "current":
+        live_logger.warning(
+            "[DELTA][CONFIG_NOTICE] "
+            f"residual_arch={_resolve_residual_arch(args)} ignores delta_sign_mode={_resolve_delta_sign_mode(args)} "
+            "in the forward path; changing delta_sign_mode only changes metadata/experiment naming here."
+        )
 
     # when to run validation set
     delta_val_mode = _normalize_delta_val_mode(getattr(args, "delta_val_mode", "each_epoch"))
@@ -604,6 +847,23 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         live_logger.info("[DELTA] feature modules frozen (legacy mode).")
     else:
         live_logger.info("[DELTA] feature modules remain trainable (recommended).")
+    if int(getattr(args, "delta_temporal_text_enable", 0)) == 1:
+        if str(getattr(args, "delta_multimodal_arch", "summary_gated") or "summary_gated").lower().strip() == "plan_c_mvp":
+            live_logger.warning(
+                "[DELTA][CONFIG_NOTICE] multimodal_arch=plan_c_mvp skips patch-level temporal-text fusion; "
+                "delta_text_fuse_mode and delta_temporal_text_fuse_lambda do not act on the patch branch in this setting."
+            )
+        if freeze_feature_modules:
+            live_logger.warning(
+                "[DELTA][CONFIG_NOTICE] delta_freeze_feature_modules=1 freezes temporal_text_tower / temporal_text_gate; "
+                "temporal-text source changes may have only limited downstream impact."
+            )
+        refine_mode = str(getattr(args, "news_refine_mode", "local") or "local").lower().strip()
+        if refine_mode != "api":
+            live_logger.info(
+                "[DELTA][CONFIG_NOTICE] news_refine_mode is not api; temporal_text_source=refined will use locally truncated raw text, "
+                "so differences vs raw may be small."
+            )
 
     # ensure delta-specific heads remain trainable
     train_modules = [
@@ -613,9 +873,13 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         "text_mag_head",
         "route_mag_head",
         "confidence_head",
+        "direct_residual_head",
+        "simple_delta_head",
+        "unified_trunk",
         "text_summary_ln",
         "route_summary_ln",
         "rel_head",
+        "text_cross_attn",
     ]
     for name in train_modules:
         if hasattr(delta_model, name):
@@ -626,16 +890,18 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     if hasattr(delta_model, "delta_log_scale"):
         delta_model.delta_log_scale.requires_grad = True
 
-    optim_delta, lr_info = _build_delta_optimizer(delta_model, args)
+    optim_delta, lr_info = _build_delta_optimizer(delta_model, args, steps_per_epoch=len(train_loader))
     live_logger.info(
         "[DELTA] optimizer groups: "
         f"base_lr={lr_info['base_lr']:.3e}, "
         f"head_lr={lr_info['head_lr']:.3e} (n={lr_info['n_head']}), "
-        f"other_lr={lr_info['other_lr']:.3e} (n={lr_info['n_other']})"
+        f"other_lr={lr_info['other_lr']:.3e} (n={lr_info['n_other']}), "
+        f"encoder_lr={lr_info['encoder_lr']:.3e} (n={lr_info['n_encoder']}), "
+        f"warmup_steps={lr_info['warmup_steps']}"
     )
 
     total_opt_steps_delta = math.ceil((len(train_loader) * max(1, delta_epochs)) / max(1, args.grad_accum))
-    warmup_steps_delta = int(getattr(args, "warmup_ratio", 0.1) * total_opt_steps_delta)
+    warmup_steps_delta = int(lr_info.get("warmup_steps", 0))
     warmup_steps_delta = min(warmup_steps_delta, max(0, total_opt_steps_delta - 1))
 
     if args.scheduler == 1:
@@ -664,6 +930,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         api_adapter=news_api_adapter,
     )
     # signnet
+    # TRAIN EXTERNAL SIGNNET?
     external_signnet_model = _train_external_signnet(
         args=args,
         base_backbone=base_backbone,
@@ -687,6 +954,18 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         api_adapter=news_api_adapter,
     )
     external_sign_enabled = external_signnet_model is not None
+    if not external_sign_enabled:
+        setattr(
+            args,
+            "_last_signnet_metrics",
+            {
+                "test_acc": float("nan"),
+                "test_bacc": float("nan"),
+                "test_valid": float("nan"),
+                "task_type": "disabled",
+                "residual_arch": _resolve_residual_arch(args),
+            },
+        )
     relative_mode = _resolve_delta_residual_mode(args) == "relative"
     if external_sign_enabled:
         live_logger.info(
@@ -730,19 +1009,26 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
     best_delta_alpha = 1.0
     early_stop_patience = max(0, int(getattr(args, "early_stop_patience", 0))) if delta_val_mode == "each_epoch" else 0
     best_delta_path = os.path.join(f"./checkpoints/{args.taskName}", f"best_delta_{args.taskName}")
+
+    # log residual branch configuration
     live_logger.info(
         "[DELTA] residual branch: "
+        f"arch={_resolve_residual_arch(args)} "
         f"mode={_resolve_delta_residual_mode(args)} "
         f"sign_mode={_resolve_delta_sign_mode(args)} "
         f"denom_floor={float(getattr(args, 'delta_relative_denom_floor', 1.0) if getattr(args, 'delta_relative_denom_floor', 1.0) is not None else 1.0):.6f} "
         f"ratio_clip={float(getattr(args, 'delta_relative_ratio_clip', 0.0) or 0.0):.6f}"
     )
+
+    # cleaned residual supervision configuration
     live_logger.info(
         "[DELTA] cleaned residual supervision: "
         f"enable={int(getattr(args, 'cleaned_residual_enable', 1))} "
         f"smooth_alpha={float(getattr(args, 'cleaned_residual_smooth_alpha', 0.6) or 0.0):.3f} "
         f"structured_mix={float(getattr(args, 'cleaned_residual_structured_mix', 0.35) or 0.0):.3f}"
     )
+
+    # log temporal text auxiliary input configuration
     live_logger.info(
         "[DELTA] temporal text auxiliary input: "
         f"enable={int(getattr(args, 'delta_temporal_text_enable', 0))} "
@@ -754,7 +1040,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         f"freeze_encoder={int(getattr(args, 'delta_temporal_text_freeze_encoder', 1))}"
     )
 
-    def _save_residual_best(epoch_idx: int, metric_now: float | None, tpl_id_now: int, policy_name_now: str):
+    def _save_residual_best(epoch_idx: int, metric_now: float | None):
         metric_value = None if metric_now is None else float(metric_now)
         shutil.rmtree(best_delta_path, ignore_errors=True)
 
@@ -780,9 +1066,12 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 ),
                 "delta_relative_ratio_clip": float(getattr(args, "delta_relative_ratio_clip", 0.0) or 0.0),
                 "delta_sign_mode": _resolve_delta_sign_mode(args),
+                "residual_arch": _resolve_residual_arch(args),
                 "delta_sign_external_enable": int(external_sign_enabled),
                 "delta_sign_external_tau": float(getattr(args, "delta_sign_external_tau", 1.0)),
                 "delta_temporal_text_source": str(getattr(args, "delta_temporal_text_source", "refined") or "refined"),
+                "delta_temporal_text_unfreeze_last_n": int(getattr(args, "delta_temporal_text_unfreeze_last_n", 0)),
+                "delta_text_fuse_mode": str(getattr(args, "delta_text_fuse_mode", "gated_add")),
                 "delta_multimodal_arch": str(getattr(args, "delta_multimodal_arch", "summary_gated") or "summary_gated"),
                 "delta_multimodal_fuse_lambda": float(max(0.0, getattr(args, "delta_multimodal_fuse_lambda", 1.0))),
             },
@@ -864,7 +1153,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 history_z = history_z.to(device)
                 base_pred = base_backbone(history_z).to(torch.float32)
 
-            # build delta inputs (with news)
+            # ======= build delta inputs (with news) ======
             delta_inputs = build_delta_batch_inputs(
                 batch=batch,
                 tokenizer=tokenizer,
@@ -891,6 +1180,18 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             temporal_text_ids_d = delta_inputs.get("temporal_text_ids")
             temporal_text_attn_d = delta_inputs.get("temporal_text_attn")
             temporal_text_step_mask_d = delta_inputs.get("temporal_text_step_mask")
+            sample_debug_records = list(delta_inputs.get("sample_debug_records") or [])
+            for i_debug, rec in enumerate(sample_debug_records):
+                if i_debug < len(news_counts_d):
+                    rec["news_count"] = int(float(news_counts_d[i_debug].detach().cpu()))
+            _maybe_log_batch_news_debug(
+                live_logger=live_logger,
+                args=args,
+                split="train",
+                epoch_idx=epoch,
+                batch_idx=bidx,
+                sample_debug_records=sample_debug_records,
+            )
 
             ts_p = ts_p.to(device)
             ts_pm = ts_pm.to(device)
@@ -905,7 +1206,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 temporal_text_step_mask_d = temporal_text_step_mask_d.to(device=device, dtype=torch.long)
             has_news = (news_counts_d > 0).to(dtype=torch.float32)
             signnet_history_z = history_z.to(torch.float32) if external_sign_enabled else None
-
+            # ======= ============== =======
             delta_model.train()
 
             raw_delta_targets = _build_delta_targets(
@@ -933,6 +1234,8 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             out_delta = delta_model(
                 ts_patches=ts_p,
                 ts_patch_mask=ts_pm,
+                history_z=history_z,
+                base_pred_z=base_pred,
                 targets=None,
                 head_mode="delta",
                 rel_targets=None,
@@ -944,7 +1247,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             )
             delta_pred_model_real = out_delta["pred"].to(torch.float32)
             magnitude_real = out_delta.get("magnitude", delta_pred_model_real.abs()).to(torch.float32)
-            magnitude_raw_real = out_delta.get("magnitude_raw", magnitude_real).to(torch.float32)
             if external_sign_enabled:
                 with torch.no_grad():
                     ctrl_logits_real, ctrl_score_real = _run_external_signnet(
@@ -965,41 +1267,37 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 )
                 if relative_mode:
                     state_logits_real = ctrl_logits_real.to(torch.float32)
-                    state_score_real = ctrl_score_real.to(torch.float32)
                     sign_logits_real = None
                     sign_soft_real = None
                 else:
                     sign_logits_real = ctrl_logits_real.to(torch.float32)
                     sign_soft_real = ctrl_score_real.to(torch.float32)
                     state_logits_real = None
-                    state_score_real = None
             else:
                 delta_pred_real = delta_pred_model_real
-                if relative_mode:
+                direct_signed_mode = _direct_signed_delta_mode(args, delta_model)
+                if relative_mode and not direct_signed_mode:
                     state_logits_real = out_delta.get(
                         "state_logits",
                         torch.zeros(delta_pred_model_real.size(0), delta_pred_model_real.size(1), 3, device=delta_pred_model_real.device, dtype=torch.float32),
                     ).to(torch.float32)
-                    state_score_real = out_delta.get("state_score", torch.zeros_like(delta_pred_model_real)).to(torch.float32)
                     sign_logits_real = None
                     sign_soft_real = None
                 else:
-                    sign_logits_real = out_delta.get("sign_logits", torch.zeros_like(delta_pred_model_real)).to(torch.float32)
-                    sign_soft_real = out_delta.get("sign_soft", torch.zeros_like(delta_pred_model_real)).to(torch.float32)
+                    sign_logits_real = out_delta.get(
+                        "sign_logits",
+                        out_delta.get("direction_logits", delta_pred_model_real),
+                    ).to(torch.float32)
+                    sign_soft_real = out_delta.get(
+                        "sign_soft",
+                        out_delta.get("direction_score", torch.tanh(sign_logits_real)),
+                    ).to(torch.float32)
                     state_logits_real = None
-                    state_score_real = None
             news_available_mask = out_delta.get(
                 "news_available_mask",
                 has_news.unsqueeze(1),
             ).to(torch.float32)
             usable_news = news_available_mask.reshape(news_available_mask.size(0), -1).max(dim=1).values.clamp(0.0, 1.0)
-            news_usefulness_weighting = int(getattr(args, "news_usefulness_weighting", 1)) == 1
-            sample_weight = _build_news_usefulness_weights(
-                has_news=usable_news,
-                news_counts=news_counts_d,
-                structured_feats=structured_feats_d,
-                enabled=news_usefulness_weighting,
-            )
 
             pred_real_z = _fuse_base_and_delta(
                 base_pred_z=base_pred,
@@ -1011,16 +1309,48 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             targets_z_typed = targets_z.to(torch.float32)
             true_residual_z = delta_targets.to(torch.float32)
             abs_residual_target = true_residual_z.abs()
-            valid_sign_mask = torch.ones_like(abs_residual_target, dtype=torch.float32) if relative_mode else (
-                abs_residual_target > float(getattr(args, "delta_sign_eps", 0.03))
-            ).to(torch.float32)
-            sign_target_bin = None if relative_mode else (true_residual_z > 0).to(torch.float32)
+            direct_signed_mode = _direct_signed_delta_mode(args, delta_model)
+            if relative_mode and not direct_signed_mode:
+                valid_sign_mask = torch.ones_like(abs_residual_target, dtype=torch.float32)
+                sign_target_loss = None
+                sign_target_bin = None
+            else:
+                sign_target_loss, sign_target_bin = _build_direction_target_pack(true_residual_z, args)
+                sign_mode = str(getattr(args, "sign_label_mode", "hard") or "hard").lower().strip()
+                if sign_mode == "windowed":
+                    valid_sign_mask = torch.ones_like(abs_residual_target, dtype=torch.float32)
+                else:
+                    valid_sign_mask = (abs_residual_target > float(getattr(args, "delta_sign_eps", 0.03))).to(torch.float32)
 
             residual_mode = str(getattr(args, "residual_loss", "mae")).lower()
             loss_final = _point_loss(pred_real_z, targets_z_typed, mode=residual_mode)
-            err_real = torch.abs(pred_real_z - targets_z_typed).mean(dim=1)
             loss_total = loss_final
-            if relative_mode:
+            if direct_signed_mode:
+                loss_signed = _point_loss(delta_pred_real, true_residual_z, mode=residual_mode)
+                loss_total = loss_total + loss_signed
+                loss_relative_mag = None
+                state_ce = None
+                direction_ce = None
+                confidence_consistency = None
+                if _resolve_residual_arch(args) == "unified":
+                    loss_relative_mag = _point_loss(magnitude_real, abs_residual_target, mode=residual_mode)
+                    direction_logits_real = out_delta.get("direction_logits", sign_logits_real).to(torch.float32)
+                    direction_score_real = out_delta.get("direction_score", sign_soft_real).to(torch.float32)
+                    confidence_real = out_delta.get("confidence", torch.ones_like(delta_pred_real)).to(torch.float32)
+                    direction_ce = F.binary_cross_entropy_with_logits(direction_logits_real, sign_target_loss)
+                    confidence_consistency = _build_consistency_loss(
+                        direction_score=direction_score_real,
+                        magnitude=magnitude_real,
+                        confidence=confidence_real,
+                        delta_target=true_residual_z,
+                    )
+                    loss_total = (
+                        loss_total
+                        + loss_relative_mag
+                        + float(getattr(args, "unified_direction_loss_weight", 0.3)) * direction_ce
+                        + float(getattr(args, "unified_confidence_loss_weight", 0.1)) * confidence_consistency
+                    )
+            elif relative_mode:
                 loss_relative_mag = _point_loss(magnitude_real, abs_residual_target, mode=residual_mode)
                 loss_total = loss_total + loss_relative_mag
                 if not external_sign_enabled:
@@ -1032,9 +1362,13 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     loss_total = loss_total + state_ce
                 else:
                     state_ce = None
+                direction_ce = None
+                confidence_consistency = None
             else:
                 loss_relative_mag = None
                 state_ce = None
+                direction_ce = None
+                confidence_consistency = None
 
             if hard_reflect_mode not in {"off", "none"} and len(prompt_texts_d) > 0:
                 err_real_batch = torch.abs(pred_real_z - targets_z_typed).mean(dim=1).detach().cpu().numpy()
@@ -1060,7 +1394,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 sign_acc = float(
                     (
                         _masked_multiclass_accuracy_from_logits(state_logits_real, relative_state_targets, valid_sign_mask)
-                        if relative_mode
+                        if relative_mode and not direct_signed_mode
                         else _masked_binary_accuracy_from_logits(sign_logits_real, sign_target_bin, valid_sign_mask)
                     )
                     .detach()
@@ -1078,7 +1412,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                     "delta": delta_abs_mean,
                     "news": news_frac,
                 }
-                if relative_mode:
+                if relative_mode and not direct_signed_mode:
                     postfix["state_acc"] = sign_acc
                 else:
                     postfix["sgn"] = sign_acc
@@ -1150,8 +1484,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
                 _save_residual_best(
                     epoch_idx=epoch,
                     metric_now=best_metric,
-                    tpl_id_now=best_tpl_id,
-                    policy_name_now=best_policy_name,
                 )
                 _dump_val_residual_debug_csv()
                 live_logger.info(
@@ -1231,8 +1563,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             _save_residual_best(
                 epoch_idx=final_epoch,
                 metric_now=best_metric,
-                tpl_id_now=best_tpl_id,
-                policy_name_now=best_policy_name,
             )
             _dump_val_residual_debug_csv()
             live_logger.info(
@@ -1256,8 +1586,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             _save_residual_best(
                 epoch_idx=final_epoch,
                 metric_now=None,
-                tpl_id_now=best_tpl_id,
-                policy_name_now=best_policy_name,
             )
             live_logger.info(
                 f"[DELTA][VAL] skipped (mode={delta_val_mode}); "
@@ -1294,8 +1622,6 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             _save_residual_best(
                 epoch_idx=final_epoch,
                 metric_now=best_metric,
-                tpl_id_now=best_tpl_id,
-                policy_name_now=best_policy_name,
             )
             _dump_val_residual_debug_csv()
             live_logger.info(
@@ -1341,7 +1667,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
             live_logger.info(
                 f"[TEST][FALLBACK-BASE] loss(zMSE)={test_loss:.6f} mse(raw)={test_mse:.6f} mae(raw)={test_mae:.6f}"
             )
-            record_test_results_csv(args, live_logger, test_mse, test_mae)
+            record_test_results_csv(args, live_logger, test_mse, test_mae, base_mse=test_mse, base_mae=test_mae)
             draw_pred_true(live_logger, args, true_pred_csv_path)
             _save_refine_cache(args, live_logger=live_logger, force=True)
             _save_structured_cache(args, live_logger=live_logger, force=True)
@@ -1454,7 +1780,7 @@ def train_delta_stage(args, bundle, best_base_path: str, best_base_metric):
         if test_residual_debug_csv_path:
             live_logger.info(f"[DELTA][TEST_DEBUG_CSV] updated path={test_residual_debug_csv_path}")
 
-        record_test_results_csv(args, live_logger, test_mse, test_mae)
+        record_test_results_csv(args, live_logger, test_mse, test_mae, base_mse=base_test_mse, base_mae=base_test_mae)
         draw_pred_true(live_logger, args, true_pred_csv_path)
         _save_refine_cache(args, live_logger=live_logger, force=True)
         _save_structured_cache(args, live_logger=live_logger, force=True)

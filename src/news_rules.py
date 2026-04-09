@@ -2,7 +2,6 @@ import json
 import os
 import re
 import warnings
-from datetime import datetime
 from typing import List
 
 import numpy as np
@@ -11,44 +10,14 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from textblob import TextBlob
 
+from .news_datetime import normalize_news_datetime, parse_news_datetime
+
 
 def _parse_news_datetime(raw):
-    s = str(raw or "").strip()
-    if not s:
-        return pd.NaT
-
-    iso_candidate = s.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(iso_candidate)
-        ts = pd.Timestamp(dt)
-        if ts.tzinfo is not None:
-            ts = ts.tz_localize(None)
-        return ts
-    except Exception:
-        pass
-
-    fmts = [
-        "%d-%m-%Y %I:%M:%S %p",
-        "%d/%m/%Y %I:%M:%S %p",
-        "%d-%m-%Y %H:%M:%S",
-        "%d/%m/%Y %H:%M:%S",
-        "%d-%m-%Y %H:%M",
-        "%d/%m/%Y %H:%M",
-        "%d-%m-%Y",
-        "%d/%m/%Y",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-    ]
-    for fmt in fmts:
-        try:
-            return pd.Timestamp(datetime.strptime(s, fmt))
-        except Exception:
-            continue
-
-    return pd.to_datetime(s, dayfirst=True, errors="coerce")
+    dt = parse_news_datetime(raw, dayfirst=True)
+    if dt is not None:
+        return pd.Timestamp(dt)
+    return pd.to_datetime(raw, dayfirst=True, errors="coerce")
 
 
 def _normalize_news_identity_title_local(text: str) -> str:
@@ -56,10 +25,10 @@ def _normalize_news_identity_title_local(text: str) -> str:
 
 
 def _normalize_news_identity_time_local(value) -> str:
-    if isinstance(value, pd.Timestamp):
-        ts = value
-    else:
-        ts = pd.to_datetime(value, errors="coerce")
+    norm = normalize_news_datetime(value, dayfirst=True, floor="s")
+    if norm:
+        return norm
+    ts = pd.to_datetime(value, errors="coerce", dayfirst=True)
     if pd.isna(ts):
         return ""
     if ts.tzinfo is not None:
@@ -210,17 +179,6 @@ def _align_ts_to_series_tz(ts, ref_series: pd.Series) -> pd.Timestamp:
         if ts.tzinfo:
             ts = ts.tz_localize(None)  # 保留输入数据的本地时间，不强制转 UTC
     return ts
-
-def get_num_news_between(news_df, time_col, target_time, window_days):
-    # ✅ 先把传入的 target_time 对齐到新闻列的时区
-    target_time = _align_ts_to_series_tz(target_time, news_df[time_col])
-
-    if pd.isna(target_time):
-        return 0  # 无效时间
-
-    start = target_time - pd.Timedelta(days=window_days)
-    count = news_df[(news_df[time_col] >= start) & (news_df[time_col] < target_time)].shape[0]
-    return count
 
 def get_candidates(news_df, time_col, target_time, window_days, topM):
     # ✅ 先把传入的 target_time 对齐到新闻列的时区
@@ -572,16 +530,6 @@ def keyword_polarity_low_hybrid(cand: pd.DataFrame, text_col: str, keywords, K: 
 
     return cand.loc[chosen]
 
-def select_sum_v0(cand, text_col,K):
-    m = cand[text_col].fillna("").astype(str).str.strip().ne("")
-    filtered = cand[m]
-    return filtered.head(K)
-
-def select_no_sum(cand, text_col, K):
-    m = cand[text_col].fillna("").astype(str).str.strip().ne("")
-    filtered = cand[m]
-    return filtered.head(K)
-
 def select_news(
     cand: pd.DataFrame,
     policy: str,
@@ -595,26 +543,21 @@ def select_news(
     if policy == 'keywords':
         selected = policy_by_keywords(cand, text_col, policy_kw, K) #这里把命中关键词的都选上
     elif policy == 'polarity_high':
-        selected = select_by_sentiment_polarity_high(cand, text_col, K)#选个
+        selected = select_by_sentiment_polarity_high(cand, text_col, K)
     elif policy == 'polarity_low':
-        selected = select_by_sentiment_polarity_low(cand, text_col, K)#选个
+        selected = select_by_sentiment_polarity_low(cand, text_col, K)
     elif policy == 'keyword_polarity_high_hybrid':
         selected = keyword_polarity_high_hybrid(cand, text_col, policy_kw, K)#先按keyword筛选，然后选个
     elif policy == 'keyword_polarity_low_hybrid':
         selected = keyword_polarity_low_hybrid(cand, text_col, policy_kw, 1)#先按keyword筛选，然后选个
     elif policy == "all":
         selected = cand.head(K)
-    elif policy == "sum_v0":
-        selected = cand
-    elif policy == "no_sum":
-        selected = cand
     elif policy in {"smart", "auto"}:
         selected = _smart_select_news(cand, text_col, policy_kw, K, args=args)
     else:
         raise ValueError("Unknown news select policy")
-    # Return both selected news and average rating for use in base model training.
-    avg_rate = selected["rate"].mean() if (not selected.empty and "rate" in selected.columns) else 0.0
-    return selected, avg_rate
+
+    return selected
 
 def lead3(text: str, max_sentences: int = 3) -> str:
     seps = ['。', '.', '；', ';', '！', '!', '？', '?', '\n']

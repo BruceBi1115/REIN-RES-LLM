@@ -15,6 +15,7 @@ class TemporalTextTower(nn.Module):
         patch_dim: int,
         patch_stride: int,
         freeze_encoder: bool = True,
+        unfreeze_last_n: int = 0,
     ):
         super().__init__()
         model_id = str(model_id or "").strip()
@@ -26,6 +27,7 @@ class TemporalTextTower(nn.Module):
         self.patch_dim = int(max(1, patch_dim))
         self.patch_stride = int(max(1, patch_stride))
         self.freeze_encoder = bool(freeze_encoder)
+        self.unfreeze_last_n = int(max(0, unfreeze_last_n))
 
         self.encoder = AutoModel.from_pretrained(self.model_id)
         text_hidden = int(
@@ -34,8 +36,12 @@ class TemporalTextTower(nn.Module):
             or getattr(self.encoder.config, "d_model", 0)
             or self.hidden_size
         )
+        intermediate = max(self.step_dim * 2, 64)
         self.step_proj = nn.Sequential(
-            nn.Linear(text_hidden, self.step_dim),
+            nn.Linear(text_hidden, intermediate),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(intermediate, self.step_dim),
             nn.GELU(),
             nn.LayerNorm(self.step_dim),
         )
@@ -47,6 +53,12 @@ class TemporalTextTower(nn.Module):
         if self.freeze_encoder:
             for p in self.encoder.parameters():
                 p.requires_grad = False
+            if self.unfreeze_last_n > 0:
+                layers = list(self.encoder.encoder.layer) if hasattr(self.encoder, "encoder") else []
+                if len(layers) > 0:
+                    for layer in layers[-self.unfreeze_last_n :]:
+                        for p in layer.parameters():
+                            p.requires_grad = True
 
     def encode_step_series(
         self,
@@ -84,7 +96,8 @@ class TemporalTextTower(nn.Module):
             if step_mask.ndim != 2:
                 step_mask = step_mask.reshape(bsz, hist_len)
 
-        if self.freeze_encoder:
+        encoder_trainable = any(p.requires_grad for p in self.encoder.parameters())
+        if self.freeze_encoder and not encoder_trainable:
             self.encoder.eval()
             with torch.no_grad():
                 hidden = self.encoder(

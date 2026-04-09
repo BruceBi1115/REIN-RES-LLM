@@ -1,1250 +1,1111 @@
-# 框架工作逻辑说明
+# REIN-RES-LLM 当前框架说明
 
-## 这份文档是给谁看的
+本文档描述的是当前代码库里真实在运行的两阶段主框架，而不是早期的概念设计图。重点覆盖：
 
-这份文档面向想理解框架整体工作方式、但不想先扎进源码细节的人。
+- 从命令行到训练/测试落盘的主流程
+- 每个关键节点的输入与输出
+- 关键组件的职责与相互关系
+- 当前主路径、兼容路径、遗留路径的边界
 
-它描述的是当前仓库里的真实状态，而不是早期版本的旧设计。
+## 1. 一句话总览
 
-## 一句话概括
+当前主框架是一个两阶段时序预测系统：
 
-这个框架当前做的事可以概括为：
+1. `BASE` 阶段先只看历史时间序列，输出一个基础预测 `base_pred_z`
+2. `DELTA` 阶段再把历史 patch、新闻衍生特征、可选的时间对齐文本特征，与 `history_z + base_pred_z` 结合，预测一个残差修正 `delta_pred`
+3. 最终预测由 `base_pred_z` 和 `delta_pred` 融合得到
 
-- 先用 `Base` 模型只根据历史时间序列做一个基线预测
-- 再用 `DELTA` 模型结合新闻信息去修正 Base 还没解释好的残差
-- 如果开启 `SignNet`，就先额外学一个外部残差状态分类器：
-  在 `additive` 模式下学残差正负，
-  在 `relative` 模式下学 `amplify / neutral / shrink`
+当前默认配置下，主路径是：
 
-最终可以理解为：
+- `residual_arch=unified`
+- `delta_residual_mode=additive` 或 `relative`
+- `delta_sign_mode` 只有在 `residual_arch=current` 时才真正决定是否走外部 `SignNet`
 
-- `additive` 模式：`最终预测 = Base 预测 + DELTA 修正`
-- `relative` 模式：先定义
-  `q = (target_raw - base_raw) / scale_raw`
-  其中 `scale_raw = max(abs(base_raw), floor_or_eps)`
-  然后：
-  `最终预测 = base_raw + q_hat * scale_raw`
+## 2. 先看一眼总流程图
 
-如果这时还启用了外部 `SignNet`，那么在当前版本里：
+```mermaid
+flowchart TD
+    A["run.py\n解析命令行参数"] --> B["src/base/stage.py::main\n构建 bundle 并分派 stage"]
+    B --> C["setup_env_and_data\n读取 train/val/test + news\n构造 DataLoader / 日志 / 路径 / z-score 统计"]
 
-- `additive` 模式下，`SignNet` 主要决定 DELTA 修正更像正向还是负向
-- `relative` 模式下，`SignNet` 输出 3 类状态：
-  `amplify / neutral / shrink`
-  并通过 softmax 概率生成一个状态分数
-  `state_score = P(amplify) - P(shrink)`
-  然后让 `DELTA` 预测的 `|q_hat|` 变成有符号 `q_hat = |q_hat| * state_score`
+    C --> D["SlidingDataset / make_loader\n生成滑动窗口样本"]
 
-## 当前代码结构
+    D --> E["BASE Stage\nbuild_base_backbone + train_base_stage"]
+    E --> F["best_base checkpoint\nbase_backbone.pt + meta.json"]
 
-现在主逻辑已经不再堆在一个大文件里，而是拆成了几个模块目录：
+    F --> G["DELTA Stage\ntrain_delta_stage"]
+    C --> G
+
+    G --> H["build_delta_batch_inputs\n构造 patch / structured_feats /\ntemporal_text / prompt_texts(仅记录)"]
+    F --> I["Base Backbone Forward\nhistory_z -> base_pred_z"]
+    H --> J["TinyNewsTSRegressor Forward\n输出 delta_pred 及诊断量"]
+    I --> J
+
+    J --> K{"是否启用外部 SignNet"}
+    K -- "是，仅 current + signnet_binary" --> L["ResidualSignNet\n覆盖/组合方向信息"]
+    K -- "否" --> M["使用 DELTA 内部方向/状态/统一 trunk"]
+    L --> N["compose delta"]
+    M --> N["compose delta"]
+
+    N --> O["_fuse_base_and_delta\nbase_pred_z + delta_pred -> final_pred_z"]
+    O --> P["训练损失 / 验证指标 / skill score"]
+    P --> Q["保存 best_delta checkpoint\nresidual_pair.json\n调试 CSV\nresults/test_results.csv"]
+```
+
+## 3. 当前主路径与非主路径
+
+### 3.1 当前真实主路径
+
+当前真正参与训练和评估的主链路是：
 
 - `run.py`
-  命令行入口，负责解析参数并启动训练。
+- `src/base/stage.py`
+- `src/base/common.py`
+- `src/base_backbone.py`
+- `src/delta/stage.py`
+- `src/delta/core.py`
+- `src/model2.py`
+- `src/temporal_text.py`
+- `src/unified_trunk.py`
+- `src/signnet/model.py`
+- `src/signnet/training.py`
 
-- `src/base/`
-  Base 阶段相关逻辑。
-  这里负责环境准备、数据读取、Base 训练、Base 验证、主流程编排。
+### 3.2 需要特别说明的“看起来存在但不是主路径”的部分
 
-- `src/delta/`
-  DELTA 阶段相关逻辑。
-  这里负责 DELTA 的损失、训练、验证、测试和最终残差修正。
+1. Prompt 文本仍然会被构建出来，但当前 DELTA 主训练路径并不把 prompt token 喂给模型。
+   原因是 `build_delta_batch_inputs()` 内部调用 `build_batch_inputs(..., build_prompt_inputs=False)`。
 
-- `src/signnet/`
-  SignNet 相关逻辑。
-  这里负责 SignNet 模型定义、训练、校准和外部符号信号输出。
+2. 当前主框架不是“LLM 直接读 prompt 后输出预测值”的结构。
+   真实主模型是 `Base Backbone + TinyNewsTSRegressor`。
 
-- `src/refine/`
-  refined news cache 和 structured news cache 的读取、构建、校验、写回逻辑。
+3. `delta_sign_mode` 现在不是全局生效参数。
+   只有 `residual_arch=current` 时，它才决定是外部 `SignNet`、内部 sign/state head，还是 `none`。
+   对 `unified/simple_concat/base_only_delta` 来说，它基本只是兼容旧实验名的参数。
 
-- `src/base_delta_decoouple_trainer.py`
-  现在只是兼容导出层。
-  它把新的 `base/delta` 模块重新导出给旧调用路径使用，但真实主逻辑已经不在这里实现。
+## 4. 顶层入口
 
-## 当前框架在解决什么问题
+### 4.1 `run.py`
 
-如果只看历史数值，模型通常能学到：
+职责：
 
-- 周期性
-- 趋势
-- 季节性
-- 工作日与周末差异
+- 解析所有训练、数据、残差、新闻、文本、缓存、优化器参数
+- 调用 `src.base_delta_decoouple_trainer.main`，实际落到 `src/base/stage.py::main`
 
-但很多真实扰动来自外部事件，比如：
+关键输入：
 
-- 天气
-- 政策
-- 市场消息
-- 行业新闻
-- 公司新闻
+- 命令行参数 `args`
 
-这些事件常常会让“只看历史”的预测出现系统性误差。
+关键输出：
 
-所以当前框架的核心思想不是“让新闻从零开始预测数值”，而是：
+- 无直接业务输出
+- 通过 `main(args)` 驱动整个训练/测试流程
 
-- Base 学正常规律
-- 新闻帮助解释和修正异常偏差
+几个最关键的参数：
 
-## 一次完整运行会发生什么
+- `stage`: `base` / `delta` / `all`
+- `history_len`, `horizon`, `stride`
+- `base_backbone`
+- `residual_arch`: `current` / `unified` / `simple_concat` / `base_only_delta`
+- `delta_residual_mode`: `additive` / `relative`
+- `delta_sign_mode`: `signnet_binary` / `internal` / `none`
+- `delta_temporal_text_enable`
+- `delta_text_fuse_mode`: `gated_add` / `cross_attention`
 
-### 1. 启动与参数整理
+## 5. 环境与数据准备
 
-程序从 `run.py` 进入后，会在 `src/base/stage.py` 里先做统一初始化。
+### 5.1 `setup_env_and_data(args)` in `src/base/stage.py`
 
-当前版本在日志开头会打印两张 ASCII 双栏表：
+职责：
 
-- 参数表
-- cache 决策表
+- 统一实验名
+- 创建日志与产物路径
+- 读取 train/val/test
+- 计算全局 z-score 统计
+- 构造 DataLoader
+- 读取新闻表
+- 生成 cache / volatility / 模板等上下文
 
-也就是说，训练一开始就会把：
+输入：
 
-- 当前参数取值
-- refined news cache 的路径
-- cache 是 `read_only`、`build_mode` 还是 `disabled`
-- 是否检测到 API key
+- `args`
 
-直接写进日志。
+输出：
 
-### 2. 读取时间序列数据
+- `bundle: dict`
 
-框架会读取：
+`bundle` 关键字段如下：
 
-- `train_file`
-- `val_file`
-- `test_file`
+| 字段 | 含义 |
+| --- | --- |
+| `stage` | 当前运行阶段 |
+| `live_logger` | 实时日志器 |
+| `ckpt_dir` | 当前实验 checkpoint 目录 |
+| `ans_json_path` | 测试答案 json |
+| `true_pred_csv_path` | 预测/真实值 CSV |
+| `val_residual_debug_csv_path` | 验证集残差调试 CSV |
+| `test_residual_debug_csv_path` | 测试集残差调试 CSV |
+| `device` | 训练设备 |
+| `train_df/val_df/test_df` | 原始数据表 |
+| `train_loader/val_loader/test_loader` | 窗口化后的 DataLoader |
+| `news_df` | 新闻表 |
+| `templates` | prompt 模板 |
+| `patch_len` | 时间序列 patch 长度 |
+| `volatility_bin*` | 波动率分桶 |
+| `global_zstats` | `mu_global`, `sigma_global` |
+| `news_api_adapter` | API 模式下的新闻处理适配器 |
 
-并且用训练集计算全局 z-score 统计量：
+### 5.2 全局 z-score
 
+当前框架的基础数值空间是全局 z-space：
+
+- `z = (x - mu_global) / sigma_global`
+
+这里的 `mu_global` 和 `sigma_global` 来自 `train_df`。
+
+作用：
+
+- BASE 模型在 z-space 训练和预测
+- DELTA 模型也在 z-space 预测残差
+- `relative` 模式下会在 raw scale 和 z-space 之间来回转换
+
+## 6. 样本生成与 DataLoader
+
+### 6.1 `SlidingDataset` in `src/data_construction/data.py`
+
+职责：
+
+- 把原始序列表转成滑动窗口监督样本
+
+输入：
+
+- 原始 DataFrame
+- `L = history_len`
+- `H = horizon`
+- `stride`
+- 时间列 / 数值列 / 可选 `series_id`
+
+单样本输出：
+
+```python
+{
+    "history_value": (L,),
+    "target_value": (H,),
+    "history_times": list[str] length L,
+    "target_times": list[str] length H,
+    "target_time": str,        # target 的第一个时间点
+    "series_id": str,
+}
+```
+
+### 6.2 `make_loader(...)`
+
+职责：
+
+- 将 `SlidingDataset` 包装成 `DataLoader`
+
+输出：
+
+- 训练、验证、测试三个 loader
+
+## 7. BASE 阶段
+
+### 7.1 目标
+
+BASE 阶段只用历史序列，不看新闻，训练一个纯时序 backbone，给 DELTA 提供：
+
+- 一个稳定的基础预测 `base_pred_z`
+- 一个可以比较的基线误差
+
+### 7.2 `train_base_stage(args, bundle)` in `src/base/stage.py`
+
+输入：
+
+- `train_loader`, `val_loader`
+- `global_zstats`
+- `base_backbone` 配置
+
+核心流程：
+
+1. `history_z, targets_z = _z_batch_tensors(batch, ...)`
+2. `base_train_model(history_z) -> pred_z`
+3. 计算点预测损失
+4. 在验证集上选择 best base checkpoint
+
+输出：
+
+```python
+{
+    "best_base_path": str,
+    "device": torch.device,
+    "live_logger": logger,
+    "templates": templates,
+    "best_base_metric": float,
+    "global_zstats": {...},
+}
+```
+
+### 7.3 Base Backbone 输入输出
+
+#### `DLinearBackbone`
+
+输入：
+
+- `history_z`: `(B, L)`
+
+输出：
+
+- `base_pred_z`: `(B, H)`
+
+功能：
+
+- 先做 trend / seasonal 分解，再分别线性投影到未来 `H` 步
+
+#### `MLPBackbone`
+
+输入：
+
+- `history_z`: `(B, L)`
+
+输出：
+
+- `base_pred_z`: `(B, H)`
+
+功能：
+
+- 一个简单的 MLP 回归器
+
+### 7.4 BASE 阶段落盘产物
+
+- `checkpoints/<task>/best_base_<task>/base_backbone.pt`
+- `checkpoints/<task>/best_base_<task>/meta.json`
+
+其中 `meta.json` 还会保存：
+
+- `history_len`
+- `horizon`
 - `mu_global`
 - `sigma_global`
 
-后续 Base、SignNet、DELTA 里凡是用到 `z` 空间，都会基于这个训练集统计量。
+## 8. DELTA 阶段总览
 
-当前日志里的 `[DATA_RANGE][TRAIN/VAL/TEST]` 只显示原始 split 的真实时间范围，不再混入补历史窗口时带上的上下文区间。
+DELTA 阶段的目标不是重新预测整条未来序列，而是学习：
 
-### 3. 构造样本
+- “在 base 基础上，需要修正多少”
+- “修正的方向是什么”
+- “新闻什么时候真正有帮助”
 
-当前样本的核心字段包括：
+它的输入由两部分组成：
 
-- `history_value`
-- `target_value`
-- `history_times`
-- `target_times`
-- `target_time`
-- `series_id`
+1. 时序主线：`history_z`、`base_pred_z`、`ts_patches`
+2. 新闻侧信息：`structured_feats`、可选 `temporal_text_*`
 
-如果数据是多序列面板数据，比如同一天有多个 ticker，那么必须传 `id_col`。
+## 9. DELTA 输入构造
 
-`id_col` 的作用是：
+### 9.1 `_z_batch_tensors(batch, args, global_zstats)` in `src/base/common.py`
 
-- 按不同序列分别切历史窗口和预测窗口
-- 给 `val/test` 分别补各自序列的历史前缀
-- 避免把多条序列错误地拼成一条
+职责：
 
-所以：
+- 把 batch 里的原始历史值和目标值变成 z-space tensor
 
-- 单序列数据可以不传 `id_col`
-- 多序列数据必须传
+输入：
 
-### 4. Base 阶段
+- `batch["history_value"]`
+- `batch["target_value"]`
+- `mu_global`, `sigma_global`
 
-Base 阶段只看历史数值，不看新闻。
+输出：
 
-输入本质上是：
+- `history_z`: `(B, L)`
+- `targets_z`: `(B, H)`
+- `metas`: 每个样本一份 z-score 统计字典
 
-- `history_value` 的 z-score 版本 `history_z`
+### 9.2 `build_batch_inputs(...)` in `src/base/common.py`
 
-输出是：
+职责：
 
-- 对未来 `horizon` 步的基线预测 `base_pred_z`
+- 为新闻增强和 DELTA 分支构造多模态输入
 
-Base 的作用很明确：
+每个样本会做的事：
 
-- 学“如果完全不看新闻，我会怎么预测”
+1. `history` / `target` 转成 z 值
+2. 历史序列切成 patch
+3. 从 `news_df` 中按时间窗选新闻
+4. 对选中的新闻做 utility rerank
+5. 生成 refined news 文本
+6. 可选提取结构化事件
+7. 可选构建时间对齐的 temporal text 序列
+8. 可选生成 prompt 文本
 
-Base 的 checkpoint 会在验证集上按设定指标做早停和选优。
+返回值是一个 16 项元组：
 
-### 5. 为 DELTA 准备新闻输入
+| 返回项 | 含义 |
+| --- | --- |
+| `input_ids` | prompt token ids，当前 DELTA 主路径通常不用 |
+| `attn` | prompt attention mask |
+| `ts_patches` | `(B, P, patch_len)` |
+| `ts_patch_mask` | `(B, P)` |
+| `targets_z` | `(B, H)` |
+| `metas` | z-score 元信息 |
+| `prompt_texts` | 只用于记录/调试 |
+| `rel_labels` | 新闻相关性标签 |
+| `news_counts` | 每个样本选到的新闻数 |
+| `news_max_utility` | 每个样本新闻 utility 最大值 |
+| `structured_events_list` | 聚合后的结构化事件 |
+| `structured_doc_events_list` | 文档级结构化事件 |
+| `structured_feats` | `(B, F)` 结构化特征向量 |
+| `temporal_text_ids` | `(B, L, Ttok)` |
+| `temporal_text_attn` | `(B, L, Ttok)` |
+| `temporal_text_step_mask` | `(B, L)` |
 
-对每个样本，框架会根据样本的目标时间和新闻窗口规则去选新闻。
+### 9.3 `build_delta_batch_inputs(...)`
 
-当前逻辑大致是：
+职责：
 
-1. 先按时间窗取候选新闻
-2. 再按策略筛选或 rerank
-3. 然后把选中的新闻交给 refine/cache 逻辑
+- 从 `build_batch_inputs(...)` 中裁出 DELTA 真正需要的那部分
 
-最终会整理出几类 DELTA 可直接使用的新闻输入：
+输出字典：
 
-- `structured_events`
-  聚合后的结构化事件
+```python
+{
+    "ts_patches": (B, P, patch_len),
+    "ts_patch_mask": (B, P),
+    "targets_z": (B, H),
+    "prompt_texts": list[str],
+    "rel_labels": (B,),
+    "news_counts": (B,),
+    "news_max_utility": (B,),
+    "structured_events": list[dict],
+    "structured_doc_events": list[list[dict]],
+    "structured_feats": (B, F),
+    "temporal_text_ids": (B, L, Ttok) or None,
+    "temporal_text_attn": (B, L, Ttok) or None,
+    "temporal_text_step_mask": (B, L) or None,
+}
+```
 
-- `structured_doc_events`
-  文档级结构化事件
-  这个对象现在主要用于调试、日志和 cache 侧保留文档粒度信息，不作为 DELTA 或 SignNet 的直接张量输入
+注意：
 
-- `structured_feats`
-  结构化事件向量
-  这是当前新闻真正进入 DELTA 和 SignNet 的主输入形式
+- 当前 DELTA 路径虽然会返回 `prompt_texts`，但不会把 prompt token 输入模型
 
-- `news_counts`
-  当前样本最终使用到的新闻数量
-  这个值目前只保留给日志、诊断和部分 DELTA 侧权重逻辑，不再作为 SignNet 或 DELTA 模型的直接数值输入
+## 10. DELTA 主模型：`TinyNewsTSRegressor`
 
-换句话说，refine 后的文本结果现在不只是给结构化抽取用。
-如果开启 `delta_temporal_text_enable`，这些文本还会进入共享 `TemporalTextTower`；
-在默认 `summary_gated` 架构下，它会给 DELTA 提供 `text_summary + patch_context`，也会给外部 `SignNet` 提供 `text_summary`；
-在 `delta_multimodal_arch=plan_c_mvp` 时，外部 `SignNet` 仍然只直接吃 `text_summary + text_strength`，但会在内部额外走一层 `RegimeRouter + ResidualExpertMixture` 做路由式方向推理。
+### 10.1 位置
 
-## 关键节点输入清单
+- `src/model2.py`
 
-下面这部分专门回答四个问题：
+### 10.2 `forward(...)` 输入
 
-- 这个节点吃什么输入
-- 输入的格式是什么
-- 哪些参数会影响这个节点
-- 参数是怎么影响的，最终影响到框架的哪一部分
+```python
+forward(
+    ts_patches,               # (B, P, patch_dim)
+    ts_patch_mask,            # (B, P)
+    history_z=None,           # (B, L)
+    base_pred_z=None,         # (B, H)
+    targets=None,
+    head_mode="base"|"delta",
+    rel_targets=None,
+    rel_lambda=0.0,
+    structured_feats=None,    # (B, F)
+    temporal_text_ids=None,   # (B, L, Ttok)
+    temporal_text_attn=None,  # (B, L, Ttok)
+    temporal_text_step_mask=None, # (B, L)
+)
+```
 
-### 节点 1：启动与环境整理 `run.py -> setup_env_and_data()`
+### 10.3 `head_mode="base"`
 
-- 输入：命令行参数对象 `args`
-- 关键输入格式：
-  `taskName: str`，`save_dir: str`，`stage: str`
-  `train_file/val_file/test_file: str`
-  `time_col/value_col/id_col: str`
-  `news_path/news_doc_cache_path: str`
-- 关键参数：
-  `taskName`
-  `stage`
-  `save_dir`
-  `base_backbone`
-  `news_path`
-  `news_doc_cache_path`
-  `news_refine_mode`
-  `news_structured_mode`
-  `news_api_key_path`
-- 参数如何影响：
-  `taskName` 和 `save_dir` 决定 checkpoint、日志、测试输出写到哪里
-  `stage` 决定这次只跑 Base、只跑 DELTA，还是整条链一起跑
-  `base_backbone` 会进入后续 Base 模型构造
-  `news_path` 和 `news_doc_cache_path` 决定是否启用新闻链，以及 refined cache 是 `disabled`、`read_only` 还是 `build_mode`
-  `news_refine_mode/news_structured_mode/news_api_key_path` 会影响是否需要 API adapter，以及在缺 key 时是否启动前直接报错
-- 最终影响到：
-  日志开头的参数表
-  cache 决策表
-  后续整个运行链是否允许读新闻、构建 cache、调用 API
+输入：
 
-### 节点 2：时间序列数据读取与切分拼接 `setup_env_and_data()`
+- 只使用 `ts_patches` / `ts_patch_mask`
 
-- 输入：
-  `train_df`
-  `val_df`
-  `test_df`
-- 关键输入格式：
-  每个表至少要有 `time_col` 和 `value_col`
-  如果是多序列面板数据，还要有 `id_col`
-  文件可以是 `csv` 或 `parquet`
-- 关键参数：
-  `train_file`
-  `val_file`
-  `test_file`
-  `time_col`
-  `value_col`
-  `id_col`
-  `dayFirst`
-  `history_len`
-  `horizon`
-  `stride`
-  `batch_size`
-- 参数如何影响：
-  `time_col/value_col/id_col` 决定框架从哪几列取时间、数值和序列身份
-  `dayFirst` 决定时间解析策略，直接影响日期是否会被读反
-  `history_len/horizon/stride` 决定样本窗口长度和滑动步长
-  `id_col` 决定 `val/test` 补历史前缀时是按整表补，还是按每个序列单独补
-  `batch_size` 决定 DataLoader 的 batch 规模
-- 最终影响到：
-  全局 z-score 统计量 `mu_global/sigma_global`
-  样本条数
-  每个样本的 `history_value/target_value`
-  `val/test` 是否有合法窗口可评估
+输出：
 
-### 节点 3：新闻源加载 `load_news()`
+- `pred`: `(B, H)`
+- `rel_logits`: `(B,)` 或 `(B, 1)`
 
-- 输入：
-  `news_path`
-- 关键输入格式：
-  一个 JSON 数组文件
-  每条新闻通常包含 `title/date/url/content`
-  其中 `date` 对应 `news_time_col`
-  其中正文列对应 `news_text_col`
-- 关键参数：
-  `news_path`
-  `news_time_col`
-  `news_text_col`
-  `news_tz`
-  `dayFirst`
-- 参数如何影响：
-  `news_path` 决定是否启用新闻源
-  `news_time_col` 决定从哪一列读发布时间
-  `news_tz` 决定新闻时间是否本地化或转换时区
-  `dayFirst` 会影响非 ISO 日期解析
-- 最终影响到：
-  `news_df` 的时间排序
-  新闻 identity 去重结果
-  后续 candidate news 检索和 cache 精确匹配
+用途：
 
-### 节点 4：refined news cache 决策与读取 `src/refine/cache.py`
+- 当前主框架里基本不用这个分支做最终训练主线，真正的 base 训练走的是独立 `Base Backbone`
 
-- 输入：
-  `news_df`
-  `args`
-  当前样本对应的 `news_metas`
-- 关键输入格式：
-  cache 记录按 `title + date + url` 做 identity
-  单条 unified doc cache 记录里保留 `refined_news`、`structured_events`、`title/date/url/news_path` 等字段
-- 关键参数：
-  `news_doc_cache_path`
-  `news_path`
-  `news_refine_mode`
-  `news_structured_mode`
-  `news_api_model`
-  `news_api_key_path`
-  `dayFirst`
-- 参数如何影响：
-  `news_doc_cache_path` 显式指定 unified cache 文件
-  `news_path` 会触发自动发现 `checkpoints/_shared_refine_cache/news_doc_cache_{新闻文件名}.json`
-  `news_refine_mode/news_structured_mode` 决定 build 时走本地逻辑还是 API 逻辑
-  `news_api_key_path` 和环境变量一起决定 API key 是否可用
-  `dayFirst` 会影响 cache 记录里日期的标准化匹配
-- 最终影响到：
-  当前运行是 `read_only`、`build_mode` 还是 `disabled`
-  missing 新闻是报错、跳过，还是允许新建条目
-  refine 和 structured 结果是否会被写回 cache
+### 10.4 `head_mode="delta"` 主分支
 
-### 节点 5：新闻筛选与样本级新闻构造 `build_batch_inputs()`
+这是当前最重要的分支。其内部可拆成 6 个节点。
 
-- 输入：
-  `batch`
-  `news_df`
-  `templates`
-  `tokenizer`
-  `global_zstats`
-- 关键输入格式：
-  `batch["history_value"]`: `list[list[float]]`
-  `batch["target_value"]`: `list[list[float]]`
-  `batch["target_time"]`: 每个样本一个时间戳
-  `news_df`: `DataFrame`
-- 关键参数：
-  `news_window_days`
-  `news_topM`
-  `news_topK`
-  `utility_rerank_enable`
-  `token_budget`
-  `token_budget_news_frac`
-  `delta_include_structured_news`
-  `delta_structured_enable`
-  `delta_structured_feature_dim`
-  `news_refine_mode`
-  `news_structured_mode`
-  `news_dropout`
-  `force_no_news`
-  `delta_temporal_text_enable`
-  `delta_temporal_text_source`
-  `delta_temporal_text_max_len`
-  `delta_temporal_text_per_step_topk`
-- 参数如何影响：
-  `news_window_days` 决定候选新闻回看窗口
-  `news_topM` 决定初始 candidate cap
-  `news_topK` 决定最终保留多少条新闻
-  `utility_rerank_enable` 决定筛选后是否再做 utility rerank
-  `token_budget * token_budget_news_frac` 决定 refine 文本合并时的 token budget
-  `delta_include_structured_news` 决定 prompt 里是否把结构化事件展开成文本
-  `delta_structured_enable` 决定是否真的去构造 `structured_feats`
-  `delta_structured_feature_dim` 决定结构化向量最终维度
-  `news_dropout` 只会在需要构造 prompt 文本时随机把 `news_str` 拿掉；在当前 DELTA / SignNet 主路径里通常不会改变真正送进模型的张量输入
-  `force_no_news` 会强制当前 batch 走“无新闻”路径
-  `delta_temporal_text_enable` 决定是否额外构造按 history step 对齐的文本辅助序列
-  `delta_temporal_text_source` 决定这条文本辅助序列编码的是原新闻正文 `raw`，还是 doc-cache 里的 `refined` 摘要
-  `delta_temporal_text_max_len / delta_temporal_text_per_step_topk` 决定每个时间步文本片段的截断长度，以及每步最多合并多少条已发生新闻摘要
-- 最终影响到：
-  `structured_events`
-  `structured_doc_events`
-  `structured_feats`
-  `news_counts`
-  `prompt_texts`
-  `temporal_text_ids / temporal_text_attn / temporal_text_step_mask`
-  当前样本最终能给 SignNet 提供的 `structured_feats`，以及在开启 temporal text 时能给 DELTA 提供的时间对齐文本辅助信号
+#### 节点 A：Patch 编码
 
-### 节点 6：Base 输入与输出 `train_base_stage()`
+输入：
 
-- 输入：
-  `history_z`
-- 关键输入格式：
-  `history_z: torch.FloatTensor`，形状大致是 `(B, L)`
-  其中 `L = history_len`
-- 关键参数：
-  `base_backbone`
-  `history_len`
-  `horizon`
-  `lr`
-  `weight_decay`
-  `scheduler`
-  `patience`
-- 参数如何影响：
-  `base_backbone` 决定 Base 是 `dlinear` 还是 `mlp`
-  `history_len` 决定输入长度
-  `horizon` 决定一次输出多少未来步
-  优化器和 scheduler 参数影响收敛速度、稳定性和 early stop 结果
-- 最终影响到：
-  `base_pred_z`
-  Base checkpoint 选优
-  后续 SignNet 和 DELTA 的残差学习基线
+- `ts_patches`: `(B, P, patch_dim)`
+- `ts_patch_mask`: `(B, P)`
 
-### 节点 7：SignNet 输入与输出 `_train_external_signnet()`
+处理：
 
-这一节最重要的一句话是：
+- `patch_proj`
+- `patch_gate`
+- 可选 prototype routing
+- `_pool_ts`
 
-- `SignNet` 现在真正进入模型的主输入是：
-  `history_z`
-  `base_pred_z`
-  `structured_feats`
-  以及可选的 temporal-text 特征
+输出：
 
-也就是说，当前版本里：
+- `ts_feat`: `(B, P, hidden)`
+- `pooled`: `(B, hidden)`
 
-- 不输入 `history_raw`
-- 不输入新闻数量 `news_counts`
-- 不输入 prompt 文本
-- 不直接输入原始 prompt token 序列
+#### 节点 B：时间对齐文本塔 `TemporalTextTower`
 
-- 输入：
-  `history_z`
-  `base_pred_z`
-  `structured_feats`
-  可选的 `text_summary / text_strength`
-- 关键输入格式：
-  `history_z: torch.FloatTensor (B, L)`
-  `base_pred_z: torch.FloatTensor (B, H)`
-  `structured_feats: torch.FloatTensor (B, D)`
-  `text_summary: torch.FloatTensor (B, hidden_text)` 或 `None`
-  `text_strength: torch.FloatTensor (B, 1)` 或 `None`
-  其中 `D = delta_structured_feature_dim`
-- 关键参数：
-  `delta_sign_external_epochs`
-  `delta_sign_external_hidden`
-  `delta_sign_external_dropout`
-  `delta_sign_external_lr`
-  `delta_sign_eps`
-  `delta_sign_external_use_news_weighting`
-  `delta_sign_external_use_residual_weighting`
-  `delta_sign_external_use_pos_weight`
-  `delta_sign_external_pos_weight_floor`
-  `delta_sign_external_pos_weight_clip`
-  `delta_sign_external_tau`
-  `delta_multimodal_arch`
-  `delta_multimodal_fuse_lambda`
-- 参数如何影响：
-  `delta_sign_external_hidden/dropout` 决定 SignNet 宽度和正则强度
-  `delta_sign_external_epochs/lr` 决定训练时长和学习率
-  `delta_sign_eps` 决定哪些残差位置被视为“符号有意义”
-  `delta_sign_external_use_news_weighting` 会根据结构化新闻强弱调节样本权重
-  `delta_sign_external_use_residual_weighting` 会根据残差幅度调节 horizon 位置权重
-  `delta_sign_external_use_pos_weight` 以及 floor/clip 只在 additive 的二分类监督里有效
-  `delta_sign_external_tau` 只在 additive 模式里影响 `logits -> tanh(sign_soft)` 的温度
-  `delta_multimodal_arch` 决定 SignNet 走原来的 summary-based MLP，还是切到 Plan C 的 `RegimeRouter + ResidualExpertMixture` 版本
-  `delta_multimodal_fuse_lambda` 决定 Plan C 下 expert mixture 对最终方向表征的注入强度
-  `cleaned_residual_enable` 打开后，relative 模式下只会先对 `q_target` 做 horizon 平滑，再据此构造 3 类状态标签
-  `cleaned_residual_smooth_alpha` 控制 cleaned residual 在 horizon 上的 EWMA 平滑强度
-  `cleaned_residual_structured_mix` 主要影响 additive 模式的 cleaned residual 模板混合；relative 模式下不再把结构化模板直接写进监督目标
-- 最终影响到：
-  additive 下的 `sign_logits / sign_soft`
-  relative 下的 `state_logits / state_score`
-  DELTA 在 relative 模式下的状态选择稳定性
+只在 `delta_temporal_text_enable=1` 时启用。
 
-#### SignNet 的输入分别是什么意思
+输入：
 
-- `history_z`
-  这是当前样本历史窗口的 z-score 序列。
-  形状是 `(B, L)`，其中 `B` 是 batch size，`L = history_len`。
-  它回答的是：“最近这段历史数值轨迹长什么样？”
+- `temporal_text_ids`: `(B, L, Ttok)`
+- `temporal_text_attn`: `(B, L, Ttok)`
+- `temporal_text_step_mask`: `(B, L)`
+- `target_patch_count=P`
 
-- `base_pred_z`
-  这是 Base 模型对未来 `H` 步的基线预测。
-  形状是 `(B, H)`，其中 `H = horizon`。
-  它回答的是：“如果完全不看新闻，Base 觉得未来会怎么走？”
+输出包：
 
-- `structured_feats`
-  这是当前样本新闻经过 structured extraction 之后得到的固定维度向量。
-  形状是 `(B, D)`，其中 `D = delta_structured_feature_dim`。
-  它回答的是：“当前新闻在方向、强度、持续性、相关性、置信度和事件类型上长什么样？”
+```python
+{
+    "step_feat": (B, L, step_dim),
+    "step_mask": (B, L),
+    "patch_context": (B, P, hidden),
+    "patch_mask": (B, P),
+    "text_summary": (B, hidden),
+    "text_strength": (B, 1),
+}
+```
 
+功能：
+
+1. 每个历史时间步的新闻文本先编码成 step 特征
+2. 再按 patch 对齐成 patch-level 文本上下文
+3. 再聚合成一个全局 `text_summary`
+
+#### 节点 C：文本与时序融合
+
+两种模式：
+
+- `gated_add`
+- `cross_attention`
+
+输入：
+
+- `ts_feat`: `(B, P, hidden)`
+- `patch_context`: `(B, P, hidden)`
+
+输出：
+
+- 融合后的 `ts_feat`: `(B, P, hidden)`
+
+作用：
+
+- 让每个时间 patch 感知其附近时间范围内的新闻语义
+
+#### 节点 D：结构化新闻特征包
+
+输入：
+
+- `structured_feats`: `(B, F)`
+
+输出包：
+
+```python
+{
+    "feats": (B, F),
+    "weight": (B, 1),
+    "summary": (B, hidden),
+}
+```
+
+作用：
+
+- 将结构化事件向量压成一个 `structured_summary`
+- 同时给出该结构化信息的可信权重 `structured_weight`
+
+#### 节点 E：新闻上下文聚合
+
+输入：
+
+- `pooled` 时序摘要
+- `structured_summary`
 - `text_summary`
-  这是共享 `TemporalTextTower` 从 `temporal_text_ids / temporal_text_attn / temporal_text_step_mask` 编码后，再做 patch-level 聚合和 masked mean pool 得到的文本摘要向量。
-  形状大致是 `(B, hidden_size)`，另外还会带一个 `(B, 1)` 的 `text_strength` 表示当前样本文本覆盖度。
-  它回答的是：“如果把时间对齐新闻文本先编码成一条统一表征，这个样本现在最重要的文本上下文是什么，以及这条文本信号强不强？”
+- `text_strength`
 
-#### SignNet 的输入分别从哪里来
+输出：
 
-- `history_z`
-  来自 `_z_batch_tensors(batch, args, global_zstats)`。
-  原始来源是样本里的 `history_value`，再用训练集统计量做 z-score。
+- `fused_news_context`: `(B, hidden)`
+- `news_strength`: `(B, 1)`
+- `residual_context`: `(B, hidden)`
 
+其中：
+
+- `fused_news_context` 主要融合结构化新闻摘要
+- `residual_context` 是 DELTA 残差头真正消费的主上下文
+
+#### 节点 F：残差头
+
+这一步由 `residual_arch` 决定。
+
+## 11. 四种 `residual_arch`
+
+### 11.1 `simple_concat`
+
+输入：
+
+- `pooled`: `(B, hidden)`
+- `text_summary`: `(B, hidden)`
+
+处理：
+
+- `concat([pooled, text_summary]) -> simple_delta_head`
+
+输出：
+
+- `pred`: `(B, H)`，直接作为 signed residual
+
+特点：
+
+- 最简单的文本+时序拼接基线
+
+### 11.2 `base_only_delta`
+
+输入：
+
+- `pooled`: `(B, hidden)`
+
+处理：
+
+- `simple_delta_head(pooled)`
+
+输出：
+
+- `pred`: `(B, H)`，直接作为 signed residual
+
+特点：
+
+- 完全不使用新闻语义，只做 DELTA residual 头基线
+
+### 11.3 `unified`
+
+输入：
+
+- `residual_context`: `(B, hidden)`
+- `history_z`: `(B, L)`
+- `base_pred_z`: `(B, H)`
+- `text_summary`: `(B, hidden)`
+- `text_strength`: `(B, 1)`
+
+内部组件：
+
+- `UnifiedResidualTrunk`
+
+输出：
+
+```python
+{
+    "direction_logits": (B, H),
+    "direction_score": (B, H),   # tanh 后方向强度
+    "magnitude_raw": (B, H),
+    "magnitude": (B, H),         # softplus 后幅度
+    "confidence_logits": (B, H),
+    "confidence": (B, H),        # sigmoid 后置信度
+}
+```
+
+最终残差：
+
+```python
+pred = confidence * direction_score * magnitude
+```
+
+特点：
+
+- 方向、幅度、置信度统一建模
+- 当前默认也是推荐主路径
+
+### 11.4 `current`
+
+这是旧残差结构保留下来的兼容路径。
+
+它的行为还会受 `delta_sign_mode` 影响。
+
+#### `delta_sign_mode=none`
+
+输出：
+
+- `direct_residual_head(residual_context) -> pred`
+
+即直接回归 signed residual。
+
+#### `delta_residual_mode=relative` 且 `delta_sign_mode=internal`
+
+输出：
+
+- `magnitude`
+- `state_logits`: `(B, H, 3)`
+- `state_score`: `(B, H)`
+
+其中 3 类状态是：
+
+- shrink
+- neutral
+- amplify
+
+#### `delta_residual_mode=additive`
+
+输出：
+
+- `sign_logits`: `(B, H)`
+- `sign_soft = tanh(sign_logits / tau)`
+- `magnitude`
+- `pred = sign_soft * magnitude`
+
+## 12. `UnifiedResidualTrunk` 说明
+
+位置：
+
+- `src/unified_trunk.py`
+
+输入：
+
+- `residual_context`: `(B, hidden)`
+- `history_z`: `(B, L)`，不足会补零，超长会截断
+- `base_pred_z`: `(B, H)`，不足补零，超长截断
+- `text_summary`: `(B, hidden)`
+- `text_strength`: `(B, 1)`
+
+输出：
+
+```python
+{
+    "hidden": (B, hidden),
+    "direction_logits": (B, H),
+    "direction_score": (B, H),
+    "magnitude_raw": (B, H),
+    "magnitude": (B, H),
+    "confidence_logits": (B, H),
+    "confidence": (B, H),
+}
+```
+
+功能关系：
+
+- `history_proj` 编码历史窗口
+- `base_proj` 编码 base 预测轨迹
+- `text_proj` 编码文本摘要和其强度
+- `input_fuse` 把上述信息和 `residual_context` 合到一起
+- `trunk` 做共享残差推理
+- 三个 head 分别预测方向、幅度、置信度
+
+## 13. 外部 `ResidualSignNet`
+
+### 13.1 什么时候会启用
+
+只在下面条件同时成立时启用：
+
+- `residual_arch=current`
+- `delta_sign_mode=signnet_binary`
+
+对应判断在：
+
+- `src/delta/core.py::_use_external_signnet`
+
+### 13.2 输入
+
+```python
+history_z        # (B, L)
+base_pred_z      # (B, H)
+structured_feats # (B, F)
+text_summary     # (B, hidden) or None
+text_strength    # (B, 1) or None
+```
+
+### 13.3 输出
+
+- additive 模式：`(B, H)` 二分类 sign logits
+- relative 模式：`(B, H, 3)` 三分类 state logits
+
+### 13.4 它与 DELTA 的关系
+
+它不是最终预测器，而是“方向控制器”。
+
+关系如下：
+
+1. DELTA 主模型先预测 `magnitude` 或原始残差
+2. 外部 `SignNet` 再提供方向信息
+3. `_compose_delta_with_external_sign(...)` 把两者合成为最终 `delta_pred`
+
+## 14. DELTA 训练中的目标构造与融合
+
+### 14.1 `_build_delta_targets(...)`
+
+输入：
+
+- `targets_z`: `(B, H)`
+- `base_pred`: `(B, H)`
+- `mu_global`, `sigma_global`
+- `args`
+
+输出：
+
+- `delta_target`: `(B, H)`
+
+两种模式：
+
+#### additive
+
+```python
+delta_target = targets_z - base_pred
+```
+
+#### relative
+
+先转 raw scale，再除以 base 的幅度尺度：
+
+```python
+q = (target_raw - base_raw) / scale_raw
+```
+
+### 14.2 `_build_cleaned_residual_targets(...)`
+
+作用：
+
+- 对 additive 残差目标做 EWMA 平滑
+- 可选混入结构化事件模板，减少高噪声残差标签对方向监督的干扰
+
+输入：
+
+- `raw_residual`: `(B, H)`
+- `structured_feats`: `(B, F)` 或 `None`
+
+输出：
+
+- `cleaned_residual`: `(B, H)`
+
+### 14.3 `_build_direction_target_pack(...)`
+
+作用：
+
+- 从真实残差构造方向监督标签
+
+输出：
+
+- `loss_target`
+- `eval_target`
+
+支持：
+
+- `hard`
+- `soft`
+- `windowed`
+
+### 14.4 `_fuse_base_and_delta(...)`
+
+输入：
+
+- `base_pred_z`: `(B, H)`
+- `delta_pred`: `(B, H)`
+
+输出：
+
+- `final_pred_z`: `(B, H)`
+
+两种融合方式：
+
+#### additive
+
+```python
+final_pred_z = base_pred_z + delta_pred
+```
+
+#### relative
+
+```python
+base_raw -> pred_raw = base_raw + ratio * scale_raw -> 再转回 z
+```
+
+## 15. `train_delta_stage(...)` 主循环
+
+位置：
+
+- `src/delta/stage.py`
+
+输入：
+
+- `args`
+- `bundle`
+- `best_base_path`
+- `best_base_metric`
+
+核心步骤如下。
+
+### 15.1 准备阶段
+
+1. 加载 `best_base` checkpoint
+2. 构造 `TinyNewsTSRegressor`
+3. 根据参数组建优化器和 warmup
+4. 预热 refined cache / structured cache
+5. 如满足条件，则预训练外部 `SignNet`
+
+### 15.2 每个 batch 的主计算图
+
+1. `history_z = _z_batch_tensors(...)`
+2. `base_pred = base_backbone(history_z)`
+3. `delta_inputs = build_delta_batch_inputs(...)`
+4. `raw_delta_targets = _build_delta_targets(...)`
+5. `delta_targets = cleaned residual` 或 `relative target`
+6. `out_delta = delta_model(..., head_mode="delta")`
+7. 如果启用外部 `SignNet`，则用它重组方向
+8. `pred_real_z = _fuse_base_and_delta(base_pred, delta_pred_real, ...)`
+9. 计算损失并反向传播
+
+### 15.3 损失组成
+
+#### 所有模式都有
+
+- `loss_final`
+  含义：最终预测 `final_pred_z` 与 `targets_z` 的点预测损失
+
+#### direct-signed 模式
+
+direct-signed 模式包括：
+
+- `residual_arch in {unified, simple_concat, base_only_delta}`
+- 或 `delta_sign_mode=none`
+
+额外损失：
+
+- `loss_signed`
+  含义：直接监督预测残差和真实残差
+
+#### unified 模式额外还有
+
+- `loss_relative_mag`
+- `direction_ce`
+- `confidence_consistency`
+
+其中：
+
+- `direction_ce` 监督方向 logits
+- `confidence_consistency` 约束高置信位置不要和真实残差偏差太大
+
+#### current + relative 模式
+
+额外损失：
+
+- `loss_relative_mag`
+- `state_ce`，监督 3 类状态
+
+## 16. `evaluate_metrics_residual(...)`
+
+位置：
+
+- `src/delta/stage.py`
+
+职责：
+
+- 在验证/测试时完整复现 `base + delta` 推理
+- 同时收集大量诊断指标
+
+输入：
+
+- `base_model`
+- `delta_model`
+- 可选 `external_signnet`
+- `data_loader`
+- `news_df`
+- `templates`
+- `args`
+- `global_zstats`
+
+输出：
+
+```python
+(
+    final_loss,
+    final_mse,
+    final_mae,
+    base_loss,
+    base_mse,
+    base_mae,
+)
+```
+
+副作用：
+
+- 写 `true_pred_csv`
+- 写 `val/test residual debug csv`
+- 把诊断结果挂到 `args._last_residual_eval_diag`
+
+### 16.1 评估时会额外记录的诊断量
+
+- sign / state accuracy
+- 平均残差幅度
+- `delta_helped_rate`
+- `skill_score`
+- 按新闻密度切片的 MAE
+- 按事件期切片的 MAE
+- route 使用统计
+
+## 17. 调试与结果文件
+
+### 17.1 Checkpoint
+
+BASE：
+
+- `checkpoints/<task>/best_base_<task>/base_backbone.pt`
+- `checkpoints/<task>/best_base_<task>/meta.json`
+
+DELTA：
+
+- `checkpoints/<task>/best_delta_<task>/regressor.pt`
+- `checkpoints/<task>/best_delta_<task>/meta.json`
+- `checkpoints/<task>/best_delta_<task>/tokenizer/`
+- 可选 `external_signnet.pt`
+
+配对文件：
+
+- `checkpoints/<task>/residual_pair.json`
+
+### 17.2 调试 CSV
+
+`_open_residual_debug_csv(...)` 会创建的字段包括：
+
+- `z_input`
+- `target_z`
 - `base_pred_z`
-  来自已经训练好的 Base 模型。
-  也就是先把 `history_z` 喂进 Base，再得到未来窗口的 `base_pred_z`。
-
-- `structured_feats`
-  来自 `build_delta_batch_inputs() -> build_batch_inputs()`。
-  先选新闻，再读 refined/structured cache，再把 `structured_events` 数值化成固定长度向量。
-
-- `text_summary`
-  来自共享 `TemporalTextTower`。
-  它的原始张量来源仍然是 `build_delta_batch_inputs()` 产出的 `temporal_text_*`，只是不会把 token 序列直接送进 SignNet，而是先在 tower 里压成一个 pooled summary。
-
-#### 哪些参数会改变 SignNet 的输入本身
-
-- `history_len`
-  直接改变 `history_z` 的长度 `L`。
-
-- `horizon`
-  直接改变 `base_pred_z` 的长度 `H`。
-
-- `delta_structured_enable`
-  决定是否真的构造并使用结构化新闻向量。
-  关掉后，`structured_feats` 会退化成无信息或零向量，SignNet 基本只剩历史和 Base 预测可看。
-
-- `delta_structured_feature_dim`
-  直接改变 `structured_feats` 的维度 `D`。
-
-- `force_no_news`
-  会强制当前 batch 走无新闻路径。
-  这会让该 batch 的 `structured_feats` 变弱甚至接近零。
-
-- `news_window_days / news_topM / news_topK / utility_rerank_enable`
-  这些参数不会改变张量形状，但会改变当前样本最终选到哪些新闻，因此会改变 `structured_feats` 的数值内容。
-
-- `news_refine_mode / news_structured_mode / news_doc_cache_path`
-  这些参数会影响 refined/structured 结果从哪里来、是否能读到、是否跳过缺失新闻，因此也会影响 `structured_feats` 的具体值。
-
-- `delta_temporal_text_enable`
-  决定 SignNet 是否还能额外看到一条来自共享 `TemporalTextTower` 的文本支路。
-  无论是默认架构还是 Plan C，直接进入 SignNet 的都主要是 `text_summary + text_strength`。
-
-- `delta_temporal_text_source`
-  决定这条 `text_summary` 是从原新闻正文 `raw` 还是从 `refined` 摘要编码出来的。
-
-- `temporal_text_model_id`
-  决定共享 `TemporalTextTower` 使用哪个 tokenizer/encoder，因此会改变 `text_summary` 的表征空间。
-
-- `delta_temporal_text_max_len / delta_temporal_text_per_step_topk`
-  不会改变 `history_z / base_pred_z / structured_feats` 的形状，但会改变 `text_summary` 的信息密度和每步聚合到多少文本。
-
-- `delta_multimodal_arch / delta_multimodal_fuse_lambda`
-  这组参数决定 SignNet 是只做普通 summary-based MLP 融合，还是在 pooled summary 之上再做 Plan C 的 regime routing 和 expert mixture。
-
-#### SignNet 的输入不会再被什么影响
-
-当前版本里，下面这些东西已经不会再直接进入 SignNet：
-
-- prompt token
-- 新闻数量 `news_counts`
-- `temporal_text_ids / temporal_text_attn / temporal_text_step_mask` 这些逐 token 张量本身
-- 单条 doc 级文本 embedding 列表
-
-也就是说，SignNet 现在可以通过共享 tower 间接看到文本：
-
-- 在默认 `summary_gated` 架构下，看到的是 pooled 过的 `text_summary`
-- 在 `plan_c_mvp` 架构下，仍然直接看到 pooled `text_summary + text_strength`，但会再基于历史波动、Base 分散度、文本强度和结构化新闻强度去做 route-aware 推理
-
-但它仍然不会直接吃原始新闻 token 序列本身。
-
-### 节点 8：DELTA 样本输入 `build_delta_batch_inputs()`
-
-这一节也可以先记一句话：
-
-- `build_delta_batch_inputs()` 会产出很多字段
-- 默认真正送进 DELTA 主模型前向的核心输入是：
-  `ts_patches`
-  `ts_patch_mask`
-  `structured_feats`
-- 如果开启 `delta_temporal_text_enable=1`，还会额外送：
-  `temporal_text_ids`
-  `temporal_text_attn`
-  `temporal_text_step_mask`
-
-- 输入：
-  `build_batch_inputs()` 的输出
-- 关键输入格式：
-  `ts_patches: torch.FloatTensor (B, P, patch_len)`
-  `ts_patch_mask: torch.FloatTensor (B, P)`
-  `targets_z: torch.FloatTensor (B, H)`
-  `structured_feats: torch.FloatTensor (B, D)`
-  `temporal_text_ids: torch.LongTensor (B, L, T)`，其中 `T` 是单步文本最大 token 长度
-  `temporal_text_attn: torch.LongTensor (B, L, T)`
-  `temporal_text_step_mask: torch.LongTensor (B, L)`
-  `news_counts: torch.FloatTensor (B,)`
-  `prompt_texts: list[str]`
-- 关键参数：
-  `patch_len`
-  `patch_stride`
-  `history_len`
-  `horizon`
-  `delta_structured_feature_dim`
-  `delta_temporal_text_enable`
-  `delta_temporal_text_source`
-  `delta_temporal_text_max_len`
-  `delta_temporal_text_per_step_topk`
-- 参数如何影响：
-  `patch_len/patch_stride` 决定历史序列如何被切成 patch
-  `history_len` 决定 patch 总覆盖长度
-  `horizon` 决定 `targets_z` 长度
-  `delta_structured_feature_dim` 决定结构化新闻特征维度
-  `delta_temporal_text_enable` 决定是否真的生成时间对齐文本辅助输入
-  `delta_temporal_text_source` 决定 `temporal_text_*` 来自原新闻正文还是 refined 摘要
-  `delta_temporal_text_max_len / delta_temporal_text_per_step_topk` 决定 `temporal_text_*` 的信息密度
-- 最终影响到：
-  DELTA 模型真正吃到的张量形状
-  sign、state、magnitude head 的输出形状
-
-#### `build_delta_batch_inputs()` 产出的字段里，哪些是给 DELTA 真正前向用的
-
-- `ts_patches`
-  会直接送进 DELTA 主模型
-
-- `ts_patch_mask`
-  会直接送进 DELTA 主模型
-
-- `structured_feats`
-  会直接送进 DELTA 主模型
-
-- `temporal_text_ids / temporal_text_attn / temporal_text_step_mask`
-  只在 `delta_temporal_text_enable=1` 时直接送进 DELTA 主模型
-  这是一条按历史时间步对齐的辅助文本分支
-
-- `targets_z`
-  不进入 DELTA 前向本身，但会进入训练损失
-
-- `news_counts`
-  当前不作为 DELTA 主模型的直接输入
-  它主要用于日志、调试，以及少数辅助统计逻辑
-
-- `prompt_texts`
-  当前不进入 DELTA 主模型
-  而且当前 DELTA / SignNet 这条 helper 调用会设置 `build_prompt_inputs=False`，所以这个字段通常只是兼容保留，不是主路径输入
-
-- `structured_events / structured_doc_events`
-  当前不直接作为 DELTA 张量输入
-  它们主要保留给日志、调试、cache 追踪和结构化信息检查
-
-### 节点 9：DELTA 模型前向 `TinyNewsTSRegressor.forward()`
-
-这一节最重要的结论是：
-
-- DELTA 默认真正吃的是“时间序列 patch + patch mask + structured news vector”
-- 如果开启 `delta_temporal_text_enable`，它还会额外吃一条按 history step 对齐的新闻文本辅助序列
-- 它不直接吃整段 prompt token，也不直接吃新闻数量
-
-- 输入：
-  `ts_patches`
-  `ts_patch_mask`
-  `structured_feats`
-  可选的 `temporal_text_ids / temporal_text_attn / temporal_text_step_mask`
-- 关键输入格式：
-  `ts_patches: torch.FloatTensor (B, P, patch_len)`
-  `ts_patch_mask: torch.FloatTensor (B, P)`
-  `structured_feats: torch.FloatTensor (B, D)` 或 `None`
-  `temporal_text_ids: torch.LongTensor (B, L, T)` 或 `None`
-  `temporal_text_attn: torch.LongTensor (B, L, T)` 或 `None`
-  `temporal_text_step_mask: torch.LongTensor (B, L)` 或 `None`
-- 关键参数：
-  `tiny_news_hidden_size`
-  `delta_clip`
-  `delta_sign_tau`
-  `delta_mag_max`
-  `delta_structured_enable`
-  `delta_structured_feature_dim`
-  `delta_temporal_text_enable`
-  `delta_temporal_text_source`
-  `temporal_text_model_id`
-  `delta_temporal_text_dim`
-  `delta_temporal_text_fuse_lambda`
-  `delta_temporal_text_freeze_encoder`
-  `delta_multimodal_arch`
-  `delta_multimodal_fuse_lambda`
-- 参数如何影响：
-  `tiny_news_hidden_size` 决定 DELTA 主隐藏维度
-  `delta_clip` 决定最终 delta 修正是否做 `tanh` 截断
-  `delta_sign_tau` 决定内部 sign logits 的软符号温度
-  `delta_mag_max` 决定 magnitude 上限
-  `delta_structured_enable/delta_structured_feature_dim` 决定是否读取以及如何解释结构化新闻向量
-  `delta_temporal_text_enable` 决定是否启用时间对齐文本辅助分支
-  `delta_temporal_text_source` 决定时间对齐文本分支编码 `raw` 还是 `refined` 新闻文本
-  `temporal_text_model_id` 决定这条文本辅助分支实际使用哪个 HF tokenizer/encoder；如果不单独指定，就回退到主 `tokenizer / base_model`
-  `delta_temporal_text_dim / delta_temporal_text_fuse_lambda / delta_temporal_text_freeze_encoder` 决定这条文本辅助分支的投影维度、融合强度，以及编码器是冻结前向还是参与训练
-  `delta_multimodal_arch` 决定 DELTA 走原来的 summary/gated 路径，还是切到 Plan C 的 regime-router expert-mixture 路径
-  `delta_multimodal_fuse_lambda` 决定 Plan C 路径里各个 residual expert 对最终 residual_context 的注入强度
-- 最终影响到：
-  `pred`
-  `sign_logits`
-  `state_logits`
-  `magnitude`
-  `delta_init`
-
-#### DELTA 的这些真正输入分别是什么意思
-
-- `ts_patches`
-  这是把历史 z-score 序列按 `patch_len` 和 `patch_stride` 切开的 patch 张量。
-  形状是 `(B, P, patch_len)`，其中 `P` 是 patch 数。
-  它回答的是：“把历史轨迹切成多个局部片段之后，每段局部模式长什么样？”
-
-- `ts_patch_mask`
-  这是 patch 有效位掩码。
-  形状是 `(B, P)`。
-  它回答的是：“哪些 patch 是真实数据，哪些是 padding 补出来的？”
-
-- `structured_feats`
-  这是新闻结构化特征向量。
-  形状是 `(B, D)`。
-  它回答的是：“当前新闻侧提供了什么方向、强度、持续性和事件类型信息？”
-
-- `temporal_text_ids / temporal_text_attn / temporal_text_step_mask`
-  这是可选的时间对齐文本辅助输入。
-  它不是“整段 prompt”，而是对每个历史时间步单独整理“在该时间点之前已经发生的新闻文本”，再把这些文本序列送进共享 `TemporalTextTower` 编码后按 patch 对齐融合进 DELTA。
-
-#### 这条 temporal text 分支到底是怎么工作的
-
-- 第一步，`build_batch_inputs()` 仍然会先做样本级新闻选择。
-  也就是说，temporal text 分支不是重新遍历全量 `news_df`；它复用的是当前样本已经筛好的 `selected_news_metas`，以及与之对齐的原新闻正文或 refined 文本。
-  所以 `news_window_days / news_topM / news_topK / utility_rerank_enable / force_no_news` 这些参数，仍然会先决定这条文本分支“看得到哪些新闻”。
-
-- 第二步，`_build_temporal_text_series_for_sample()` 会遍历每个 history step 的时间戳 `step_ts`。
-  对于当前这个 `step_ts`，它只保留 `doc_ts <= step_ts` 的新闻文档。
-  这意味着每个历史步只能看到“在那个时刻之前已经发生”的新闻，不会偷看未来新闻。
-
-- 第二步半，要先看 `delta_temporal_text_source`：
-  如果设成 `refined`，这条支路编码的是 doc-cache 里的 refined 新闻摘要；
-  如果设成 `raw`，编码的就是当前样本已选中的原新闻正文。
-
-- 第三步，对当前 step 可见的文档，它会按时间从近到远排序，取最近的 `delta_temporal_text_per_step_topk` 条，
-  再用 `_merge_refined_news_docs()` 合成一段短文本，并按 `delta_temporal_text_max_len` 做 tokenizer-level truncation。
-  如果某个 history step 没有任何可见新闻，这个 step 对应的文本就是空字符串。
-
-- 第四步，`_tokenize_temporal_text_series()` 会把整批样本的 step 文本序列 pad 成：
-  `temporal_text_ids: (B, L, T)`
-  `temporal_text_attn: (B, L, T)`
-  `temporal_text_step_mask: (B, L)`
-  这里第二维的 `L` 本质上就是 history 长度。
-  `temporal_text_step_mask[b, l] = 1` 表示这个历史步最终确实有非空文本 token。
-
-- 第五步，进入共享 `TemporalTextTower` 之后，
-  它会先把 `(B, L, T)` 展平成 `(B * L, T)`，
-  再送进 `temporal_text_model_id` 对应的 HF `AutoModel` 文本编码器。
-  编码后，它不是取生成结果，而是对 token hidden states 做 attention-mask mean pooling，
-  从而得到“每个 history step 一个文本向量”，然后再投影到 `delta_temporal_text_dim`。
-
-- 第六步，`TemporalTextTower` 会继续用和时间序列分支相同的 `patch_len / patch_stride`，
-  把 step-level 文本向量继续聚成 patch-level 文本上下文，并再 pooled 成一个样本级 `text_summary`。
-  所以这条分支最终不是直接对齐 horizon，也不是直接对齐整段 history，而是和 `ts_patches` 在 patch 轴上对齐。
-
-- 第七步，要看 `delta_multimodal_arch`：
-
-  - 如果是默认的 `summary_gated`，
-    patch-level 文本上下文会先过一个 gate，再做 residual add：
-    `ts_feat = ts_feat + lambda * gate(ts_feat, text_patch_context) * text_patch_context`
-
-  - 如果是 `plan_c_mvp`，
-    patch-level 文本上下文本身不再直接进入一个额外的 token-level 交互块。
-    当前实现会先照常得到 `pooled_ts`、`fused_news_context`、`text_summary * text_strength`，
-    再把它们拼成一个基础 `residual_base`；
-    然后根据历史波动、文本强度、结构化新闻强度和组合后的 news strength 构造 route scalars，
-    送进 `RegimeRouter` 输出 `none / trend / event / reversal / sparse` 五类路由概率；
-    再由 `ResidualExpertMixture` 对多个 residual experts 做加权混合，得到新的 `residual_context`。
-    这里的 `none` 路由本质上是 abstention 信号，会在后面压低修正置信度。
-
-- 第八步，`text_summary` 现在也不只影响 patch 表征。
-  无论哪种架构，它都会进入 DELTA 的 `residual_context`；
-  在 `plan_c_mvp` 下，还会额外形成一个 `route_summary`，并通过 `route_mag_head` 和 abstention-aware `confidence_head` 去调节最终 `magnitude`。
-  所以 temporal text 对 DELTA 的作用，已经从“辅助 patch-level 融合”扩展成：
-  patch 融合 + pooled residual context + route-aware magnitude/confidence 调节。
-
-- 这也解释了为什么它和 `structured_feats` 不是互斥关系：
-  `temporal text` 分支是在 patch level 融合文本上下文，
-  `text_summary` 会在 pooled/residual level 提供文本摘要上下文，
-  `structured_feats` 分支则是在 pooled level 提供数值化新闻上下文。
-  当前实现里，两条新闻支路可以同时打开。
-
-- 还要特别区分：
-  这条分支不等于 prompt 分支。
-  它不直接读取整段 prompt token，也不直接把 merged prompt 文本送进 DELTA 主干。
-  在当前 DELTA / SignNet 主路径里，`build_delta_batch_inputs()` 通常会关掉 prompt token 构造，但 temporal-text 分支仍然可以照常工作。
-
-- `news_dropout` 主要影响 prompt 文本构造，通常不会把这条 temporal-text 张量支路一起丢掉。
-  但 SignNet 现在可以通过共享 `TemporalTextTower` 间接吃到这条分支的 pooled `text_summary`。
-
-#### DELTA 的这些真正输入分别从哪里来
-
-- `ts_patches`
-  来自 `build_batch_inputs()` 里的 `_make_patches(history_z, patch_len, patch_stride)`。
-  本质上它来源于样本的 `history_value`，先做 z-score，再切 patch。
-
-- `ts_patch_mask`
-  和 `ts_patches` 同时生成。
-  当历史长度不整齐或需要 pad 时，用来告诉模型哪些 patch 有效。
-
-- `structured_feats`
-  来自新闻筛选、refine、structured extraction 之后的数值化结果。
-  本质上是 `structured_events -> feature vector`。
-
-- `temporal_text_*`
-  来自 `build_batch_inputs()` 里的 `_build_temporal_text_series_for_sample()` 和 `_tokenize_temporal_text_series()`。
-  它会把“每个历史时间步之前可见的 refined news 摘要”整理成 `(B, L, T)` 张量，再在 DELTA 前向里编码并按 patch 聚合。
-
-#### 哪些参数会改变 DELTA 的输入本身
-
-- `history_len`
-  先决定历史窗口长度，再间接影响能切出多少 patch。
-
-- `patch_len`
-  直接决定每个 patch 的长度。
-
-- `patch_stride`
-  直接决定 patch 之间的滑动步长，也会改变 patch 数量 `P`。
-
-- `delta_structured_enable`
-  决定 DELTA 是否接收结构化新闻输入。
-
-- `delta_structured_feature_dim`
-  直接决定 `structured_feats` 的维度 `D`。
-
-- `news_window_days / news_topM / news_topK / utility_rerank_enable / force_no_news`
-  这些参数不会改变 DELTA 时间序列 patch 的形状，但会改变 `structured_feats` 的具体值。
-
-- `delta_temporal_text_enable`
-  决定 DELTA 是否额外接收时间对齐文本辅助输入。
-
-- `delta_temporal_text_max_len / delta_temporal_text_per_step_topk`
-  不改变 patch 形状，但会改变 `temporal_text_*` 的内容密度和每步能看到多少文本信息。
-
-#### DELTA 当前明确不直接吃什么
-
-当前版本里，下面这些东西不会直接送进 `TinyNewsTSRegressor.forward()`：
-
-- `history_z` 原始整段序列
-- `history_raw`
-- `base_pred_z`
-- `prompt_texts`
-- raw 新闻文本
-- `news_counts`
-- `structured_events` 原始 dict
-- `structured_doc_events` 原始列表
-
-需要特别注意：
-
-- 如果开启 `delta_temporal_text_enable`，模型会额外直接吃“按 history step 对齐后的新闻文本 token 序列”
-- 但它仍然不会直接吃“整段 prompt token”或“整段 merged 新闻文本”
-
-### 节点 10：DELTA 训练损失与最终融合 `train_delta_stage()`
-
-- 输入：
-  `base_pred_z`
-  `delta_pred`
-  `sign_soft`
-  `targets_z`
-  可选的 `external_signnet`
-- 关键输入格式：
-  这些张量大多是 `torch.FloatTensor (B, H)`
-- 关键参数：
-  `residual_loss`
-  `delta_residual_mode`
-  `delta_relative_denom_floor`
-  `delta_relative_ratio_clip`
-  `cleaned_residual_enable`
-  `cleaned_residual_smooth_alpha`
-  `cleaned_residual_structured_mix`
-  `delta_sign_external_tau`
-- 参数如何影响：
-  `residual_loss` 决定最终主损失用 `mse/mae/smooth_l1` 哪一种
-  `delta_residual_mode` 决定最终融合是 `additive` 还是 `relative`
-  `delta_relative_denom_floor` 决定相对残差目标 `q = (target_raw - base_raw) / scale_raw` 中 `scale_raw = max(abs(base_raw), floor_or_eps)` 的 floor
-  `delta_relative_ratio_clip` 决定相对百分比 `q_hat` 是否截断；`<=0` 表示禁用
-  `cleaned_residual_enable` 打开后，relative 模式只会把平滑后的 `q_target` 用于 3 类状态标签构造
-  `cleaned_residual_smooth_alpha` 控制 cleaned residual 的 horizon 平滑
-  `cleaned_residual_structured_mix` 主要影响 additive 模式的模板混合
-  `delta_sign_external_tau` 会影响外部 SignNet 输出给 DELTA 时的软符号强度
-- 最终影响到：
-  DELTA 训练方向
-  在 `relative` 模式下，当前 DELTA 的反向传播来自：
-  `loss_final + loss_relative_mag`
-  如果 `delta_sign_mode=internal`，还会再加 `loss_relative_state_ce`
-  也就是说，旧版那些 sign/magnitude/null/counterfactual 辅助损失已经不再参与训练
-  `final_pred`
-  在 `additive` 模式下：`final_pred = base_pred + delta_corr`
-  在 `relative` 模式下：先预测 `|q_hat|` 和状态分数，再得到有符号 `q_hat`
-  然后：`final_pred_raw = base_pred_raw + q_hat * scale_raw`
-  验证集选优
-  测试集最终结果
-
-### 节点 11：日志与调试输出
-
-- 输入：
-  `args`
-  当前 batch 的统计值
-  当前 epoch 的评估结果
-- 关键输入格式：
-  标量统计、路径字符串、时间范围字符串、结构化新闻调试记录
-- 关键参数：
-  `taskName`
-  `stage`
-  `delta_structured_enable`
-  `delta_sign_mode`
-  `residual_debug_csv_path`
-- 参数如何影响：
-  `taskName/stage` 决定日志和 debug 文件命名
-  `delta_structured_enable` 会决定日志是否强调 structured 分支
-  `delta_sign_mode` 会决定日志里是否出现 external signnet 相关信息
-- 最终影响到：
-  你能否从日志里快速定位
-  当前机制到底开没开
-  cache 是怎么决策的
-  每个阶段到底在吃什么输入
-
-## refined news cache 的当前规则
-
-这部分是当前版本变化最大、也最需要记住的地方。
-
-### 1. unified doc cache 的主键
-
-当前 unified refined news cache 不再按原始新闻文本做主键。
-
-现在统一按新闻 identity 做主键，identity 由三部分组成：
-
-- `title`
-- `date`
-- `url`
-
-也就是说，当前 cache 匹配规则是：
-
-`title + 发布时间 + url`
-
-而不是旧版本里那种“正文一样就算同一条”的逻辑。
-
-### 2. 新闻源本身也按同一 identity 规则处理
-
-当前 `load_news()` 读入新闻 JSON 后，会做几件事：
-
-- 解析发布时间
-- 统一排序
-- 对完全相同的 `title + date + url` 做去重
-
-去重时会尽量保留信息更完整的那一行。
-
-### 3. cache 运行模式
-
-当前 refined news cache 有三种模式：
-
-- `disabled`
-  没有 `news_path`，新闻 cache 整体关闭
-
-- `read_only`
-  显式指定了现成 cache，或者按新闻文件名自动发现到了现成 cache
-
-- `build_mode`
-  没有现成 cache，需要边运行边生成
-
-自动发现时，脚本通常会去找类似：
-
-- `checkpoints/_shared_refine_cache/news_doc_cache_{新闻文件名}.json`
-
-### 4. read_only 模式下的行为
-
-如果进入 `read_only`：
-
-- 不做 prewarm
-- 不写回 unified doc cache
-- 不写回 refine cache
-- 不写回 structured cache
-
-当前版本对缺失 cache 新闻的处理也已经收紧并改过一次：
-
-- 不再偷偷现场补算
-- 而是跳过这条缺失新闻，并打印 warning
-
-换句话说，当前 read-only 的真实行为是：
-
-- 有 cache 就读
-- 缺条目就忽略该新闻
-- 不在 read-only 运行中生成新条目
-
-### 5. build_mode 模式下的行为
-
-只有在没有现成 cache 时，框架才会进入 `build_mode`。
-
-这时才允许：
-
-- 做 refine
-- 做 structured extraction
-- 写回 unified doc cache
-
-如果这时配置要求使用 API，而系统里又没有可用 API key，框架会直接报错。
-
-### 6. cache 排序
-
-当前 unified doc cache 在保存时会按下面顺序排序：
-
-- `date`
-- `title`
-- `url`
-
-也就是从早到晚。
-
-### 7. cache 允许部分缺失
-
-当前脚本启动前通常会跑 `scripts/verify_refined_news_cache.py`。
-
-这个校验器现在支持：
-
-- 检查 chronological ordering
-- 检查 identity coverage
-- 允许用 `--allow-missing` 放行“部分缺失但格式没坏”的 cache
-
-所以当前框架状态下：
-
-- cache 缺少一部分新闻时，训练可以继续
-- 这些缺失新闻会被忽略
-
-## SignNet 在当前版本里到底做什么
-
-SignNet 是一个可选模块，不是每次训练都必须启用。
-
-它现在的职责是：
-
-- 在 DELTA 之前，先学习一个更稳定的外部修正信号
-- 在 `additive` 模式下，给 DELTA 提供“更像往上修还是往下修”的信号
-- 在 `relative` 模式下，给 DELTA 提供“当前相对残差百分比应该放大还是缩小”的信号
-
-### SignNet 当前吃什么输入
-
-当前版本里，SignNet 的历史输入已经是 `history_z`，不是 `history_raw`。
-
-它当前主要会用到：
-
-- `history_z`
-- `base_pred_z`
+- `true_residual_z`
+- `delta_branch_output`
+- `pred_residual_z`
+- `sign_logits`
+- `sign_soft`
+- `state_logits`
+- `state_score`
+- `magnitude`
+- `magnitude_raw`
+- `news_count`
+- `news_max_utility`
+- `base_residual_abs`
+- `delta_helped`
+- `direction_correct`
+- `confidence_value`
+- `regime_route`
+
+这些字段非常适合做失败样本回放。
+
+### 17.3 汇总结果
+
+测试阶段最终会写入：
+
+- `results/test_results.csv`
+
+当前会记录的核心列包括：
+
+- `MSE`, `MAE`
+- `Base_MSE`, `Base_MAE`
+- `Skill_Score_MSE`, `Skill_Score_MAE`
+- `Delta_Helped_Rate`
+- `NoNews_MAE`, `SparseNews_MAE`, `DenseNews_MAE`
+- `SignNet_Acc`, `SignNet_BalancedAcc`
+
+## 18. 关键组件之间的关系
+
+可以把整个系统理解成下面这张依赖图。
+
+### 18.1 数据依赖关系
+
+- `SlidingDataset` 负责把原始序列切成监督样本
+- `setup_env_and_data` 负责给全局训练环境补齐统计量、loader、news 表、缓存、路径
+- `build_delta_batch_inputs` 负责把“样本窗口”升级成“DELTA 可消费的多模态 batch”
+
+### 18.2 模型依赖关系
+
+- `Base Backbone` 负责给出一个不带新闻的纯时序预测
+- `TinyNewsTSRegressor` 负责学习新闻驱动的残差修正
+- `TemporalTextTower` 是 `TinyNewsTSRegressor` 的一个可选子模块
+- `UnifiedResidualTrunk` 是 `TinyNewsTSRegressor` 在 `unified` 模式下的核心残差推理器
+- `ResidualSignNet` 是 `current + signnet_binary` 条件下的外部方向控制器
+
+### 18.3 训练依赖关系
+
+- `train_base_stage` 必须先产出 `best_base`
+- `train_delta_stage` 依赖 `best_base`
+- `evaluate_metrics_residual` 同时依赖 `base_model + delta_model`
+
+## 19. 一个完整样本从上到下怎么走
+
+下面用单个样本来描述完整链路。
+
+1. 原始表中的一段连续历史值和未来目标值被 `SlidingDataset` 切出来
+2. `history_value` 和 `target_value` 被转成 `history_z`、`targets_z`
+3. `history_z` 进入 `Base Backbone`，得到 `base_pred_z`
+4. 同一条历史序列被切成 `ts_patches`
+5. 与该目标时间相邻的新闻被检索、筛选、重排、精炼
+6. 新闻被转换成：
+   - `structured_feats`
+   - 可选 `temporal_text_ids/attn/step_mask`
+7. 这些信息进入 `TinyNewsTSRegressor`
+8. 模型根据当前 `residual_arch` 输出一个残差 `delta_pred`
+9. 若启用了外部 `SignNet`，则由它重写或补充方向信息
+10. `_fuse_base_and_delta` 把 `base_pred_z` 和 `delta_pred` 合成为 `final_pred_z`
+11. 验证/测试时再从 z-space 还原到 raw scale，计算 `MSE/MAE/skill score`
+
+## 20. 最容易混淆的几个点
+
+### 20.1 prompt 不是当前主模型输入
+
+尽管系统仍然保留 prompt 构造代码，但当前 DELTA 主训练并不依赖 prompt token。
+
+### 20.2 `delta_sign_mode` 不是所有架构都生效
+
+- 对 `current`：有真实作用
+- 对 `unified/simple_concat/base_only_delta`：基本只是兼容旧实验命名
+
+### 20.3 当前默认残差主干已经是 `unified`
+
+这意味着默认残差分解逻辑更接近：
+
+- 方向
+- 幅度
+- 置信度
+
+而不是旧的“单独 SignNet + magnitude”路线。
+
+## 21. 推荐把框架记成这三层
+
+如果只想抓住最核心逻辑，可以把它记成三层：
+
+### 第 1 层：基础预测层
+
+- `Base Backbone`
+- 输入 `history_z`
+- 输出 `base_pred_z`
+
+### 第 2 层：新闻理解层
+
+- `build_delta_batch_inputs`
+- `TemporalTextTower`
 - `structured_feats`
 
-当前版本里，SignNet 已经不再接新闻数量，也不会直接接新闻 token 序列；
-但如果开启 `delta_temporal_text_enable`，它会通过共享 `TemporalTextTower` 间接接收到一个 pooled `text_summary`。
+作用是把新闻变成模型可以消费的数值表示。
 
-### SignNet 当前到底学的是什么标签
+### 第 3 层：残差决策层
 
-这件事要分 `additive` 和 `relative` 两种模式看：
+- `TinyNewsTSRegressor`
+- 可选 `UnifiedResidualTrunk`
+- 可选 `ResidualSignNet`
 
-- `additive` 模式下：
-  如果 `cleaned_residual_enable=0`，SignNet 学的是 raw residual 的正负
-  如果 `cleaned_residual_enable=1`，SignNet 学的是 cleaned residual 的正负
+作用是回答：
 
-- `relative` 模式下：
-  SignNet 学的不是二分类正负，而是 3 类状态标签：
-  `shrink / neutral / amplify`
-  如果 `cleaned_residual_enable=1`，当前只会先对 `q_target` 做 horizon 平滑，再据此构造状态标签，不再把结构化模板直接混进 relative 标签里
+- 要不要改
+- 往哪个方向改
+- 改多少
+- 这次改动有多可信
 
-这里的 cleaned residual 当前不是一个额外模型输出，而是一个启发式构造的监督目标：
+---
 
-- 先对 raw residual 做 horizon 上的 EWMA 平滑
-- 再按结构化新闻特征生成一个模板
-- 最后把两者混合
+如果后续框架继续演化，建议优先更新以下 4 处文档内容：
 
-所以它更像“平滑后的方向标签”，而不是新的 ground truth
-
-### `val_valid` 的含义
-
-SignNet 日志里会看到 `val_valid`。
-
-它不是准确率，而是：
-
-- 在验证集里，真实残差绝对值大于 `delta_sign_eps` 的位置占比
-
-只有这些“符号真的有意义”的位置，才会参与符号监督和评估。
-
-## DELTA 在当前版本里怎么工作
-
-DELTA 的目标不是重新做一次完整预测，而是学习：
-
-- Base 还剩下多少误差
-- 误差方向是什么
-- 哪些新闻值得起作用
-- 修正幅度应该多大
-
-但需要特别注意当前版本的训练事实：
-
-- DELTA 模型前向仍然会输出 `sign / magnitude / pred`
-- `additive` 模式下，当前参与反向传播的核心就是 `loss_final`
-- `relative` 模式下，还会额外加 `loss_relative_mag`
-- 如果这时 `delta_sign_mode=internal`，还会再加 `state_ce`
-- 所以 `sign / magnitude / state` 既是模型结构，也是 relative 路径里的显式监督对象；只是旧版那套更复杂的辅损已经去掉了
-
-### 当前 DELTA 可以接的新闻分支
-
-当前 DELTA 的新闻侧输入默认是结构化新闻特征：
-
-- `structured_feats`
-  由 `structured_events` 数值化后得到的固定维度向量
-
-如果开启 `delta_temporal_text_enable`，还会额外接一条时间对齐文本辅助分支：
-
-- `temporal_text_ids / temporal_text_attn / temporal_text_step_mask`
-  这是按每个 history step 对齐后的新闻文本序列
-  它的真实路径是：
-  当前样本已选新闻 -> 按 `delta_temporal_text_source` 取 `raw` 或 `refined` 文本 -> 每个 history step 只保留当时已发生新闻 -> `(B, L, T)` token 序列 -> `TemporalTextTower` 编码 -> patch 聚合 -> gated fusion 回 `ts_feat`
-
-也就是说，当前版本已经不再把“整段 merged refined news / prompt token”直接送进 DELTA 主干；文本只会在 temporal-text 这条按时间步对齐的辅助支路里进入模型。
-
-### 当前 DELTA 和 prompt 的关系
-
-当前 tiny-news + two-stage 这条主路径里，DELTA 不是靠 prompt token 直接做预测的。
-
-也就是说，当前真正进入 DELTA `forward()` 的，是：
-
-- 时间序列 patch 和 patch mask
-- structured features
-- 可选的 temporal text auxiliary sequence
-
-而：
-
-- `base_pred_z` 不直接进入 DELTA `forward()`，它是在模型外用于构造残差目标和最终融合
-- 外部 `SignNet` 信号也不直接进入 DELTA `forward()`，而是在 DELTA 先产出 magnitude / ratio 后再参与符号或状态组合
-- prompt token 本身不会直接进入当前这条 DELTA 主路径
-
-### 最终预测形式
-
-当前主逻辑要分两种模式看：
-
-- `additive`
-  `final_pred = base_pred + delta_corr`
-
-- `relative`
-  先构造相对残差百分比 `q_hat`
-  再做：
-  `scale_raw = max(abs(base_pred_raw), floor_or_eps)`
-  `final_pred_raw = base_pred_raw + q_hat * scale_raw`
-
-也就是：
-
-- Base 负责主预测
-- DELTA 负责残差修正
-- 在 `relative` 下，DELTA 修正的是“按百分比放大/缩小 Base”
-
-## 日志应该怎么读
-
-当前日志里最重要的标签大致如下：
-
-- `[CONFIG] Parameters`
-  当前运行的参数表
-
-- `[CONFIG] Cache Decision`
-  cache 的路径、模式、来源、是否显式指定、是否检测到 API key
-
-- `[DATA_RANGE]`
-  train/val/test 原始 split 的真实时间范围
-
-- `[NEWS_DATA]`
-  新闻总量和时间范围
-
-- `[MECH]`
-  当前有哪些机制真的开启了，比如 structured、external signnet 这些真实仍在工作的机制
-
-- `[BASE]`
-  Base 阶段训练与验证
-
-- `[SIGNNET]`
-  SignNet 预训练、验证、校准
-
-- `[DELTA]`
-  DELTA 阶段训练、验证、测试
-
-- `[TEST][FINAL]`
-  最终测试结果与输出写盘
-
-## 主要脚本如何理解
-
-当前仓库里比较关键的脚本例子包括：
-
-- `scripts/nswelecLOAD_2024_tinynews.sh`
-  NSW 电力负荷任务
-
-- `scripts/nswelecPRICE_2024_tinynews.sh`
-  NSW 电价任务
-
-- `scripts/NAS_14ticker_22_23_combine.sh`
-  NASDAQ 多 ticker 组合数据集任务
-
-这些脚本的主要作用是：
-
-- 指定数据集路径
-- 指定新闻数据路径
-- 指定 Base/DELTA/SignNet 超参数
-- 在启动前决定 refined news cache 应该读哪个文件
-
-## 当前版本最重要的几个注意事项
-
-### 1. 多序列数据必须传 `id_col`
-
-如果一个 CSV 里同时包含多条时间序列，例如多个 ticker，共享同一个 `date` 列，那么一定要传 `id_col`。
-
-否则：
-
-- 样本窗口会切错
-- `val/test` 历史前缀会补错
-- 验证集甚至可能变成空的
-
-### 2. 输入 split 本身应该已经是按时间顺序排好的
-
-当前 `SlidingDataset` 不会替你强制把每个 group 再排序一遍。
-
-所以：
-
-- train/val/test CSV 最好在进入框架前就已经按时间升序排好
-
-### 3. 当前 cache 匹配已经非常严格
-
-当前 cache 读取按 `title + date + url` 匹配。
-
-因此：
-
-- 旧 cache 如果是按旧规则生成的，可能会出现 coverage 不完整
-- 这不是读取 bug，而是旧 cache 本身和当前 identity 规则不一致
-
-### 4. read_only 模式不会再偷偷补 cache
-
-现在 read-only 的原则就是：
-
-- 只读
-- 不补
-- 缺条目就跳过
-
-## 最容易记住的心智模型
-
-如果只记一个最简单的理解方式，可以把当前框架想成三个协作模块：
-
-- `Base`
-  负责回答“正常情况下，只看历史会怎样”
-
-- `SignNet`
-  负责回答“这次残差方向更像往上还是往下”
-
-- `DELTA`
-  负责回答“该不该修、修多少、修正后最终值是多少”
-
-而新闻在当前版本里的主要作用，是先被 refine 和结构化，再以 `structured_feats` 这种数值化形式去帮助 DELTA 和 SignNet 解释 Base 没看出来的那部分误差；如果开启 `delta_temporal_text_enable`，还会再生成一条按历史时间步对齐的文本辅助支路。
-
-- 在默认 `summary_gated` 架构下，这条支路主要给 DELTA 提供 patch-level gated fusion，并给外部 SignNet 提供 pooled `text_summary`
-- 在 `plan_c_mvp` 架构下，这条支路仍然先压成 `text_summary + text_strength`，再和结构化新闻、时间序列统计一起参与 DELTA 与外部 SignNet 的 regime routing / expert mixture
-
-## 用最通俗的话总结
-
-当前框架不是“新闻模型替代时间序列模型”，而是：
-
-- 先让时间序列模型给出主判断
-- 再让新闻去解释偏差
-- 最后做一个受控的残差修正
-
-这是当前代码真正实现的工作方式。
+1. `residual_arch` 分支行为
+2. `build_delta_batch_inputs` 的返回项
+3. `evaluate_metrics_residual` 的诊断字段
+4. prompt 是否重新进入主训练图

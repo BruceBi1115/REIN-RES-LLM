@@ -509,7 +509,7 @@ def extract_structured_events(
     use_mode = str(mode or "off").lower().strip()
     txt = str(raw_or_refined_news or "").strip()
     if not txt:
-        return {}
+        return ValueError("Input news text is empty for structured event extraction.")
 
     if use_mode == "api" and api_adapter is not None and hasattr(api_adapter, "extract_events"):
         try:
@@ -518,39 +518,39 @@ def extract_structured_events(
                 return out
         except Exception:
             pass
+    elif use_mode == "heuristic":
 
-    if use_mode != "heuristic":
-        return {}
+        lo = txt.lower()
+        pos_kw = ["rise", "up", "increase", "higher", "strong", "growth", "surge"]
+        neg_kw = ["fall", "down", "decrease", "lower", "weak", "drop", "decline"]
 
-    lo = txt.lower()
-    pos_kw = ["rise", "up", "increase", "higher", "strong", "growth", "surge"]
-    neg_kw = ["fall", "down", "decrease", "lower", "weak", "drop", "decline"]
+        pos = sum(lo.count(k) for k in pos_kw)
+        neg = sum(lo.count(k) for k in neg_kw)
+        direction = 1 if pos > neg else (-1 if neg > pos else 0)
+        strength = min(1.0, abs(pos - neg) / 6.0)
+        relevance = min(1.0, max(pos + neg, 1) / 8.0)
+        confidence = min(1.0, 0.4 + 0.6 * strength)
+        persistence = 0.5
 
-    pos = sum(lo.count(k) for k in pos_kw)
-    neg = sum(lo.count(k) for k in neg_kw)
-    direction = 1 if pos > neg else (-1 if neg > pos else 0)
-    strength = min(1.0, abs(pos - neg) / 6.0)
-    relevance = min(1.0, max(pos + neg, 1) / 8.0)
-    confidence = min(1.0, 0.4 + 0.6 * strength)
-    persistence = 0.5
+        if any(k in lo for k in ["policy", "government", "regulation"]):
+            event_type = "policy"
+        elif any(k in lo for k in ["weather", "storm", "temperature", "rain", "heat"]):
+            event_type = "weather"
+        elif any(k in lo for k in ["gas", "coal", "oil", "fuel"]):
+            event_type = "fuel"
+        else:
+            event_type = "general"
 
-    if any(k in lo for k in ["policy", "government", "regulation"]):
-        event_type = "policy"
-    elif any(k in lo for k in ["weather", "storm", "temperature", "rain", "heat"]):
-        event_type = "weather"
-    elif any(k in lo for k in ["gas", "coal", "oil", "fuel"]):
-        event_type = "fuel"
+        return {
+            "relevance": float(relevance),
+            "direction": int(direction),
+            "strength": float(strength),
+            "persistence": float(persistence),
+            "confidence": float(confidence),
+            "event_type": event_type,
+        }
     else:
-        event_type = "general"
-
-    return {
-        "relevance": float(relevance),
-        "direction": int(direction),
-        "strength": float(strength),
-        "persistence": float(persistence),
-        "confidence": float(confidence),
-        "event_type": event_type,
-    }
+        return ValueError(f"Invalid mode for structured event extraction: {mode}")
 
 
 def merge_structured_events(events_list: list[dict] | None) -> dict:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 
 def _match_horizon_shape(values: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -52,19 +53,53 @@ def _build_news_usefulness_weights(
 def _resolve_delta_residual_mode(args) -> str:
     mode = str(getattr(args, "delta_residual_mode", "additive")).lower().strip()
     if mode not in {"additive", "relative"}:
-        mode = "additive"
+        raise ValueError(f"Unsupported delta_residual_mode={mode!r}. Supported modes are 'additive' and 'relative'.")
     return mode
 
 def _resolve_delta_sign_mode(args) -> str:
     mode = str(getattr(args, "delta_sign_mode", "signnet_binary") or "signnet_binary").lower().strip()
-    if mode not in {"signnet_binary", "internal"}:
+    if mode not in {"signnet_binary", "internal", "none"}:
         raise ValueError(
-            f"Unsupported delta_sign_mode={mode!r}. This framework now supports only 'signnet_binary' and 'internal'."
+            f"Unsupported delta_sign_mode={mode!r}. This framework now supports 'signnet_binary', 'internal', and 'none'."
         )
     return mode
 
+def _resolve_residual_arch(args) -> str:
+    arch = str(getattr(args, "residual_arch", "current") or "current").lower().strip()
+    if arch not in {"current", "unified", "simple_concat", "base_only_delta"}:
+        arch = "current"
+    return arch
+
 def _use_external_signnet(args) -> bool:
-    return _resolve_delta_sign_mode(args) == "signnet_binary"
+    return _resolve_delta_sign_mode(args) == "signnet_binary" and _resolve_residual_arch(args) == "current"
+
+def _build_soft_sign_targets(delta_target_z: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    t = max(1e-6, float(temperature))
+    return torch.sigmoid(delta_target_z.to(torch.float32) / t)
+
+def _build_windowed_sign_targets(delta_target_z: torch.Tensor, window_size: int = 8) -> torch.Tensor:
+    q = delta_target_z.to(torch.float32)
+    if q.ndim != 2:
+        q = q.reshape(q.size(0), -1)
+    win = int(max(1, window_size))
+    pad = win // 2
+    smoothed = F.avg_pool1d(q.unsqueeze(1), kernel_size=win, stride=1, padding=pad).squeeze(1)
+    if smoothed.size(1) > q.size(1):
+        smoothed = smoothed[:, : q.size(1)]
+    elif smoothed.size(1) < q.size(1):
+        extra = q.size(1) - smoothed.size(1)
+        smoothed = torch.cat([smoothed, smoothed[:, -1:].expand(-1, extra)], dim=1)
+    return (smoothed > 0).to(torch.float32)
+
+def _build_consistency_loss(
+    direction_score: torch.Tensor,
+    magnitude: torch.Tensor,
+    confidence: torch.Tensor,
+    delta_target: torch.Tensor,
+) -> torch.Tensor:
+    pred = direction_score.to(torch.float32) * magnitude.to(torch.float32)
+    error = (pred - delta_target.to(torch.float32)).abs()
+    return (confidence.to(torch.float32) * error).mean()
 
 def _z_to_raw_tensor(x_z: torch.Tensor, mu_global: float, sigma_global: float) -> torch.Tensor:
     return x_z.to(torch.float32) * float(sigma_global) + float(mu_global)
@@ -366,18 +401,22 @@ def _select_metric(loss_v: float, mse_v: float, mae_v: float, select_metric: str
         return float(mse_v)
     return float(mae_v)
 
-def _build_delta_optimizer(delta_model, args):
+def _build_delta_optimizer(delta_model, args, *, steps_per_epoch: int | None = None):
     base_lr = float(args.lr)
     wd = float(args.weight_decay)
 
     head_scale = float(getattr(args, "delta_head_lr_scale", 1.0))
     other_scale = float(getattr(args, "delta_other_lr_scale", 1.0))
+    encoder_scale = 0.01
 
-    head_params, other_params = [], []
+    head_params, other_params, encoder_params = [], [], []
     for name, p in delta_model.named_parameters():
         if not p.requires_grad:
             continue
         lname = name.lower()
+        if "temporal_text_tower.encoder" in lname:
+            encoder_params.append(p)
+            continue
         if (
             lname.startswith("delta_head")
             or lname.startswith("delta_fuse")
@@ -388,11 +427,15 @@ def _build_delta_optimizer(delta_model, args):
             or lname.startswith("text_mag_head")
             or lname.startswith("route_mag_head")
             or lname.startswith("confidence_head")
+            or lname.startswith("direct_residual_head")
+            or lname.startswith("simple_delta_head")
+            or lname.startswith("unified_trunk")
             or lname.startswith("text_summary_ln")
             or lname.startswith("route_summary_ln")
             or lname.startswith("regime_router")
             or lname.startswith("regime_experts")
             or lname.startswith("temporal_text_gate")
+            or lname.startswith("text_cross_attn")
         ):
             head_params.append(p)
         else:
@@ -403,17 +446,27 @@ def _build_delta_optimizer(delta_model, args):
         param_groups.append({"params": head_params, "lr": base_lr * head_scale, "weight_decay": wd})
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr * other_scale, "weight_decay": wd})
+    if encoder_params:
+        param_groups.append({"params": encoder_params, "lr": base_lr * encoder_scale, "weight_decay": wd})
 
     if not param_groups:
         raise ValueError("No trainable parameters found for DELTA optimizer.")
 
     optimizer = AdamW(param_groups)
+    warmup_steps = 0
+    if steps_per_epoch is not None:
+        warmup_epochs = int(max(0, getattr(args, "delta_warmup_epochs", 2)))
+        grad_accum = int(max(1, getattr(args, "grad_accum", 1)))
+        warmup_steps = int(math.ceil((max(0, warmup_epochs) * max(1, steps_per_epoch)) / grad_accum))
     lr_info = {
         "base_lr": base_lr,
         "head_lr": base_lr * head_scale if head_params else 0.0,
         "other_lr": base_lr * other_scale if other_params else 0.0,
+        "encoder_lr": base_lr * encoder_scale if encoder_params else 0.0,
         "n_head": len(head_params),
         "n_other": len(other_params),
+        "n_encoder": len(encoder_params),
+        "warmup_steps": int(max(0, warmup_steps)),
     }
     return optimizer, lr_info
 
@@ -428,5 +481,27 @@ def _log_last_residual_eval_diag(args, live_logger, tag: str):
         f"{tag} {acc_key}={float(diag.get(acc_key, 0.0)):.4f} "
         f"pred_mag={float(diag.get('pred_mag_mean', 0.0)):.4f} "
         f"true_|res|={float(diag.get('true_abs_residual_mean', 0.0)):.4f} "
-        f"|delta|={float(diag.get('delta_abs_mean', 0.0)):.4f}"
+        f"|delta|={float(diag.get('delta_abs_mean', 0.0)):.4f} "
+        f"skill_mse={float(diag.get('skill_score_mse', 0.0)):.4f} "
+        f"skill_mae={float(diag.get('skill_score_mae', 0.0)):.4f} "
+        f"helped={float(diag.get('delta_helped_rate', 0.0)):.4f} "
+        f"dir_acc={float(diag.get('direction_acc', 0.0)):.4f} "
+        f"conf={float(diag.get('mean_confidence', 0.0)):.4f}"
     )
+    for slice_name, payload in (diag.get("news_slices", {}) or {}).items():
+        live_logger.info(
+            f"{tag} [{slice_name}] n={int(payload.get('n', 0))} "
+            f"base_mae={float(payload.get('base_mae', 0.0)):.4f} "
+            f"final_mae={float(payload.get('final_mae', 0.0)):.4f}"
+        )
+    for slice_name, payload in (diag.get("event_slices", {}) or {}).items():
+        live_logger.info(
+            f"{tag} [{slice_name}] n={int(payload.get('n', 0))} "
+            f"base_mae={float(payload.get('base_mae', 0.0)):.4f} "
+            f"final_mae={float(payload.get('final_mae', 0.0)):.4f}"
+        )
+    for route_name, payload in (diag.get("route_summary", {}) or {}).items():
+        live_logger.info(
+            f"{tag} [route={route_name}] n={int(payload.get('count', 0))} "
+            f"final_mae={float(payload.get('final_mae', 0.0)):.4f}"
+        )

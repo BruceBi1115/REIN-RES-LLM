@@ -1,9 +1,6 @@
 from __future__ import annotations
-
-import math
 import os
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +16,8 @@ from ..delta.core import (
     _build_delta_residual_position_weights,
     _build_news_usefulness_weights,
     _build_relative_state_targets,
+    _build_soft_sign_targets,
+    _build_windowed_sign_targets,
     _match_horizon_shape,
     _masked_binary_accuracy_from_logits,
     _masked_binary_balanced_accuracy_from_logits,
@@ -27,6 +26,7 @@ from ..delta.core import (
     _masked_multiclass_macro_balanced_accuracy_from_logits,
     _masked_weighted_mean,
     _relative_state_score_from_logits,
+    _resolve_residual_arch,
     _resolve_delta_residual_mode,
     _use_external_signnet,
 )
@@ -45,6 +45,30 @@ def _derive_has_news_from_structured_feats(structured_feats: torch.Tensor) -> to
 
 def _signnet_task_type(args) -> str:
     return "relative_state" if _resolve_delta_residual_mode(args) == "relative" else "binary_sign"
+
+
+def _build_sign_label_pack(delta_target: torch.Tensor, args) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cleaned = delta_target.to(torch.float32)
+    sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
+    mode = str(getattr(args, "sign_label_mode", "hard") or "hard").lower().strip()
+    if mode == "soft":
+        loss_target = _build_soft_sign_targets(
+            cleaned,
+            temperature=float(getattr(args, "sign_soft_temperature", 1.0)),
+        )
+        hard_target = (cleaned > 0).to(torch.float32)
+        valid_mask = (cleaned.abs() > sign_eps).to(torch.float32)
+        return loss_target, hard_target, valid_mask
+    if mode == "windowed":
+        smoothed = _build_windowed_sign_targets(
+            cleaned,
+            window_size=int(getattr(args, "sign_window_size", 8)),
+        )
+        valid_mask = torch.ones_like(smoothed, dtype=torch.float32)
+        return smoothed, smoothed, valid_mask
+    hard_target = (cleaned > 0).to(torch.float32)
+    valid_mask = (cleaned.abs() > sign_eps).to(torch.float32)
+    return hard_target, hard_target, valid_mask
 
 
 def _encode_text_pack_from_tower(
@@ -256,9 +280,7 @@ def _evaluate_external_signnet(
                 args=args,
             )
             abs_residual = cleaned_residual_target.abs()
-            sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
-            valid_mask = (abs_residual > sign_eps).to(torch.float32)
-            sign_target_bin = (cleaned_residual_target > 0).to(torch.float32)
+            sign_target_loss, sign_target_bin, valid_mask = _build_sign_label_pack(cleaned_residual_target, args)
 
         has_news = _derive_has_news_from_structured_feats(structured_feats)
         if use_news_weighting:
@@ -295,7 +317,7 @@ def _evaluate_external_signnet(
                 )
             sign_bce = F.binary_cross_entropy_with_logits(
                 sign_logits,
-                sign_target_bin,
+                sign_target_loss,
                 **bce_kwargs,
             )
             loss = _masked_weighted_mean(sign_bce, sample_pos_weight, mask=valid_mask)
@@ -597,9 +619,7 @@ def _train_external_signnet(
                     args=args,
                 )
                 abs_residual = cleaned_residual_target.abs()
-                sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
-                valid_mask = (abs_residual > sign_eps).to(torch.float32)
-                sign_target_bin = (cleaned_residual_target > 0).to(torch.float32)
+                sign_target_loss, sign_target_bin, valid_mask = _build_sign_label_pack(cleaned_residual_target, args)
 
             has_news = _derive_has_news_from_structured_feats(structured_feats)
             if use_news_weighting:
@@ -636,7 +656,7 @@ def _train_external_signnet(
                     )
                 sign_bce = F.binary_cross_entropy_with_logits(
                     sign_logits,
-                    sign_target_bin,
+                    sign_target_loss,
                     **bce_kwargs,
                 )
                 loss = _masked_weighted_mean(sign_bce, sample_pos_weight, mask=valid_mask)
@@ -836,7 +856,18 @@ def _train_external_signnet(
             f"[SIGNNET][TEST] loss={test_loss:.6f} "
             f"{'state_acc' if relative_mode else 'acc'}={test_acc:.4f} "
             f"{'state_bacc' if relative_mode else 'bacc'}={test_bacc:.4f} valid={test_valid:.4f} "
-            f"bias={bias_now:.6f} "
-            f"ckpt={signnet_ckpt_path}"
+                f"bias={bias_now:.6f} "
+                f"ckpt={signnet_ckpt_path}"
         )
+    setattr(
+        args,
+        "_last_signnet_metrics",
+        {
+            "test_acc": float(test_acc),
+            "test_bacc": float(test_bacc),
+            "test_valid": float(test_valid),
+            "task_type": str(signnet_task_type),
+            "residual_arch": _resolve_residual_arch(args),
+        },
+    )
     return signnet

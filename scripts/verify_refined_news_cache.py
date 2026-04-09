@@ -2,45 +2,27 @@
 import argparse
 import json
 import re
-from datetime import datetime
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.news_datetime import normalize_news_datetime, parse_news_datetime
 
 
 def normalize_title(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip()).casefold()
 
 
-def parse_dt(raw: str) -> datetime | None:
-    s = str(raw or "").strip()
-    if not s:
-        return None
-    iso_candidate = s.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(iso_candidate)
-        return dt.replace(tzinfo=None)
-    except Exception:
-        pass
-
-    fmts = [
-        "%d-%m-%Y %I:%M:%S %p",
-        "%d/%m/%Y %I:%M:%S %p",
-        "%d-%m-%Y %H:%M:%S",
-        "%d/%m/%Y %H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-    ]
-    for fmt in fmts:
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            continue
-    return None
+def parse_dt(raw: str):
+    dt = parse_news_datetime(raw, dayfirst=True)
+    return dt
 
 
 def normalize_dt(raw: str) -> str:
-    dt = parse_dt(raw)
-    return dt.isoformat() if dt is not None else ""
+    return normalize_news_datetime(raw, dayfirst=True, floor="s")
 
 
 def normalize_url(raw: str) -> str:
@@ -66,6 +48,10 @@ def load_json_array(path: Path) -> list[dict]:
     if not isinstance(obj, list):
         raise TypeError(f"{path} is not a JSON array.")
     return [x for x in obj if isinstance(x, dict)]
+
+
+def save_json_array(path: Path, items: list[dict]) -> None:
+    path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def collect_identities(
@@ -105,12 +91,30 @@ def is_chronological(cache_items: list[dict]) -> tuple[bool, tuple[int, str, str
     return True, None
 
 
+def sort_cache_items(cache_items: list[dict]) -> list[dict]:
+    indexed = list(enumerate(cache_items))
+    indexed.sort(
+        key=lambda item: (
+            normalize_dt(str(item[1].get("date", "") or "").strip()),
+            normalize_title(item[1].get("title", "")),
+            normalize_url(item[1].get("url", "")),
+            item[0],
+        )
+    )
+    return [dict(rec) for _, rec in indexed]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify refined news cache identity coverage and ordering.")
     parser.add_argument("--news", required=True, help="path to the source news JSON array")
     parser.add_argument("--cache", required=True, help="path to the unified refined news cache JSON array")
     parser.add_argument("--expect-count", type=int, default=-1, help="optional expected row count for both files")
     parser.add_argument("--allow-missing", action="store_true", help="do not fail if the cache misses some source news identities")
+    parser.add_argument(
+        "--no-auto-sort",
+        action="store_true",
+        help="fail instead of rewriting the cache file when records are not sorted from early to late",
+    )
     args = parser.parse_args()
 
     news_path = Path(args.news)
@@ -122,8 +126,14 @@ def main() -> int:
         raise AssertionError(f"Unexpected news row count: {len(news_items)} != {args.expect_count}")
 
     news_identities, news_duplicate_count = collect_identities(news_items, label="source_news")
-    cache_identities, cache_duplicate_count = collect_identities(cache_items, label="cache_records")
+    chronological_before, bad_pair_before = is_chronological(cache_items)
+    cache_auto_sorted = 0
+    if (not chronological_before) and (not args.no_auto_sort):
+        cache_items = sort_cache_items(cache_items)
+        save_json_array(cache_path, cache_items)
+        cache_auto_sorted = 1
 
+    cache_identities, cache_duplicate_count = collect_identities(cache_items, label="cache_records")
     missing = [key for key in news_identities if key not in cache_identities]
     chronological, bad_pair = is_chronological(cache_items)
     print(f"news_rows={len(news_items)}")
@@ -132,7 +142,11 @@ def main() -> int:
     print(f"missing_identities={len(missing)}")
     print(f"source_duplicate_identities={news_duplicate_count}")
     print(f"cache_duplicate_identities={cache_duplicate_count}")
+    print(f"cache_auto_sorted={cache_auto_sorted}")
     print(f"cache_chronological={int(chronological)}")
+    if bad_pair_before is not None:
+        idx, prev_date, cur_date = bad_pair_before
+        print(f"first_descending_pair_index_before={idx} prev={prev_date!r} cur={cur_date!r}")
     if missing:
         title_key, date_key, url_key = missing[0]
         print(
