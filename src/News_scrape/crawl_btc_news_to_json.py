@@ -128,6 +128,7 @@ def canonicalize_url(url: str) -> str:
 
 
 def is_cryptopanic_url(url: str) -> bool:
+    return True
     return "cryptopanic.com" in urlparse(canonicalize_url(url)).netloc.lower()
 
 
@@ -137,6 +138,8 @@ def fetch_soup(session: requests.Session, url: str, timeout: float) -> tuple[Bea
     response = session.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
     response.raise_for_status()
     response.encoding = response.apparent_encoding or "utf-8"
+    # print(response.text)
+    # print(response.url)
     return BeautifulSoup(response.text, "html.parser"), response.url
 
 
@@ -219,7 +222,9 @@ def extract_article_text(soup: BeautifulSoup) -> str:
 
 def extract_cryptopanic_detail(soup: BeautifulSoup) -> dict[str, str]:
     content = ""
-    description_node = soup.find(class_="description-body")
+    # print(soup)
+    description_node =soup.find(class_="detail_panel")
+    print("[des_node]", description_node)
     if description_node is not None:
         content = clean_text(description_node.get_text(" ", strip=True))
 
@@ -266,14 +271,33 @@ def build_record_from_cryptopanic(
     soup: BeautifulSoup,
     final_url: str,
 ) -> tuple[dict[str, str] | None, dict[str, str] | None]:
-    detail = extract_cryptopanic_detail(soup)
+    
+    from playwright.sync_api import sync_playwright
+    list_url = final_url
+    detail = None
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        page.goto(list_url, wait_until="networkidle", timeout=30000)
+        page.locator("a.news-cell.nc-title").first.click()
+        page.wait_for_selector("#detail_pane .description-body", timeout=10000)
+
+        text = page.locator("#detail_pane .description-body").inner_text()
+        print(text)
+        detail = text
+
+        browser.close()
+
+    # detail = extract_cryptopanic_detail(soup)
+    print("[detail] ",detail)
     content = clean_text(detail.get("content", ""))
     if not content:
         return None, {"url": final_url, "reason": "cryptopanic_description_not_found"}
 
     record = {
-        "title": title or clean_text(detail.get("title", "")),
-        "date": date or normalize_datetime(detail.get("date", "")),
+        "title": title ,
+        "date": date,
         "content": content,
         "url": final_url,
     }
@@ -354,16 +378,18 @@ def build_record(
     title = clean_text(row.get("title", ""))
     date = normalize_datetime(row.get("newsDatetime", ""))
     csv_url = row.get("url", "")
-    source_domain = row.get("sourceDomain", "")
+    # source_domain = "cryptopanic.com"
     cryptopanic_candidates = [csv_url]
 
-    resolved_url, resolve_error = resolve_article_url(
-        session=session,
-        csv_url=csv_url,
-        source_domain=source_domain,
-        timeout=timeout,
-    )
+    # resolved_url, resolve_error = resolve_article_url(
+    #     session=session,
+    #     csv_url=csv_url,
+    #     source_domain=source_domain,
+    #     timeout=timeout,
+    # )
+    resolved_url=csv_url
     if resolved_url is None:
+        print(1)
         fallback_record, fallback_failure = build_record_from_cryptopanic_url(
             title=title,
             date=date,
@@ -373,11 +399,12 @@ def build_record(
         )
         if fallback_record is not None:
             return fallback_record, None
-        return None, fallback_failure or {"url": csv_url, "reason": resolve_error or "resolve_failed"}
+        return None, fallback_failure or {"url": csv_url, "reason": "xxxx" or "resolve_failed"}
 
     try:
         soup, final_url = fetch_soup(session, resolved_url, timeout)
     except Exception as exc:
+        print(11)
         fallback_record, fallback_failure = build_record_from_cryptopanic_url(
             title=title,
             date=date,
@@ -390,6 +417,7 @@ def build_record(
         return None, fallback_failure or {"url": resolved_url, "reason": f"fetch_failed:{exc}"}
 
     if is_cryptopanic_url(final_url):
+        print(111)
         cryptopanic_record, cryptopanic_failure = build_record_from_cryptopanic(
             title=title,
             date=date,
@@ -402,6 +430,7 @@ def build_record(
 
     content = extract_article_text(soup)
     if not content:
+        print(1111)
         fallback_record, fallback_failure = build_record_from_cryptopanic_url(
             title=title,
             date=date,
@@ -493,6 +522,7 @@ def main() -> None:
         f"{FIXED_START_DT.strftime('%Y-%m-%d %H:%M:%S')} -> {FIXED_END_DT.strftime('%Y-%m-%d %H:%M:%S')}"
     )
     for idx, row in enumerate(rows, start=1):
+        # print(row)
         try:
             record, failure = build_record(
                 row=row,

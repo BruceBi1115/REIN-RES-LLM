@@ -21,6 +21,7 @@ from ..delta.core import (
     _match_horizon_shape,
     _masked_binary_accuracy_from_logits,
     _masked_binary_balanced_accuracy_from_logits,
+    _masked_multiclass_inverse_freq_weights,
     _masked_binary_pos_weight,
     _masked_multiclass_accuracy_from_logits,
     _masked_multiclass_macro_balanced_accuracy_from_logits,
@@ -266,8 +267,9 @@ def _evaluate_external_signnet(
         )
         if relative_mode:
             abs_residual = raw_residual_target.abs()
-            valid_mask = torch.ones_like(abs_residual, dtype=torch.float32)
-            non_neutral_mask = (abs_residual > float(getattr(args, "delta_sign_eps", 0.03))).to(torch.float32)
+            sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
+            non_neutral_mask = (abs_residual > sign_eps).to(torch.float32)
+            valid_mask = non_neutral_mask
             state_targets = _build_relative_state_targets(
                 raw_residual_target,
                 args,
@@ -303,7 +305,12 @@ def _evaluate_external_signnet(
                 state_targets.reshape(-1),
                 reduction="none",
             ).reshape_as(state_targets)
-            loss = _masked_weighted_mean(ce, sample_pos_weight, mask=valid_mask)
+            class_weight = _masked_multiclass_inverse_freq_weights(
+                state_targets,
+                valid_mask,
+                num_classes=int(sign_logits.size(-1)),
+            )
+            loss = _masked_weighted_mean(ce, sample_pos_weight * class_weight, mask=valid_mask)
             acc = _masked_multiclass_accuracy_from_logits(sign_logits, state_targets, valid_mask)
             bacc = _masked_multiclass_macro_balanced_accuracy_from_logits(sign_logits, state_targets, valid_mask)
         else:
@@ -478,7 +485,8 @@ def _train_external_signnet(
     min_lr = float(max(0.0, getattr(args, "delta_sign_external_min_lr", 1e-5)))
     calibrate_bias = int(getattr(args, "delta_sign_external_calibrate_bias", 1)) == 1
     bias_clip = float(max(0.0, getattr(args, "delta_sign_external_bias_clip", 2.0)))
-    signnet_news_dropout = int(getattr(args, "delta_sign_external_news_dropout", 0)) == 1
+    signnet_news_dropout_enabled = int(getattr(args, "delta_sign_external_news_dropout", 0)) == 1
+    signnet_news_dropout = float(getattr(args, "news_dropout", 0.0) or 0.0) if signnet_news_dropout_enabled else 0.0
     use_news_weighting = int(getattr(args, "delta_sign_external_use_news_weighting", 0)) == 1
     use_residual_weighting = int(getattr(args, "delta_sign_external_use_residual_weighting", 0)) == 1
     use_pos_weight = int(getattr(args, "delta_sign_external_use_pos_weight", 1)) == 1
@@ -519,7 +527,7 @@ def _train_external_signnet(
             f"dropout={float(max(0.0, getattr(args, 'delta_sign_external_dropout', 0.1))):.3f} "
             f"patience={patience} select_metric={select_metric} min_delta={min_delta:.1e} "
             f"lr_sched_factor={lr_factor:.3f} lr_sched_patience={max(1, lr_patience)} min_lr={min_lr:.3e} "
-            f"news_dropout={int(signnet_news_dropout)} calibrate_bias={int(calibrate_bias)} bias_clip={bias_clip:.3f} "
+            f"news_dropout={signnet_news_dropout:.3f} calibrate_bias={int(calibrate_bias)} bias_clip={bias_clip:.3f} "
             f"use_news_weighting={int(use_news_weighting)} use_residual_weighting={int(use_residual_weighting)} "
             f"use_pos_weight={int(use_pos_weight)} pos_weight_floor={pos_weight_floor:.3f} pos_weight_clip={pos_weight_clip:.3f} "
             f"text_summary_dim={text_summary_dim} "
@@ -606,7 +614,8 @@ def _train_external_signnet(
             )
             if relative_mode:
                 abs_residual = raw_residual_target.abs()
-                valid_mask = torch.ones_like(abs_residual, dtype=torch.float32)
+                sign_eps = float(getattr(args, "delta_sign_eps", 0.03))
+                valid_mask = (abs_residual > sign_eps).to(torch.float32)
                 state_targets = _build_relative_state_targets(
                     raw_residual_target,
                     args,
@@ -642,7 +651,12 @@ def _train_external_signnet(
                     state_targets.reshape(-1),
                     reduction="none",
                 ).reshape_as(state_targets)
-                loss = _masked_weighted_mean(ce, sample_pos_weight, mask=valid_mask)
+                class_weight = _masked_multiclass_inverse_freq_weights(
+                    state_targets,
+                    valid_mask,
+                    num_classes=int(sign_logits.size(-1)),
+                )
+                loss = _masked_weighted_mean(ce, sample_pos_weight * class_weight, mask=valid_mask)
                 acc = _masked_multiclass_accuracy_from_logits(sign_logits, state_targets, valid_mask)
                 bacc = _masked_multiclass_macro_balanced_accuracy_from_logits(sign_logits, state_targets, valid_mask)
             else:
