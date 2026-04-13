@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class DeltaV3Config:
+    dataset_key: str
+    history_len: int
+    horizon: int
+    schema_variant: str
+    regime_bank_path: str
+    regime_bank_build: bool
+    text_encoder_model_id: str
+    text_encoder_max_length: int
+    regime_tau_days: float
+    regime_ema_alpha: float
+    regime_ema_window: int
+    arch: str
+    hidden_size: int
+    num_layers: int
+    num_heads: int
+    patch_len: int
+    patch_stride: int
+    dropout: float
+    use_base_hidden: bool
+    slow_weight: float
+    shape_weight: float
+    spike_weight: float
+    spike_gate_threshold: float
+    spike_k: float
+    spike_target_pct: float
+    spike_gate_loss_weight: float
+    news_blank_prob: float
+    consistency_weight: float
+    counterfactual_weight: float
+    counterfactual_margin: float
+    spike_bias_l2: float
+    active_mass_threshold: float
+    lambda_min: float
+    lambda_ts_cap: float
+    lambda_news_cap: float
+    lambda_max: float
+    shape_gain_cap: float
+    spike_bias_cap: float
+    selection_counterfactual_gain_min: float
+    selection_lambda_saturation_max_pct: float
+    hard_residual_frac: float
+    hard_residual_pct: float
+    pretrain_epochs: int
+    pretrain_lr: float
+    price_winsor_low: float
+    price_winsor_high: float
+    grad_clip: float
+    select_metric: str
+    eval_permutation_seed: int
+
+    @classmethod
+    def from_args(cls, args) -> "DeltaV3Config":
+        dataset_key = str(getattr(args, "dataset_key", "dataset") or "dataset").strip()
+        default_bank_path = os.path.join(
+            "checkpoints",
+            "_shared_refine_cache",
+            "v4",
+            f"regime_bank_{dataset_key}.npz",
+        )
+        return cls(
+            dataset_key=dataset_key,
+            history_len=int(getattr(args, "history_len", 48) or 48),
+            horizon=int(getattr(args, "horizon", 48) or 48),
+            schema_variant=str(getattr(args, "delta_v3_schema_variant", "load") or "load").strip(),
+            regime_bank_path=str(getattr(args, "delta_v3_regime_bank_path", "") or "").strip() or default_bank_path,
+            regime_bank_build=bool(int(getattr(args, "delta_v3_regime_bank_build", 0) or 0)),
+            text_encoder_model_id=str(
+                getattr(args, "delta_v3_text_encoder_model_id", "intfloat/e5-small-v2") or "intfloat/e5-small-v2"
+            ).strip(),
+            text_encoder_max_length=int(getattr(args, "delta_v3_text_encoder_max_length", 256) or 256),
+            regime_tau_days=float(getattr(args, "delta_v3_regime_tau_days", 5.0) or 5.0),
+            regime_ema_alpha=float(getattr(args, "delta_v3_regime_ema_alpha", 0.5) or 0.5),
+            regime_ema_window=int(getattr(args, "delta_v3_regime_ema_window", 5) or 5),
+            arch=str(getattr(args, "delta_v3_arch", "patchtst_regime_modulation") or "patchtst_regime_modulation").strip(),
+            hidden_size=int(getattr(args, "delta_v3_hidden_size", 128) or 128),
+            num_layers=int(getattr(args, "delta_v3_num_layers", 2) or 2),
+            num_heads=int(getattr(args, "delta_v3_num_heads", 4) or 4),
+            patch_len=int(getattr(args, "delta_v3_patch_len", 8) or 8),
+            patch_stride=int(getattr(args, "delta_v3_patch_stride", 4) or 4),
+            dropout=float(getattr(args, "delta_v3_dropout", 0.1) or 0.1),
+            use_base_hidden=bool(int(getattr(args, "delta_v3_use_base_hidden", 1) or 0)),
+            slow_weight=float(getattr(args, "delta_v3_slow_weight", 1.0) or 1.0),
+            shape_weight=float(getattr(args, "delta_v3_shape_weight", 1.0) or 1.0),
+            spike_weight=float(getattr(args, "delta_v3_spike_weight", 1.0) or 1.0),
+            spike_gate_threshold=float(getattr(args, "delta_v3_spike_gate_threshold", 0.8) or 0.8),
+            spike_k=float(getattr(args, "delta_v3_spike_k", 3.0) or 3.0),
+            spike_target_pct=float(getattr(args, "delta_v3_spike_target_pct", 0.10) or 0.10),
+            spike_gate_loss_weight=float(getattr(args, "delta_v3_spike_gate_loss_weight", 0.25) or 0.25),
+            news_blank_prob=float(getattr(args, "delta_v3_news_blank_prob", 0.3) or 0.3),
+            consistency_weight=float(getattr(args, "delta_v3_consistency_weight", 0.05) or 0.05),
+            counterfactual_weight=float(getattr(args, "delta_v3_counterfactual_weight", 0.1) or 0.1),
+            counterfactual_margin=float(getattr(args, "delta_v3_counterfactual_margin", 0.02) or 0.02),
+            spike_bias_l2=float(getattr(args, "delta_v3_spike_bias_l2", 1e-3) or 1e-3),
+            active_mass_threshold=float(getattr(args, "delta_v3_active_mass_threshold", 0.7) or 0.7),
+            lambda_min=float(getattr(args, "delta_v3_lambda_min", 0.05) or 0.05),
+            lambda_ts_cap=float(getattr(args, "delta_v3_lambda_ts_cap", 0.30) or 0.30),
+            lambda_news_cap=float(getattr(args, "delta_v3_lambda_news_cap", 0.12) or 0.12),
+            lambda_max=float(getattr(args, "delta_v3_lambda_max", 0.45) or 0.45),
+            shape_gain_cap=float(getattr(args, "delta_v3_shape_gain_cap", 0.20) or 0.20),
+            spike_bias_cap=float(getattr(args, "delta_v3_spike_bias_cap", 0.75) or 0.75),
+            selection_counterfactual_gain_min=float(
+                getattr(args, "delta_v3_selection_counterfactual_gain_min", 0.01) or 0.01
+            ),
+            selection_lambda_saturation_max_pct=float(
+                getattr(args, "delta_v3_selection_lambda_saturation_max_pct", 0.35) or 0.35
+            ),
+            hard_residual_frac=float(getattr(args, "delta_v3_hard_residual_frac", 0.6) or 0.6),
+            hard_residual_pct=float(getattr(args, "delta_v3_hard_residual_pct", 0.10) or 0.10),
+            pretrain_epochs=int(getattr(args, "delta_v3_pretrain_epochs", 12) or 12),
+            pretrain_lr=float(getattr(args, "delta_v3_pretrain_lr", 1e-3) or 1e-3),
+            price_winsor_low=float(getattr(args, "delta_v3_price_winsor_low", 0.005) or 0.005),
+            price_winsor_high=float(getattr(args, "delta_v3_price_winsor_high", 0.995) or 0.995),
+            grad_clip=float(getattr(args, "delta_v3_grad_clip", 1.0) or 1.0),
+            select_metric=str(getattr(args, "delta_v3_select_metric", "mae") or "mae").strip(),
+            eval_permutation_seed=int(getattr(args, "delta_v3_eval_permutation_seed", 2024) or 2024),
+        )

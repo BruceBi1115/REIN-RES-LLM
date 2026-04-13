@@ -38,10 +38,14 @@ class DLinearBackbone(nn.Module):
         self.linear_trend = nn.Linear(self.history_len, self.horizon)
         self.dropout = nn.Dropout(float(dropout))
 
-    def forward(self, history_z: torch.Tensor) -> torch.Tensor:
+    def forward(self, history_z: torch.Tensor, return_hidden: bool = False):
         seasonal, trend = self.decomp(history_z)
         y = self.linear_seasonal(seasonal) + self.linear_trend(trend)
-        return self.dropout(y)
+        pred = self.dropout(y)
+        if not return_hidden:
+            return pred
+        hidden = torch.cat([seasonal, trend], dim=-1)
+        return pred, hidden
 
 
 class MLPBackbone(nn.Module):
@@ -55,18 +59,21 @@ class MLPBackbone(nn.Module):
         self.history_len = int(history_len)
         self.horizon = int(horizon)
         h = int(hidden_dim)
-        self.net = nn.Sequential(
-            nn.Linear(self.history_len, h),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(h, h),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(h, self.horizon),
-        )
+        p = float(dropout)
+        self.fc1 = nn.Linear(self.history_len, h)
+        self.fc2 = nn.Linear(h, h)
+        self.head = nn.Linear(h, self.horizon)
+        self.dropout = nn.Dropout(p)
 
-    def forward(self, history_z: torch.Tensor) -> torch.Tensor:
-        return self.net(history_z)
+    def forward(self, history_z: torch.Tensor, return_hidden: bool = False):
+        hidden = F.gelu(self.fc1(history_z))
+        hidden = self.dropout(hidden)
+        hidden = F.gelu(self.fc2(hidden))
+        hidden = self.dropout(hidden)
+        pred = self.head(hidden)
+        if not return_hidden:
+            return pred
+        return pred, hidden
 
 
 def build_base_backbone(
@@ -111,11 +118,24 @@ def save_base_backbone_checkpoint(
         "dropout": float(dropout),
     }
     if isinstance(global_zstats, dict):
-        mu = global_zstats.get("mu_global", global_zstats.get("mu", None))
-        sigma = global_zstats.get("sigma_global", global_zstats.get("sigma", None))
-        if mu is not None and sigma is not None:
-            meta["mu_global"] = float(mu)
-            meta["sigma_global"] = max(float(sigma), 1e-6)
+        for key in [
+            "normalization_mode",
+            "center_global",
+            "scale_global",
+            "mu_global",
+            "sigma_global",
+            "quantile_low",
+            "quantile_high",
+            "quantile_low_value",
+            "quantile_high_value",
+        ]:
+            value = global_zstats.get(key, None)
+            if value is None:
+                continue
+            if key == "normalization_mode":
+                meta[key] = str(value)
+            else:
+                meta[key] = float(value)
     with open(os.path.join(ckpt_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 

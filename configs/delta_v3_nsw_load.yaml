@@ -1,0 +1,63 @@
+schema:
+  variant: load
+
+regime_bank:
+  path: checkpoints/_shared_refine_cache/v4/regime_bank_nsw_load.npz
+  build: false
+  tau_days: 5.0
+  ema_alpha: 0.5
+  ema_window: 5
+
+text_encoder:
+  model_id: intfloat/e5-small-v2
+  max_length: 256
+
+model:
+  arch: patchtst_regime_modulation
+  hidden_size: 128
+  num_layers: 2
+  num_heads: 4
+  patch_len: 8
+  patch_stride: 4
+  dropout: 0.1
+  use_base_hidden: true
+
+heads:
+  slow_weight: 1.0
+  shape_weight: 1.0
+  spike_weight: 1.0
+  spike_gate_threshold: 0.8
+  spike_k: 3.0
+  spike_target_pct: 0.10
+  spike_gate_loss_weight: 0.25
+
+training:
+  base_epochs: 40
+  delta_epochs: 30
+  batch_size: 16
+  grad_accum: 4
+  lr: 1.0e-4
+  scheduler: 1
+  news_blank_prob: 0.3
+  consistency_weight: 0.05
+  counterfactual_weight: 0.1
+  counterfactual_margin: 0.02
+  spike_bias_l2: 1.0e-3
+  active_mass_threshold: 0.7
+  lambda_min: 0.05
+  lambda_ts_cap: 0.30
+  lambda_news_cap: 0.12
+  lambda_max: 0.45
+  shape_gain_cap: 0.20
+  spike_bias_cap: 0.75
+  selection_counterfactual_gain_min: 0.01
+  selection_lambda_saturation_max_pct: 0.35
+  hard_residual_frac: 0.6
+  hard_residual_pct: 0.10
+  pretrain_epochs: 12
+  pretrain_lr: 1.0e-3
+  price_winsor_low: 0.005
+  price_winsor_high: 0.995
+  grad_clip: 1.0
+  eval_permutation_seed: 2024
+  select_metric: mae

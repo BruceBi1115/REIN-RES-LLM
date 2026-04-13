@@ -1,29 +1,37 @@
-import random
-import numpy as np
-import torch
-import pandas as pd
-import matplotlib.pyplot as plt
-import os
+from __future__ import annotations
+
 import csv
+import os
+import random
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+
 
 def set_seed(seed: int):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
 
 def device_from_id(gpu_id: int):
     print("torch version:", torch.__version__)
     print("compiled with CUDA:", torch.version.cuda)
     print("cuda.is_available:", torch.cuda.is_available())
     print("cuda device count:", torch.cuda.device_count())
-    print(torch.version.cuda)
     if torch.cuda.is_available():
-        print(f'Using GPU id: {gpu_id}')
-        return torch.device(f'cuda:{gpu_id}')
-    else:
-        print('Using CPU')
-        return torch.device('cpu')
+        print(f"Using GPU id: {gpu_id}")
+        return torch.device(f"cuda:{gpu_id}")
+    print("Using CPU")
+    return torch.device("cpu")
+
 
 def count_tokens(tokenizer, text: str):
     return len(tokenizer.encode(text, add_special_tokens=False))
+
 
 def compute_volatility_bin(df, time_col="", value_col="", window=48, bins=10, dayfirst=True):
     df = df.copy()
@@ -43,114 +51,98 @@ def compute_volatility_bin(df, time_col="", value_col="", window=48, bins=10, da
     bin_id = np.digitize(vol, thresholds, right=True)
     return int(min(bin_id, bins - 1))
 
+
 def draw_pred_true(live_logger, args, true_pred_csv_path):
     try:
-        p = f"./checkpoints/{args.taskName}"
-        os.makedirs(p, exist_ok=True)
+        ckpt_dir = os.path.join("./checkpoints", args.taskName)
+        os.makedirs(ckpt_dir, exist_ok=True)
         df = pd.read_csv(true_pred_csv_path)
         plt.figure()
         plt.plot(df["true"], label="True Values")
         plt.plot(df["pred"], label="Predicted Values")
         plt.xlabel("Sample Index")
         plt.ylabel("Values")
-        plt.title("Predicted and True Values (final prediction)")
+        plt.title("Predicted and True Values")
         plt.legend()
         plt.grid(True)
-        fig_path = os.path.join(p, f"PredVsTrue_{args.taskName}.png")
+        fig_path = os.path.join(ckpt_dir, f"PredVsTrue_{args.taskName}.png")
         plt.savefig(fig_path, dpi=200, bbox_inches="tight")
         plt.close()
         live_logger.info(f"Saved Pred vs True plot to {fig_path}")
-    except Exception as e:
-        live_logger.error(f"Failed to draw Pred vs True plot: {e}")
+    except Exception as exc:
+        live_logger.error(f"Failed to draw Pred vs True plot: {exc}")
 
 
 def build_experiment_task_name(args) -> str:
     base_task_name = str(
-        getattr(args, "_raw_task_name", None)
-        or getattr(args, "taskName", "task1")
-        or "task1"
+        getattr(args, "_raw_task_name", None) or getattr(args, "taskName", "task1") or "task1"
     ).strip()
-    temporal_text_enable = int(getattr(args, "delta_temporal_text_enable", 0) or 0)
-    temporal_text_source = str(getattr(args, "delta_temporal_text_source", "refined") or "refined").strip()
-    temporal_text_tag = (
-        f"DELTA_TEMPORAL_TEXT_on_{temporal_text_source}"
-        if temporal_text_enable == 1
-        else "DELTA_TEMPORAL_TEXT_off"
-    )
-    delta_residual_mode = str(getattr(args, "delta_residual_mode", "additive") or "additive").strip()
-    delta_sign_mode = str(getattr(args, "delta_sign_mode", "signnet_binary") or "signnet_binary").strip()
-    residual_arch = str(getattr(args, "residual_arch", "current") or "current").strip()
-    task = (
-        f"{base_task_name}_{args.stage}_s{args.stride}_h{args.horizon}_news_{args.news_path}"
-        f"_{temporal_text_tag}"
-        f"_RESIDUAL_ARCH_{residual_arch}"
-        f"_DELTA_RESIDUAL_MODE_{delta_residual_mode}"
-    )
-    if residual_arch == "current":
-        task += f"_DELTA_SIGN_MODE_{delta_sign_mode}"
-    return task
+    parts = [
+        base_task_name,
+        str(getattr(args, "stage", "all") or "all").strip(),
+        f"s{int(getattr(args, 'stride', 1) or 1)}",
+        f"h{int(getattr(args, 'horizon', 1) or 1)}",
+        f"dataset-{str(getattr(args, 'dataset_key', 'unknown') or 'unknown').strip()}",
+        f"base-{str(getattr(args, 'base_backbone', 'mlp') or 'mlp').strip()}",
+    ]
+    if str(getattr(args, "stage", "all")).lower() in {"delta", "all"}:
+        parts.append(f"delta-v3-{str(getattr(args, 'delta_v3_schema_variant', 'generic') or 'generic').strip()}")
+    if getattr(args, "news_path", None):
+        parts.append(os.path.basename(str(getattr(args, "news_path"))))
+    return "_".join(parts)
 
 
 def record_test_results_csv(args, live_logger, mse, mae, base_mse=None, base_mae=None):
     try:
-        p = f"./results"
-        os.makedirs(p, exist_ok=True)
-        csv_path = os.path.join(p, f"test_results.csv")
+        results_dir = "./results"
+        os.makedirs(results_dir, exist_ok=True)
+        csv_path = os.path.join(results_dir, "test_results.csv")
         task = build_experiment_task_name(args)
         residual_diag = getattr(args, "_last_residual_eval_diag", {}) or {}
-        signnet_metrics = getattr(args, "_last_signnet_metrics", {}) or {}
-        final_mse = float(mse)
-        final_mae = float(mae)
-        base_mse_v = float(base_mse) if base_mse is not None else float(residual_diag.get("base_mse", np.nan))
-        base_mae_v = float(base_mae) if base_mae is not None else float(residual_diag.get("base_mae", np.nan))
+
         row = {
             "Task": task,
-            "MSE": final_mse,
-            "MAE": final_mae,
-            "Base_MSE": base_mse_v,
-            "Base_MAE": base_mae_v,
+            "MSE": float(mse),
+            "MAE": float(mae),
+            "Base_MSE": float(base_mse) if base_mse is not None else float(residual_diag.get("base_mse", np.nan)),
+            "Base_MAE": float(base_mae) if base_mae is not None else float(residual_diag.get("base_mae", np.nan)),
             "Skill_Score_MSE": float(residual_diag.get("skill_score_mse", np.nan)),
             "Skill_Score_MAE": float(residual_diag.get("skill_score_mae", np.nan)),
             "Delta_Helped_Rate": float(residual_diag.get("delta_helped_rate", np.nan)),
-            "NoNews_MAE": float(((residual_diag.get("news_slices", {}) or {}).get("no_news", {}) or {}).get("final_mae", np.nan)),
-            "SparseNews_MAE": float(((residual_diag.get("news_slices", {}) or {}).get("sparse_news", {}) or {}).get("final_mae", np.nan)),
-            "DenseNews_MAE": float(((residual_diag.get("news_slices", {}) or {}).get("dense_news", {}) or {}).get("final_mae", np.nan)),
-            "SignNet_Acc": float(signnet_metrics.get("test_acc", np.nan)),
-            "SignNet_BalancedAcc": float(signnet_metrics.get("test_bacc", np.nan)),
+            "Delta_Helped_Rate_Top10Pct": float(residual_diag.get("delta_helped_rate_top10pct_residual", np.nan)),
+            "Top10Pct_Residual_MAE": float(residual_diag.get("top10pct_residual_mae", np.nan)),
+            "Regime_Active_Pct": float(residual_diag.get("regime_active_pct", np.nan)),
+            "Regime_Days_Mean": float(residual_diag.get("regime_days_mean", np.nan)),
+            "Regime_Docs_Mean": float(residual_diag.get("regime_docs_mean", np.nan)),
+            "Counterfactual_Blank_Active_MAE": float(residual_diag.get("blank_active_subset_mae", np.nan)),
+            "Counterfactual_Blank_Inactive_MAE": float(residual_diag.get("blank_inactive_subset_mae", np.nan)),
+            "Counterfactual_Permuted_Active_MAE": float(residual_diag.get("permuted_active_subset_mae", np.nan)),
+            "Inactive_Blank_Gap_Pct": float(residual_diag.get("inactive_blank_gap_pct", np.nan)),
+            "Lambda_Base_Mean": float(residual_diag.get("lambda_base_mean", np.nan)),
+            "Shape_Gain_Mean": float(residual_diag.get("shape_gain_mean", np.nan)),
+            "Spike_Bias_Mean": float(residual_diag.get("spike_bias_mean", np.nan)),
+            "Relevance_Mass_Mean": float(residual_diag.get("relevance_mass_mean", np.nan)),
+            "Spike_Gate_Hit_Rate": float(residual_diag.get("spike_gate_hit_rate", np.nan)),
+            "Spike_Target_Hit_Rate": float(residual_diag.get("spike_target_hit_rate", np.nan)),
         }
         new_row = pd.DataFrame([row])
         ordered_cols = list(row.keys())
         if os.path.exists(csv_path):
             df = pd.read_csv(csv_path)
-            rename_map = {}
-            for col in df.columns:
-                c = str(col).strip().lower()
-                if c == "task":
-                    rename_map[col] = "Task"
-                elif c == "mse":
-                    rename_map[col] = "MSE"
-                elif c == "mae":
-                    rename_map[col] = "MAE"
-            if rename_map:
-                df = df.rename(columns=rename_map)
-            if set(["Task", "MSE", "MAE"]).issubset(df.columns):
-                for col in ordered_cols:
-                    if col not in df.columns:
-                        df[col] = np.nan
-                df = df[ordered_cols]
-                # Keep only the latest row for each experiment signature.
-                df = df[df["Task"] != task]
-                out_df = pd.concat([df, new_row], ignore_index=True)
-            else:
-                out_df = new_row
+            for col in ordered_cols:
+                if col not in df.columns:
+                    df[col] = np.nan
+            df = df[ordered_cols]
+            df = df[df["Task"] != task]
+            out_df = pd.concat([df, new_row], ignore_index=True)
         else:
             out_df = new_row
         out_df = out_df[ordered_cols]
         out_df.to_csv(csv_path, index=False)
         live_logger.info(f"[RESULT_TASK] {task}")
         live_logger.info(f"Saved test results to {csv_path} (upsert by Task)")
-    except Exception as e:
-        live_logger.error(f"Failed to save test results to CSV: {e}")
+    except Exception as exc:
+        live_logger.error(f"Failed to save test results to CSV: {exc}")
 
 
 def print_prompt_stats(live_logger, dataStatistic):
@@ -163,57 +155,40 @@ def print_prompt_stats(live_logger, dataStatistic):
     live_logger.info(f"Prompt with max news length: {dataStatistic.prompt_with_max_news_len}")
     live_logger.info(f"Prompt with max total length: {dataStatistic.prompt_with_max_total_len}")
 
+
 def draw_metric_trend(args, live_logger, val_loss_per_epoch, mse_loss_per_epoch, mae_loss_per_epoch):
-    p = f"./checkpoints/{args.taskName}"
-    os.makedirs(p, exist_ok=True)
+    ckpt_dir = os.path.join("./checkpoints", args.taskName)
+    os.makedirs(ckpt_dir, exist_ok=True)
     epochs = list(range(1, len(val_loss_per_epoch) + 1))
 
     plt.figure()
-    plt.plot(epochs, val_loss_per_epoch, label="Val Loss (z-MSE, final pred)")
+    plt.plot(epochs, val_loss_per_epoch, label="Val Loss (z-MSE)")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title("Validation Loss (final prediction z-space MSE)")
+    plt.title("Validation Loss")
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(p, f"ValLoss_{args.taskName}.png"), dpi=200, bbox_inches="tight")
+    plt.savefig(os.path.join(ckpt_dir, f"ValLoss_{args.taskName}.png"), dpi=200, bbox_inches="tight")
     plt.close()
 
     plt.figure()
-    plt.plot(epochs, mse_loss_per_epoch, label="Val MSE (raw, final pred)")
+    plt.plot(epochs, mse_loss_per_epoch, label="Val MSE (raw)")
     plt.xlabel("Epoch")
     plt.ylabel("MSE")
-    plt.title("Validation MSE (final prediction raw scale)")
+    plt.title("Validation MSE")
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(p, f"ValMSE_{args.taskName}.png"), dpi=200, bbox_inches="tight")
+    plt.savefig(os.path.join(ckpt_dir, f"ValMSE_{args.taskName}.png"), dpi=200, bbox_inches="tight")
     plt.close()
 
     plt.figure()
-    plt.plot(epochs, mae_loss_per_epoch, label="Val MAE (raw, final pred)")
+    plt.plot(epochs, mae_loss_per_epoch, label="Val MAE (raw)")
     plt.xlabel("Epoch")
     plt.ylabel("MAE")
-    plt.title("Validation MAE (final prediction raw scale)")
+    plt.title("Validation MAE")
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(p, f"ValMAE_{args.taskName}.png"), dpi=200, bbox_inches="tight")
+    plt.savefig(os.path.join(ckpt_dir, f"ValMAE_{args.taskName}.png"), dpi=200, bbox_inches="tight")
     plt.close()
 
-    live_logger.info(f"Saved metric curves under {p}")
-
-def compute_volatility_bin(df, time_col="", value_col="", window=48, bins=10, dayfirst=True):
-    df = df.copy()
-    df[time_col] = pd.to_datetime(df[time_col], dayfirst=dayfirst)
-    df = df.sort_values(time_col)
-
-    recent = df[value_col].iloc[-window:]
-    if len(recent) < 2:
-        return 0
-
-    vol = recent.std()
-    all_std = df[value_col].rolling(window).std().dropna()
-    if len(all_std) == 0:
-        return 0
-
-    thresholds = np.quantile(all_std, np.linspace(0, 1, bins + 1)[1:-1])
-    bin_id = np.digitize(vol, thresholds, right=True)
-    return int(min(bin_id, bins - 1))
+    live_logger.info(f"Saved metric curves under {ckpt_dir}")
