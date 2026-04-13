@@ -1,16 +1,51 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
+
+
+def _sanitize_cache_component(value: str, *, fallback: str) -> str:
+    clean = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "").strip())
+    clean = re.sub(r"_+", "_", clean).strip("._-")
+    return clean or str(fallback)
+
+
+def news_dataset_cache_tag(news_path: str) -> str:
+    path = str(news_path or "").strip()
+    if not path:
+        return ""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return _sanitize_cache_component(stem, fallback="news")
+
+
+def append_cache_tag_to_path(path: str, cache_tag: str) -> str:
+    raw_path = str(path or "").strip()
+    tag = _sanitize_cache_component(cache_tag, fallback="news") if str(cache_tag or "").strip() else ""
+    if not raw_path or not tag:
+        return raw_path
+
+    directory, filename = os.path.split(raw_path)
+    stem, ext = os.path.splitext(filename)
+    if stem.endswith(f"__{tag}") or stem.endswith(f"_{tag}"):
+        return raw_path
+    return os.path.join(directory, f"{stem}__{tag}{ext}")
+
+
+def build_refined_cache_path(cache_dir: str, dataset_key: str, schema_variant: str, cache_tag: str = "") -> str:
+    base_path = os.path.join(cache_dir, f"refined_{dataset_key}_{schema_variant}_regime_v2.jsonl")
+    return append_cache_tag_to_path(base_path, cache_tag)
 
 
 @dataclass(slots=True)
 class DeltaV3Config:
     dataset_key: str
+    news_cache_tag: str
     history_len: int
     horizon: int
     schema_variant: str
     regime_bank_path: str
+    regime_bank_legacy_path: str
     regime_bank_build: bool
     text_encoder_model_id: str
     text_encoder_max_length: int
@@ -36,6 +71,7 @@ class DeltaV3Config:
     consistency_weight: float
     counterfactual_weight: float
     counterfactual_margin: float
+    inactive_residual_weight: float
     spike_bias_l2: float
     active_mass_threshold: float
     lambda_min: float
@@ -59,18 +95,23 @@ class DeltaV3Config:
     @classmethod
     def from_args(cls, args) -> "DeltaV3Config":
         dataset_key = str(getattr(args, "dataset_key", "dataset") or "dataset").strip()
+        news_cache_tag = news_dataset_cache_tag(getattr(args, "news_path", "") or "")
         default_bank_path = os.path.join(
             "checkpoints",
             "_shared_refine_cache",
             "v4",
             f"regime_bank_{dataset_key}.npz",
         )
+        legacy_bank_path = str(getattr(args, "delta_v3_regime_bank_path", "") or "").strip() or default_bank_path
+        regime_bank_path = append_cache_tag_to_path(legacy_bank_path, news_cache_tag)
         return cls(
             dataset_key=dataset_key,
+            news_cache_tag=news_cache_tag,
             history_len=int(getattr(args, "history_len", 48) or 48),
             horizon=int(getattr(args, "horizon", 48) or 48),
             schema_variant=str(getattr(args, "delta_v3_schema_variant", "load") or "load").strip(),
-            regime_bank_path=str(getattr(args, "delta_v3_regime_bank_path", "") or "").strip() or default_bank_path,
+            regime_bank_path=regime_bank_path,
+            regime_bank_legacy_path=legacy_bank_path,
             regime_bank_build=bool(int(getattr(args, "delta_v3_regime_bank_build", 0) or 0)),
             text_encoder_model_id=str(
                 getattr(args, "delta_v3_text_encoder_model_id", "intfloat/e5-small-v2") or "intfloat/e5-small-v2"
@@ -98,13 +139,16 @@ class DeltaV3Config:
             consistency_weight=float(getattr(args, "delta_v3_consistency_weight", 0.05) or 0.05),
             counterfactual_weight=float(getattr(args, "delta_v3_counterfactual_weight", 0.1) or 0.1),
             counterfactual_margin=float(getattr(args, "delta_v3_counterfactual_margin", 0.02) or 0.02),
+            inactive_residual_weight=float(
+                getattr(args, "delta_v3_inactive_residual_weight", 0.1) or 0.1
+            ),
             spike_bias_l2=float(getattr(args, "delta_v3_spike_bias_l2", 1e-3) or 1e-3),
             active_mass_threshold=float(getattr(args, "delta_v3_active_mass_threshold", 0.7) or 0.7),
             lambda_min=float(getattr(args, "delta_v3_lambda_min", 0.05) or 0.05),
-            lambda_ts_cap=float(getattr(args, "delta_v3_lambda_ts_cap", 0.30) or 0.30),
-            lambda_news_cap=float(getattr(args, "delta_v3_lambda_news_cap", 0.12) or 0.12),
-            lambda_max=float(getattr(args, "delta_v3_lambda_max", 0.45) or 0.45),
-            shape_gain_cap=float(getattr(args, "delta_v3_shape_gain_cap", 0.20) or 0.20),
+            lambda_ts_cap=float(getattr(args, "delta_v3_lambda_ts_cap", 0.45) or 0.45),
+            lambda_news_cap=float(getattr(args, "delta_v3_lambda_news_cap", 0.20) or 0.20),
+            lambda_max=float(getattr(args, "delta_v3_lambda_max", 0.60) or 0.60),
+            shape_gain_cap=float(getattr(args, "delta_v3_shape_gain_cap", 0.30) or 0.30),
             spike_bias_cap=float(getattr(args, "delta_v3_spike_bias_cap", 0.75) or 0.75),
             selection_counterfactual_gain_min=float(
                 getattr(args, "delta_v3_selection_counterfactual_gain_min", 0.01) or 0.01

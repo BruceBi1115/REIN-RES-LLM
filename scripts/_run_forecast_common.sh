@@ -374,6 +374,7 @@ init_common_defaults() {
   set_default DELTA_V3_CONSISTENCY_WEIGHT "0.05"
   set_default DELTA_V3_COUNTERFACTUAL_WEIGHT "0.1"
   set_default DELTA_V3_COUNTERFACTUAL_MARGIN "0.02"
+  set_default DELTA_V3_INACTIVE_RESIDUAL_WEIGHT "0.1"
   set_default DELTA_V3_SPIKE_BIAS_L2 "1e-3"
   set_default DELTA_V3_ACTIVE_MASS_THRESHOLD "0.7"
   set_default DELTA_V3_LAMBDA_MIN "0.05"
@@ -394,6 +395,8 @@ init_common_defaults() {
   set_default DELTA_V3_EVAL_PERMUTATION_SEED "2024"
   set_default DELTA_V3_SELECT_METRIC "mae"
 
+  set_default SPIKE_CLIP_THRESHOLD "0.0" 
+
   set_default ID_COL ""
   set_default FREQ_MIN ""
   set_default TASK_NAME_SUFFIX ""
@@ -403,6 +406,7 @@ init_common_defaults() {
   set_array_default LRS "1e-4"
   set_array_default SCHEDULERS "1"
   set_array_default GRAD_ACCS "1"
+
 }
 
 validate_dataset_config() {
@@ -518,6 +522,7 @@ build_run_args() {
     --delta_v3_consistency_weight "$DELTA_V3_CONSISTENCY_WEIGHT"
     --delta_v3_counterfactual_weight "$DELTA_V3_COUNTERFACTUAL_WEIGHT"
     --delta_v3_counterfactual_margin "$DELTA_V3_COUNTERFACTUAL_MARGIN"
+    --delta_v3_inactive_residual_weight "$DELTA_V3_INACTIVE_RESIDUAL_WEIGHT"
     --delta_v3_spike_bias_l2 "$DELTA_V3_SPIKE_BIAS_L2"
     --delta_v3_active_mass_threshold "$DELTA_V3_ACTIVE_MASS_THRESHOLD"
     --delta_v3_lambda_min "$DELTA_V3_LAMBDA_MIN"
@@ -537,6 +542,7 @@ build_run_args() {
     --delta_v3_grad_clip "$DELTA_V3_GRAD_CLIP"
     --delta_v3_eval_permutation_seed "$DELTA_V3_EVAL_PERMUTATION_SEED"
     --delta_v3_select_metric "$DELTA_V3_SELECT_METRIC"
+    --spike_clip_threshold "$SPIKE_CLIP_THRESHOLD"
   )
 
   if [[ -n "$RUN_NAME" ]]; then

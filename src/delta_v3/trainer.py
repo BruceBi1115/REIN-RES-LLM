@@ -26,7 +26,7 @@ from ..delta.core import _build_delta_optimizer, skill_score
 from ..delta_news_hooks import build_news_api_adapter
 from ..utils.batch_utils import _batch_time_seq_for_sample
 from ..utils.utils import draw_pred_true, record_test_results_csv
-from .config import DeltaV3Config
+from .config import DeltaV3Config, build_refined_cache_path
 from .importance import HardResidualSampler
 from .model import build_delta_v3_model
 from .modulation_heads import RegimePretrainHeads
@@ -36,12 +36,12 @@ from .schema_refine_v2 import refine_dataset_news_corpus
 from .targets import ResidualTargetDecomposer, compute_residual_calendar_baseline
 
 
-def _resolve_v3_paths(args, cfg: DeltaV3Config) -> tuple[str, str]:
+def _resolve_v3_paths(args, cfg: DeltaV3Config) -> tuple[str, str, str, str]:
     cache_dir = os.path.join("checkpoints", "_shared_refine_cache", "v4")
     os.makedirs(cache_dir, exist_ok=True)
-    refined_path = os.path.join(cache_dir, f"refined_{cfg.dataset_key}_{cfg.schema_variant}_regime_v2.jsonl")
-    bank_path = cfg.regime_bank_path
-    return refined_path, bank_path
+    refined_path = build_refined_cache_path(cache_dir, cfg.dataset_key, cfg.schema_variant, cfg.news_cache_tag)
+    legacy_refined_path = build_refined_cache_path(cache_dir, cfg.dataset_key, cfg.schema_variant, "")
+    return refined_path, legacy_refined_path, cfg.regime_bank_path, cfg.regime_bank_legacy_path
 
 
 def _summarize_refined_corpus(refined_path: str) -> dict[str, int]:
@@ -98,15 +98,32 @@ def _series_day_bounds(bundle, args) -> tuple[pd.Timestamp, pd.Timestamp]:
 
 def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
     live_logger = bundle["live_logger"]
-    refined_path, bank_path = _resolve_v3_paths(args, cfg)
+    refined_path, legacy_refined_path, bank_path, legacy_bank_path = _resolve_v3_paths(args, cfg)
     if os.path.exists(bank_path) and not cfg.regime_bank_build:
         bank = load_regime_bank(bank_path)
         _fail_fast_on_empty_bank(bank, bank_path=bank_path, refined_path=refined_path)
         return bank, refined_path, bank_path
 
+    if (
+        not cfg.regime_bank_build
+        and bank_path != legacy_bank_path
+        and os.path.exists(legacy_bank_path)
+    ):
+        actual_refined_path = refined_path
+        if refined_path != legacy_refined_path and not os.path.exists(refined_path) and os.path.exists(legacy_refined_path):
+            actual_refined_path = legacy_refined_path
+        live_logger.info(
+            "[DELTA_V3] using legacy regime bank cache "
+            f"legacy_path={legacy_bank_path} preferred_path={bank_path}"
+        )
+        bank = load_regime_bank(legacy_bank_path)
+        _fail_fast_on_empty_bank(bank, bank_path=legacy_bank_path, refined_path=actual_refined_path)
+        return bank, actual_refined_path, legacy_bank_path
+
     if not cfg.regime_bank_build:
         raise FileNotFoundError(
             f"delta_v3 regime bank missing: {bank_path}. "
+            f"legacy_checked={legacy_bank_path}. "
             "Set --delta_v3_regime_bank_build 1 to rebuild from --news_path."
         )
 
@@ -507,6 +524,9 @@ def evaluate_delta_v3(
             history_z = history_z.to(device)
             targets_z = targets_z.to(device)
             targets_raw = batch["target_value"].to(device, dtype=torch.float32)
+            _spike_clip = float(getattr(args, "spike_clip_threshold", 0.0) or 0.0)
+            if _spike_clip > 0:
+                targets_raw = targets_raw.clamp(-_spike_clip, _spike_clip)
             base_pred_z, base_hidden = _base_forward(base_backbone, history_z)
             regime_pack, regime_active_used, in_force_docs_used = _build_regime_pack(
                 batch,
@@ -575,6 +595,8 @@ def evaluate_delta_v3(
             perm_pred_z_cpu = perm_out["pred_z"].detach().cpu().numpy() if perm_out is not None else None
             residual_hat_cpu = out["residual_hat"].detach().cpu().numpy()
             targets_cpu = batch["target_value"].detach().cpu().numpy()
+            if _spike_clip > 0:
+                targets_cpu = np.clip(targets_cpu, -_spike_clip, _spike_clip)
             targets_z_cpu = targets_z.detach().cpu().numpy()
             true_residual_z_cpu = targets_z_cpu - base_pred_z_cpu
             active_flags_batch = (
@@ -736,6 +758,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
     device = bundle["device"]
     cfg = DeltaV3Config.from_args(args)
 
+    # load base model
     base_backbone, base_meta = load_base_backbone_checkpoint(best_base_path, device=device, is_trainable=False)
     live_logger.info(
         f"[DELTA_V3] Loaded frozen base backbone={base_meta.get('backbone_name')} from {best_base_path}"
@@ -756,7 +779,11 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                 f"scale={bundle_stats['scale_global']:.6f})."
             )
 
+    # load regime bank
     bank, refined_path, bank_path = _prepare_regime_bank(args, bundle, cfg)
+    # create shuffled bank for permutation ablation
+    # A shuffled bank is created by shuffling the date-to-regime mapping
+    # Preserves the overall regime distribution but breaks the temporal alignment between regimes and the target series.
     shuffled_bank = bank.shuffled(cfg.eval_permutation_seed)
     live_logger.info(
         f"[DELTA_V3] regime bank ready path={bank_path} refined={refined_path} dates={len(bank.dates)} "
@@ -765,6 +792,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
 
     train_vals = pd.to_numeric(bundle["train_df"][args.value_col], errors="coerce").to_numpy(dtype=np.float32)
     train_vals = train_vals[np.isfinite(train_vals)]
+    # Apply winsorization to the target values to mitigate the influence of extreme outliers.
     price_winsor_bounds = None
     if cfg.schema_variant == "price" and train_vals.size > 0:
         price_winsor_bounds = (
@@ -775,6 +803,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
             f"[DELTA_V3] price winsor bounds low={price_winsor_bounds[0]:.4f} high={price_winsor_bounds[1]:.4f}"
         )
 
+    # compute residual magnitudes for hard sampling
     residual_magnitudes = _collect_train_residual_magnitudes(
         bundle["train_eval_loader"],
         base_backbone,
@@ -782,6 +811,8 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
         stats,
         device,
     )
+    # let delta model focus more on samples with large residuals, 
+    # which are likely underfit by the base model and have more room for improvement.
     sampler_helper = HardResidualSampler(
         residual_magnitudes=residual_magnitudes,
         top_pct=cfg.hard_residual_pct,
@@ -790,7 +821,8 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
     live_logger.info(
         f"[DELTA_V3] hard residual sampler hit_rate={sampler_helper.hard_hit_rate:.4f} top_pct={cfg.hard_residual_pct:.2f}"
     )
-
+    
+    # compute residual calendar baseline for target decomposition
     dow_hod_mean, spike_sigma, spike_threshold_abs = compute_residual_calendar_baseline(
         bundle["train_eval_loader"],
         base_backbone,
@@ -799,6 +831,11 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
         device,
         spike_target_pct=cfg.spike_target_pct,
     )
+    # The residual target decomposer breaks down the prediction target into three components: 
+    # a slow-moving baseline that captures predictable calendar effects, 
+    # a shape component that captures systematic intraday patterns, 
+    # and a spike component that captures unpredictable extreme movements. 
+    # By explicitly modeling these distinct components, the delta model can learn specialized mechanisms for each.
     decomposer = ResidualTargetDecomposer(
         dow_hod_mean=dow_hod_mean,
         spike_sigma=spike_sigma,
@@ -812,6 +849,8 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
         f"spike_target_pct={cfg.spike_target_pct:.2f}"
     )
 
+
+    # Pretrain the regime attention and gating heads with self-supervised regime signals derived from the target series.
     model = build_delta_v3_model(cfg).to(device)
     daily_label_map = _build_daily_target_map(bundle, args)
     pretrain_train_payload = _build_pretrain_payload(bundle["train_df"], bank, daily_label_map, args)
@@ -831,6 +870,8 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
         model.initialize_from_pretrain(pretrain_helper)
     live_logger.info(f"[DELTA_V3][PRETRAIN_V2] best_loss={pretrain_diag.get('best_loss', float('nan')):.4f}")
 
+
+    # Main delta training loop
     train_dataset = bundle["train_loader"].dataset
     train_loader = DataLoader(
         train_dataset,
@@ -861,10 +902,14 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
             history_z = history_z.to(device)
             targets_z = targets_z.to(device)
             targets_raw = batch["target_value"].to(device, dtype=torch.float32)
+            _spike_clip = float(getattr(args, "spike_clip_threshold", 0.0) or 0.0)
+            if _spike_clip > 0:
+                targets_raw = targets_raw.clamp(-_spike_clip, _spike_clip)
 
             with torch.no_grad():
                 base_pred_z, base_hidden = _base_forward(base_backbone, history_z)
 
+            # get regime pack
             regime_pack, _, _ = _build_regime_pack(
                 batch,
                 bank,
@@ -872,12 +917,13 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                 active_mass_threshold=cfg.active_mass_threshold,
             )
             original_active = regime_pack["relevance_mass"].view(-1) > float(cfg.active_mass_threshold)
+            # dropout, randomly blank out the regime signals
             if cfg.news_blank_prob > 0:
                 blank_mask = torch.rand((history_z.size(0),), device=device) < float(cfg.news_blank_prob)
                 train_regime_pack = _blank_regime_pack(regime_pack, blank_mask=blank_mask)
             else:
                 train_regime_pack = regime_pack
-
+            # forward pass
             out = model(
                 history_z=history_z,
                 history_times=history_times,
@@ -885,11 +931,13 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                 base_hidden=base_hidden if cfg.use_base_hidden else None,
                 regime_pack=train_regime_pack,
             )
-
+            # delta prediction: the sum of the base prediction and the residual correction predicted by the delta model
             pred_z = out["pred_z"]
+            # real residual target
             residual_target = targets_z - base_pred_z
+            # decompose the residual target into slow, shape, and spike components for auxiliary losses
             target_parts = decomposer.decompose(residual_target, target_times)
-
+            # 最终预测 pred_z 和真实目标之间的主损失，基于平滑L1损失，价格模式下还加入了分位数损失以更好地捕捉预测分布。
             point_loss = _main_point_loss(
                 pred_z,
                 targets_z,
@@ -899,25 +947,41 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                 scale_global=scale_global,
                 price_winsor_bounds=price_winsor_bounds,
             )
+            # 要求模型的 slow_ts 学到 residual 里的慢变化部分
             slow_loss = F.mse_loss(out["slow_ts"], target_parts["slow"])
+            # 要求模型的 shape_ts 学到 residual 里的常规形状变化部分
             shape_loss = F.smooth_l1_loss(out["shape_ts"], target_parts["shape"])
+            # 标出哪些位置是真正的 spike
             spike_mask = target_parts["spike_mask"]
+            # 先逐点计算模型预测的 spike 和真实 spike 的误差
+            # 这里用的是 out["spike_gate"] * out["spike_ts"]，意思是“尖峰幅度乘上尖峰开关”
             spike_raw = F.smooth_l1_loss(out["spike_gate"] * out["spike_ts"], target_parts["spike"], reduction="none")
+            # 只在 spike_mask=1 的位置上统计 spike 误差
+            # 非 spike 位置不让它参与这个损失
             spike_loss = (spike_raw * spike_mask).sum() / spike_mask.sum().clamp_min(1.0)
 
+            # 单独训练“spike 开关”要不要打开。
+            # 把前面分解出来的真实 spike 位置，当成开关的监督标签
+            # 有 spike 的位置是 1，没有 spike 的位置是 0
             gate_target = spike_mask
+            # 算这一批里 spike 占比有多少; 因为 spike 通常很少，所以正样本比例会很低
             gate_pos_rate = gate_target.mean().detach().clamp_min(1e-3)
+            # 给正样本更高权重; 这样 BCE 不会因为“0 太多、1 太少”而学成总是预测没 spike
             gate_pos_weight = ((1.0 - gate_pos_rate) / gate_pos_rate).clamp(1.0, 20.0)
+            # 逐点的 spike 分类损失; 让 out["spike_gate_logits"] 学会判断每个位置是否该开 spike
             spike_gate_loss = F.binary_cross_entropy_with_logits(
                 out["spike_gate_logits"],
                 gate_target,
                 pos_weight=gate_pos_weight,
             )
+            # 额外的“比例约束” loss，鼓励 spike_gate 的平均开关率接近真实 spike 的平均发生率
             spike_gate_rate_loss = F.smooth_l1_loss(
                 out["spike_gate"].mean(dim=-1),
                 gate_target.mean(dim=-1),
             )
 
+            # 防止模型在“其实没有有效新闻”的样本上，仍然被新闻分支扰动。
+            # 也就是：没新闻价值时，新闻开着和关着，结果应该几乎一样。
             consistency_loss = torch.zeros((), dtype=torch.float32, device=device)
             if cfg.consistency_weight > 0 and bool((~original_active).any()):
                 blank_all_pack = _blank_regime_pack(regime_pack)
@@ -932,6 +996,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                 inactive_mask = ~original_active
                 consistency_loss = F.mse_loss(pred_z[inactive_mask], out_blank_all["pred_z"][inactive_mask])
 
+            # “反事实约束”：对于那些本来新闻是活跃的样本，模型用“真实新闻”时，应该比用“没有新闻”或“乱配新闻”更好
             counterfactual_loss = torch.zeros((), dtype=torch.float32, device=device)
             if cfg.counterfactual_weight > 0 and bool(original_active.any()):
                 cf_mask = original_active.clone()
@@ -977,8 +1042,13 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                         F.relu(real_err[cf_mask] - blank_err[cf_mask] + margin).mean()
                         + F.relu(real_err[cf_mask] - perm_err[cf_mask] + margin).mean()
                     )
-
+            # L2 正则化，防止 spike_bias 过大。因为 spike_bias 是直接加在预测上的，如果它过大可能会导致不稳定。
             spike_bias_reg = out["spike_bias"].pow(2).mean()
+            # 对于那些本来没有有效新闻的样本，如果模型在这些样本上预测了很大的残差（无论是正的还是负的），都应该被惩罚。
+            inactive_residual_loss = torch.zeros((), dtype=torch.float32, device=device)
+            if cfg.inactive_residual_weight > 0 and bool((~original_active).any()):
+                inactive_residual_loss = out["residual_hat"][~original_active].pow(2).mean()
+            # 最终总损失是主损失加上各种辅助损失的加权和。每个辅助损失都有一个权重系数，可以通过 cfg 来调整它们的重要性。
             loss = (
                 point_loss
                 + cfg.slow_weight * slow_loss
@@ -987,6 +1057,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                 + cfg.spike_gate_loss_weight * (spike_gate_loss + spike_gate_rate_loss)
                 + cfg.consistency_weight * consistency_loss
                 + cfg.counterfactual_weight * counterfactual_loss
+                + cfg.inactive_residual_weight * inactive_residual_loss
                 + cfg.spike_bias_l2 * spike_bias_reg
             )
 

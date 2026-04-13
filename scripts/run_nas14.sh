@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-RUN_SCRIPT_NAME="scripts/run_nas14.sh"
-RUN_SCRIPT_PATH="$SCRIPT_DIR/run_nas14.sh"
+RUN_SCRIPT_NAME="scripts/run_nas14_news.sh"
+RUN_SCRIPT_PATH="$SCRIPT_DIR/run_nas14_news.sh"
 
 DATASET_KEY="nas14"
 TIME_COL="date"
@@ -20,18 +20,33 @@ VAL_FILE="dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_chrono_v
 TEST_FILE="dataset/NAS_14ticker_22_23_combine/NAS_14ticker_22_23_combine_chrono_testset.csv"
 DEFAULT_NEWS_PATH="dataset/nasdaq_news_22_23.json"
 
-STAGE="base"
+STAGE="all"
+BASE_EPOCHS="40"
+DELTA_EPOCHS="30"
 BATCH_SIZE="4"
 GRAD_ACCS=("1")
 LRS=("1e-4")
 HORIZONS=("48")
 SCHEDULERS=("1")
 BASE_BACKBONES=("dlinear")
+DAY_FIRST="0"
 
-TASK_NAME_BASE="base_nas14"
+TASK_NAME_BASE="delta_v3_nas14"
 PRE_RUN_HOOK="prepare_chronological_timeseries_splits"
 
-NEWS_API_ENABLE="0"
+NEWS_API_ENABLE="1"
+DELTA_V3_SCHEMA_VARIANT="price"
+DELTA_V3_REGIME_BANK_PATH="checkpoints/_shared_refine_cache/v4/regime_bank_nas14.npz"
+DELTA_V3_REGIME_BANK_BUILD="0"
+
+
+if [[ -z "${DELTA_V3_REGIME_BANK_BUILD:-}" ]]; then
+  if [[ -f "checkpoints/_shared_refine_cache/v4/regime_bank_nas14__nasdaq_news_22_23.npz" || -f "$DELTA_V3_REGIME_BANK_PATH" ]]; then
+    DELTA_V3_REGIME_BANK_BUILD="0"
+  else
+    DELTA_V3_REGIME_BANK_BUILD="1"
+  fi
+fi
 
 source "$SCRIPT_DIR/_run_forecast_common.sh"
 run_forecast_dataset_main "$@"

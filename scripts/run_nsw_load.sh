@@ -26,7 +26,7 @@ DELTA_EPOCHS="30"
 BATCH_SIZE="16"
 GRAD_ACCS=("4")
 LRS=("1e-4")
-HORIZONS=("48")
+HORIZONS=("48" "96" "192" "336" "720")
 SCHEDULERS=("1")
 BASE_BACKBONES=("mlp")
 
@@ -37,7 +37,7 @@ PRE_RUN_HOOK=""
 DELTA_V3_REGIME_BANK_BUILD="0"
 
 
-
+NEWS_WINDOW_DAYS="1"
 NEWS_API_ENABLE="1"
 DELTA_V3_SCHEMA_VARIANT="load"
 DELTA_V3_REGIME_BANK_PATH="checkpoints/_shared_refine_cache/v4/regime_bank_nsw_load.npz"

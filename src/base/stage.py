@@ -156,6 +156,9 @@ def setup_env_and_data(args):
             f" q_high_value={global_zstats.get('quantile_high_value', float('nan')):.6f}"
         )
     live_logger.info(norm_msg)
+    spike_clip = float(getattr(args, "spike_clip_threshold", 0.0) or 0.0)
+    if spike_clip > 0:
+        live_logger.info(f"[SPIKE_CLIP] Active: raw values clipped to [-{spike_clip}, {spike_clip}]")
 
     raw_time_splits = {
         "train": train_df[args.time_col].copy(),

@@ -72,6 +72,16 @@ def _parse_news_timestamp(value) -> pd.Timestamp:
     return parsed
 
 
+def _normalize_day_timestamp(value) -> pd.Timestamp:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return pd.NaT
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    return ts.normalize()
+
+
 def _ema_smooth(values: np.ndarray, alpha: float) -> np.ndarray:
     if values.size <= 0:
         return values
@@ -111,7 +121,7 @@ def build_regime_bank(
     for row in rows:
         if not bool(row.get("is_actionable", False)):
             continue
-        published_at = _parse_news_timestamp(row.get("published_at", ""))
+        published_at = _normalize_day_timestamp(_parse_news_timestamp(row.get("published_at", "")))
         if pd.isna(published_at):
             continue
         horizon_days = int(max(0, min(14, int(row.get("horizon_days", 0) or 0))))
@@ -121,7 +131,7 @@ def build_regime_bank(
         regime_payload = row.get("regime_vec", {}) if isinstance(row.get("regime_vec"), dict) else {}
         actionable_rows.append(
             {
-                "published_day": pd.Timestamp(published_at).normalize(),
+                "published_day": published_at,
                 "horizon_days": horizon_days,
                 "confidence": confidence,
                 "regime_vec": np.asarray(
@@ -135,8 +145,8 @@ def build_regime_bank(
         summaries.append(str(row.get("summary", "") or "").strip())
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    start_day = pd.Timestamp(date_start).normalize() if not pd.isna(pd.Timestamp(date_start)) else pd.NaT
-    end_day = pd.Timestamp(date_end).normalize() if not pd.isna(pd.Timestamp(date_end)) else pd.NaT
+    start_day = _normalize_day_timestamp(date_start)
+    end_day = _normalize_day_timestamp(date_end)
     if pd.isna(start_day) or pd.isna(end_day) or end_day < start_day:
         raise ValueError(f"Invalid regime bank date range: start={date_start} end={date_end}")
 

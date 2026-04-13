@@ -188,6 +188,22 @@ def _compute_global_zstats_from_train_df(train_df: pd.DataFrame, args):
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
         raise ValueError("Train data has no finite values for global normalization statistics.")
+    spike_clip = float(getattr(args, "spike_clip_threshold", 0.0) or 0.0)
+    if spike_clip > 0:
+        n_before = vals.size
+        vals = vals[np.abs(vals) <= spike_clip]
+        n_dropped = n_before - vals.size
+        if n_dropped > 0:
+            import logging
+            logging.getLogger(__name__).info(
+                f"[SPIKE_CLIP] Dropped {n_dropped}/{n_before} training values "
+                f"exceeding |{spike_clip}| for normalization stats."
+            )
+        if vals.size == 0:
+            raise ValueError(
+                f"All training values exceed spike_clip_threshold={spike_clip}. "
+                "Lower the threshold or disable spike clipping."
+            )
     eps = float(getattr(args, "zscore_eps", 1e-6))
     norm_mode = str(getattr(args, "normalization_mode", "robust_quantile") or "robust_quantile").strip().lower()
     if norm_mode == "robust_quantile":
@@ -459,10 +475,16 @@ def _z_batch_tensors(batch, args, global_zstats):
     targets_z_list = []
     metas = []
 
+    spike_clip = float(getattr(args, "spike_clip_threshold", 0.0) or 0.0)
+
     batch_size = len(batch["history_value"])
     for i in range(batch_size):
-        history = batch["history_value"][i].tolist()
-        target = batch["target_value"][i].tolist()
+        history = np.asarray(batch["history_value"][i].tolist(), dtype=np.float32)
+        target = np.asarray(batch["target_value"][i].tolist(), dtype=np.float32)
+
+        if spike_clip > 0:
+            history = np.clip(history, -spike_clip, spike_clip)
+            target = np.clip(target, -spike_clip, spike_clip)
 
         history_z = np.asarray(_normalize_values(history, center_global, scale_global), dtype=np.float32)
         target_z = np.asarray(_normalize_values(target, center_global, scale_global), dtype=np.float32)
