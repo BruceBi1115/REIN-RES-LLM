@@ -7,9 +7,12 @@ import os
 import re
 from typing import Any
 
+from tqdm import tqdm
+
 from ..delta_news_hooks import OpenAINewsApiAdapter, build_news_api_adapter
 
 SCHEMA_VERSION = "v4_regime_v2"
+SCHEMA_VARIANTS = ("load", "price", "gas_demand")
 TOPIC_TAGS = (
     "supply_tight",
     "supply_surplus",
@@ -138,25 +141,109 @@ def _build_prompts(doc: dict[str, Any], schema_variant: str) -> tuple[str, str]:
     published_at = str(doc.get("date", "")).strip()
     content = str(doc.get("content", "") or doc.get("summary", "") or "").strip()
     body = _compact_summary(content, max_words=220)
-    target_name = "NSW electricity load" if schema_variant == "load" else "NSW electricity price"
-
-    system_prompt = (
-        f"You are refining generic energy news for {target_name} forecasting into strict JSON. "
-        "Return JSON only, no markdown. "
-        "The key question is whether the article describes a currently in-force market condition that can still matter within the next 14 days. "
-        "If the article is retrospective, routine commentary, historical recap, or not currently actionable, set is_actionable=false. "
-        "Use only the closed topic vocabulary: "
-        + ", ".join(TOPIC_TAGS)
-        + ". "
-        "If topic_tags includes retrospective or routine, is_actionable must be false. "
-        "Return fields exactly: "
-        "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
-        "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
-        "volatility_tone is in [0,1]. "
-        "policy_in_effect is 0 or 1. "
-        "horizon_days is an integer in [0,14]. "
-        "summary must stay under 60 words and be factual."
-    )
+    if schema_variant == "price":
+        system_prompt = (
+            "You are refining generic energy news for NSW electricity price forecasting into JSON. "
+            "Return JSON only, no markdown. "
+            "Favor recall over precision for is_actionable. "
+            "If an article has any plausible near-term pathway to move NSW wholesale price level or volatility, keep it actionable even if the impact is indirect, probabilistic, or only moderate. "
+            "For price, keep near-term operational and market-microstructure drivers, not just broad macro supply-demand themes. "
+            "Treat the following as potentially actionable if they are current, imminent, recently announced and still relevant, or likely to shape trader expectations within the next 14 days: "
+            "generator outages, deratings, planned maintenance, forced outages, unit returns, rebidding or bidding behavior, interconnector flows or constraints, transmission limits, fuel supply or spot-price shocks, heatwaves and cooling-demand peaks, renewable drought or renewable surges, reserve scarcity, market notices, operational advisories, and market interventions. "
+            "Do not filter out an article just because it is operational, plant-specific, scheduled rather than forced, framed as a market notice or advisory, or about another connected NEM region that can move NSW prices through interconnectors, shared weather, or fuel markets. "
+            "Routine maintenance notices, forecast updates, renewable output outlooks, and interconnector advisories can still be actionable if they plausibly affect price or volatility. "
+            "Set is_actionable=false only if the article is clearly retrospective, purely corporate or project news without a near-term operational cue, generic commentary with no concrete signal, or not plausibly relevant to NSW wholesale price within 14 days. "
+            "For borderline cases, prefer is_actionable=true with lower confidence rather than defaulting to false. "
+            "Use only the closed topic vocabulary: "
+            + ", ".join(TOPIC_TAGS)
+            + ". "
+            "If an article is clearly price-relevant but no topic fits well, keep is_actionable=true and include other instead of routine. "
+            "Reserve routine for articles with no clear operational or market signal. "
+            "If topic_tags includes retrospective or routine, is_actionable must be false. "
+            "Map price drivers into the existing tags and regime fields as follows: "
+            "outage, derating, maintenance, unit trip, tight reserve margin -> outage or supply_tight; "
+            "fuel shortage or fuel-cost shock -> fuel_shock; "
+            "interstate flow changes, interconnector outages, binding transmission constraints -> interconnector_limit; "
+            "heat-driven demand peaks -> heatwave; cold-driven demand peaks -> cold_snap; "
+            "high wind, solar, hydro, or excess imports suppressing price -> renewable_surge or supply_surplus; "
+            "low wind, low solar, drought, or import scarcity lifting price -> renewable_drought or supply_tight; "
+            "rebidding, scarcity pricing, spike risk, or abrupt operational uncertainty should raise volatility_tone; "
+            "administered pricing, market suspension, or intervention already in force -> market_intervention or policy_active and policy_in_effect=1. "
+            "Interpret regime_vec for price as: "
+            "tightness = near-term NSW supply-demand tightness and scarcity pressure on price; "
+            "demand_outlook = near-term load and cooling-demand pressure; "
+            "renewable_surplus = expected renewable abundance or import relief that suppresses price, negative when renewable scarcity lifts price; "
+            "volatility_tone = spike, scarcity, rebidding, outage, or constraint-driven price volatility risk; "
+            "policy_in_effect = 1 only when a policy or market intervention is already active. "
+            "For indirect but still relevant signals, use smaller-magnitude regime values instead of zeroing them out. "
+            "Return fields exactly: "
+            "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
+            "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
+            "volatility_tone is in [0,1]. "
+            "policy_in_effect is 0 or 1. "
+            "horizon_days is an integer in [0,14]. "
+            "summary must stay under 60 words and be factual."
+        )
+    elif schema_variant == "gas_demand":
+        system_prompt = (
+            "You are refining generic energy news for Netherlands gas demand forecasting into strict JSON. "
+            "Return JSON only, no markdown. "
+            "Keep articles that describe a current or near-term condition that can change Dutch or Northwest European gas demand, "
+            "gas supply tightness, storage stress, balancing conditions, or gas-for-power burn within the next 14 days. "
+            "Treat the following as potentially actionable if they are current, imminent, or still in force: "
+            "cold snaps, warm spells, heating demand shifts, storage depletion or refill stress, LNG terminal disruptions, "
+            "pipeline outages or constraints, import or export bottlenecks, supply security alerts, balancing-market stress, "
+            "fuel shortages, market intervention already in force, and power-system conditions that materially alter gas burn. "
+            "Do not filter out an article just because it is framed as security of supply, storage, infrastructure maintenance, "
+            "terminal availability, or system balancing, as long as it can plausibly affect gas demand or tightness within 14 days. "
+            "Set is_actionable=false only if the article is retrospective, routine commentary, historical recap, corporate or board news, "
+            "long-horizon hydrogen/CCS infrastructure news without near-term gas-market impact, or not plausibly relevant to Dutch gas demand "
+            "or Dutch/NW European gas tightness within 14 days. "
+            "Use only the closed topic vocabulary: "
+            + ", ".join(TOPIC_TAGS)
+            + ". "
+            "If an article is clearly gas-demand relevant but no topic fits well, keep is_actionable=true and include other instead of routine. "
+            "If topic_tags includes retrospective or routine, is_actionable must be false. "
+            "Map gas-demand drivers into the existing tags and regime fields as follows: "
+            "cold-driven heating demand or cold weather risk -> cold_snap; "
+            "mild weather, weak heating demand, or demand relief -> supply_surplus or other; "
+            "storage depletion, low inventories, import risk, or supply scarcity -> supply_tight; "
+            "LNG, pipeline, terminal, compressor, or field disruptions -> outage, interconnector_limit, or fuel_shock depending on context; "
+            "high wind/solar or other substitution that reduces gas burn -> renewable_surge or supply_surplus; "
+            "low wind/solar or power-market stress that raises gas burn -> renewable_drought or supply_tight; "
+            "government emergency actions, storage mandates, or market intervention already active -> policy_active or market_intervention and policy_in_effect=1. "
+            "Interpret regime_vec for gas demand as: "
+            "tightness = near-term Dutch/NW European gas market tightness and scarcity pressure; "
+            "demand_outlook = near-term Dutch gas demand pressure, especially weather-sensitive heating demand and gas burn; "
+            "renewable_surplus = conditions that reduce gas demand or gas-for-power burn, negative when weak renewables or substitution constraints increase gas usage; "
+            "volatility_tone = uncertainty and volatility risk from storage stress, outages, balancing tension, or supply shocks; "
+            "policy_in_effect = 1 only when a policy or intervention is already active. "
+            "Return fields exactly: "
+            "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
+            "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
+            "volatility_tone is in [0,1]. "
+            "policy_in_effect is 0 or 1. "
+            "horizon_days is an integer in [0,14]. "
+            "summary must stay under 60 words and be factual."
+        )
+    else:
+        system_prompt = (
+            "You are refining generic energy news for NSW electricity load forecasting into strict JSON. "
+            "Return JSON only, no markdown. "
+            "The key question is whether the article describes a currently in-force market condition that can still matter within the next 14 days. "
+            "If the article is retrospective, routine commentary, historical recap, or not currently actionable, set is_actionable=false. "
+            "Use only the closed topic vocabulary: "
+            + ", ".join(TOPIC_TAGS)
+            + ". "
+            "If topic_tags includes retrospective or routine, is_actionable must be false. "
+            "Return fields exactly: "
+            "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
+            "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
+            "volatility_tone is in [0,1]. "
+            "policy_in_effect is 0 or 1. "
+            "horizon_days is an integer in [0,14]. "
+            "summary must stay under 60 words and be factual."
+        )
 
     user_prompt = (
         f"published_at: {published_at}\n"
@@ -236,16 +323,31 @@ def refine_dataset_news_corpus(
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     limit = len(payload) if max_items is None or int(max_items) <= 0 else min(len(payload), int(max_items))
+    docs = payload[:limit]
+    progress = tqdm(
+        docs,
+        total=limit,
+        desc=f"[DELTA_V3][REFINE][{str(schema_variant).upper()}]",
+        dynamic_ncols=True,
+        leave=True,
+        disable=limit <= 0,
+    )
+    actionable_count = 0
+    if limit > 0:
+        progress.set_postfix_str("actionable=0")
     with open(cache_path, "w", encoding="utf-8") as handle:
-        for doc in payload[:limit]:
+        for doc in progress:
             refined = refine_one_news_doc(doc, schema_variant=schema_variant, api_adapter=api_adapter)
+            if bool(refined.get("is_actionable", False)):
+                actionable_count += 1
+            progress.set_postfix_str(f"actionable={actionable_count}")
             handle.write(json.dumps(refined, ensure_ascii=False) + "\n")
 
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Refine daily news corpus into regime-oriented JSONL")
     parser.add_argument("--news_path", type=str, required=True)
-    parser.add_argument("--schema_variant", type=str, required=True, choices=["load", "price"])
+    parser.add_argument("--schema_variant", type=str, required=True, choices=list(SCHEMA_VARIANTS))
     parser.add_argument("--out", type=str, required=True)
     parser.add_argument("--news_api_model", type=str, default="gpt-5.1")
     parser.add_argument("--news_api_key_path", type=str, default=".secrets/api_key.txt")

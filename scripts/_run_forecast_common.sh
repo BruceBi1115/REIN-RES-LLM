@@ -419,7 +419,11 @@ validate_dataset_config() {
   require_nonempty_var TRAIN_FILE
   require_nonempty_var VAL_FILE
   require_nonempty_var TEST_FILE
-  require_nonempty_var DEFAULT_NEWS_PATH
+  if [[ "${STAGE:-all}" == "base" ]]; then
+    require_var_defined DEFAULT_NEWS_PATH
+  else
+    require_nonempty_var DEFAULT_NEWS_PATH
+  fi
   require_nonempty_var BATCH_SIZE
   require_nonempty_var TASK_NAME_BASE
 

@@ -6,12 +6,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/run_forecast_experiment.sh --dataset <nas14|nsw_load|nsw_price> [dataset-script args...]
+  bash scripts/run_forecast_experiment.sh --dataset <nas14|nsw_load|nsw_price|bitcoin_hourly> [dataset-script args...]
 
 Examples:
   bash scripts/run_forecast_experiment.sh --dataset nsw_load
   bash scripts/run_forecast_experiment.sh --dataset nsw_price -- --epochs 5
   bash scripts/run_forecast_experiment.sh --dataset nas14 --session forecast
+  bash scripts/run_forecast_experiment.sh --dataset bitcoin_hourly
 EOF
 }
 
@@ -60,6 +61,9 @@ case "$DATASET" in
     ;;
   nsw_price)
     TARGET_SCRIPT="$SCRIPT_DIR/run_nsw_price.sh"
+    ;;
+  bitcoin_hourly|bitcoin_hourly_22_23_open|btc_hourly)
+    TARGET_SCRIPT="$SCRIPT_DIR/run_bitcoin_hourly.sh"
     ;;
   *)
     echo "[ERROR] Unsupported dataset: $DATASET" >&2

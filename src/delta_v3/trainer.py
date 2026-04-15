@@ -44,7 +44,7 @@ def _resolve_v3_paths(args, cfg: DeltaV3Config) -> tuple[str, str, str, str]:
     return refined_path, legacy_refined_path, cfg.regime_bank_path, cfg.regime_bank_legacy_path
 
 
-def _summarize_refined_corpus(refined_path: str) -> dict[str, int]:
+def _summarize_refined_corpus(refined_path: str) -> dict[str, float | int]:
     total_docs = 0
     actionable_docs = 0
     parseable_dates = 0
@@ -63,10 +63,35 @@ def _summarize_refined_corpus(refined_path: str) -> dict[str, int]:
             published_at = pd.to_datetime(row.get("published_at", ""), errors="coerce", dayfirst=True)
             if not pd.isna(published_at):
                 parseable_dates += 1
+    actionable_pct = 100.0 * float(actionable_docs) / float(total_docs) if total_docs > 0 else 0.0
     return {
         "total_docs": int(total_docs),
         "actionable_docs": int(actionable_docs),
         "parseable_dates": int(parseable_dates),
+        "actionable_pct": float(actionable_pct),
+    }
+
+
+def _summarize_regime_bank(bank, *, active_mass_threshold: float) -> dict[str, float | int]:
+    relevance = np.asarray(getattr(bank, "relevance_mass", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1)
+    in_force = np.asarray(getattr(bank, "in_force_doc_count", np.zeros((0,), dtype=np.int64)), dtype=np.int64).reshape(-1)
+
+    bank_days = int(relevance.size)
+    covered_days = int((in_force > 0).sum()) if in_force.size > 0 else 0
+    active_days = int((relevance > float(active_mass_threshold)).sum()) if relevance.size > 0 else 0
+    covered_pct = 100.0 * float(covered_days) / float(bank_days) if bank_days > 0 else 0.0
+    active_pct = 100.0 * float(active_days) / float(bank_days) if bank_days > 0 else 0.0
+
+    return {
+        "bank_days": bank_days,
+        "covered_days": covered_days,
+        "covered_pct": float(covered_pct),
+        "active_days": active_days,
+        "active_pct": float(active_pct),
+        "mass_mean": float(relevance.mean()) if relevance.size > 0 else 0.0,
+        "mass_median": float(np.median(relevance)) if relevance.size > 0 else 0.0,
+        "mass_min": float(relevance.min()) if relevance.size > 0 else 0.0,
+        "mass_max": float(relevance.max()) if relevance.size > 0 else 0.0,
     }
 
 
@@ -147,6 +172,7 @@ def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
         "[DELTA_V3] regime refine stats "
         f"total_docs={refined_stats['total_docs']} "
         f"actionable_docs={refined_stats['actionable_docs']} "
+        f"actionable_pct={float(refined_stats['actionable_pct']):.2f}% "
         f"parseable_dates={refined_stats['parseable_dates']}"
     )
     if refined_stats["total_docs"] <= 0:
@@ -438,7 +464,13 @@ def _main_point_loss(
             + _pinball_loss(pred_raw, true_raw, 0.5)
             + _pinball_loss(pred_raw, true_raw, 0.9)
         ) / 3.0
-        return F.smooth_l1_loss(pred_w, true_w) + 0.1 * quantile
+        raw_loss = F.smooth_l1_loss(pred_w, true_w) + 0.1 * quantile
+        # Rescale raw-space price loss to z-space magnitude so that auxiliary
+        # losses (consistency, counterfactual, inactive_residual) which live in
+        # z-space have comparable gradient scale. Without this, point_loss
+        # gradients dominate by O(scale_global) ~ 30-100x, causing news path
+        # regularization terms to have near-zero effective influence.
+        return raw_loss / max(float(scale_global), 1e-6)
     return F.smooth_l1_loss(pred_z, targets_z)
 
 
@@ -698,6 +730,7 @@ def evaluate_delta_v3(
             inactive_blank_gap_pct = 100.0 * (inactive_normal - inactive_blank) / inactive_blank
 
         lambda_arr = np.asarray(sample_lambda, dtype=np.float32)
+        relevance_arr = np.asarray(sample_relevance, dtype=np.float32)
         lambda_saturation_threshold = float(cfg.lambda_max) * 0.98
         lambda_saturation_pct = float((lambda_arr >= lambda_saturation_threshold).mean()) if lambda_arr.size > 0 else 0.0
         active_blank_gain_z = _subset_mean((sample_blank_abs_z_arr - sample_final_abs_z_arr).tolist(), active_mask)
@@ -733,7 +766,12 @@ def evaluate_delta_v3(
             "spike_bias_mean": float(np.mean(sample_spike_bias)) if sample_spike_bias else 0.0,
             "spike_bias_active_mean": _subset_mean(sample_spike_bias, active_mask),
             "spike_bias_inactive_mean": _subset_mean(sample_spike_bias, inactive_mask),
-            "relevance_mass_mean": float(np.mean(sample_relevance)) if sample_relevance else 0.0,
+            "relevance_mass_mean": float(relevance_arr.mean()) if relevance_arr.size > 0 else 0.0,
+            "relevance_mass_median": float(np.median(relevance_arr)) if relevance_arr.size > 0 else 0.0,
+            "relevance_mass_max": float(relevance_arr.max()) if relevance_arr.size > 0 else 0.0,
+            "active_mass_mean": float(relevance_arr.mean()) if relevance_arr.size > 0 else 0.0,
+            "active_mass_median": float(np.median(relevance_arr)) if relevance_arr.size > 0 else 0.0,
+            "active_mass_max": float(relevance_arr.max()) if relevance_arr.size > 0 else 0.0,
             "regime_active_pct": float(active_mask.mean()) if active_mask.size > 0 else 0.0,
             "regime_days_mean": float(np.mean(regime_days_all)) if regime_days_all else 0.0,
             "regime_docs_mean": float(np.mean(regime_docs_all)) if regime_docs_all else 0.0,
@@ -788,6 +826,34 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
     live_logger.info(
         f"[DELTA_V3] regime bank ready path={bank_path} refined={refined_path} dates={len(bank.dates)} "
         f"regime_dim={bank.regime_dim} topic_dim={bank.topic_dim} text_dim={bank.text_dim}"
+    )
+    refined_stats = _summarize_refined_corpus(refined_path) if os.path.exists(refined_path) else None
+    bank_stats = _summarize_regime_bank(bank, active_mass_threshold=cfg.active_mass_threshold)
+    if refined_stats is not None:
+        live_logger.info(
+            "[DELTA_V3][BANK_COVERAGE] "
+            f"actionable_news={refined_stats['actionable_docs']}/{refined_stats['total_docs']} "
+            f"({float(refined_stats['actionable_pct']):.2f}% refined) "
+            f"covered_days={bank_stats['covered_days']}/{bank_stats['bank_days']} "
+            f"({float(bank_stats['covered_pct']):.2f}% bank; in_force_doc_count>0) "
+            f"active_days={bank_stats['active_days']}/{bank_stats['bank_days']} "
+            f"({float(bank_stats['active_pct']):.2f}% bank; mass>{float(cfg.active_mass_threshold):.4f})"
+        )
+    else:
+        live_logger.info(
+            "[DELTA_V3][BANK_COVERAGE] "
+            f"actionable_news=N/A refined={refined_path} "
+            f"covered_days={bank_stats['covered_days']}/{bank_stats['bank_days']} "
+            f"({float(bank_stats['covered_pct']):.2f}% bank; in_force_doc_count>0) "
+            f"active_days={bank_stats['active_days']}/{bank_stats['bank_days']} "
+            f"({float(bank_stats['active_pct']):.2f}% bank; mass>{float(cfg.active_mass_threshold):.4f})"
+        )
+    live_logger.info(
+        "[DELTA_V3][BANK_MASS] "
+        f"mean={float(bank_stats['mass_mean']):.4f} "
+        f"median={float(bank_stats['mass_median']):.4f} "
+        f"min={float(bank_stats['mass_min']):.4f} "
+        f"max={float(bank_stats['mass_max']):.4f}"
     )
 
     train_vals = pd.to_numeric(bundle["train_df"][args.value_col], errors="coerce").to_numpy(dtype=np.float32)
@@ -1144,6 +1210,9 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
             f"lambda_sat={float(diag.get('lambda_saturation_pct', 0.0)):.3f} "
             f"shape_gain={float(diag.get('shape_gain_mean', 1.0)):.4f} "
             f"spike_bias={float(diag.get('spike_bias_mean', 0.0)):.4f} "
+            f"active_mass_mean={float(diag.get('active_mass_mean', 0.0)):.4f} "
+            f"active_mass_median={float(diag.get('active_mass_median', 0.0)):.4f} "
+            f"active_mass_max={float(diag.get('active_mass_max', 0.0)):.4f} "
             f"spike_hit={float(diag.get('spike_gate_hit_rate', 0.0)):.4f} "
             f"spike_tgt={float(diag.get('spike_target_hit_rate', 0.0)):.4f}"
         )
@@ -1253,6 +1322,12 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
         f"inactive_mae={float(diag.get('inactive_subset_mae', float('nan'))):.6f} "
         f"blank_inactive={float(diag.get('blank_inactive_subset_mae', float('nan'))):.6f} "
         f"perm_active={float(diag.get('permuted_active_subset_mae', float('nan'))):.6f}"
+    )
+    live_logger.info(
+        "[TEST][ACTIVE_MASS] "
+        f"mean={float(diag.get('active_mass_mean', 0.0)):.4f} "
+        f"median={float(diag.get('active_mass_median', 0.0)):.4f} "
+        f"max={float(diag.get('active_mass_max', 0.0)):.4f}"
     )
     record_test_results_csv(args, live_logger, test_mse, test_mae, base_mse=base_test_mse, base_mae=base_test_mae)
     draw_pred_true(live_logger, args, bundle.get("true_pred_csv_path"))

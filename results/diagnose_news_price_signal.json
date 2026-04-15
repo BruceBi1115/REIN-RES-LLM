@@ -1,0 +1,1940 @@
+{
+  "results": [
+    {
+      "bank_path": "checkpoints/_shared_refine_cache/v4/regime_bank_nsw_price__pv_magazine_australia_news.npz",
+      "dates_covered": 367,
+      "per_lag": {
+        "0": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.1318119249840069,
+              "null_mean": 0.01515581743622808,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.02326572765306104,
+              "null_mean": 0.004832008362641588,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.10363144804870572,
+              "null_mean": 0.016445072157591386,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.17694627911348987,
+              "null_mean": 0.014560188660053512,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.07743737454895036,
+              "null_mean": 0.013012516743016322,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.01604355312596124,
+              "null_mean": 0.007312828985550294,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.021232514943985592,
+              "null_mean": 0.011357131604645234,
+              "p_value": 0.21890547263681592,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.1091487269962762,
+              "null_mean": 0.01337332380936855,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.08197611640959916,
+              "null_mean": 0.014281658684884908,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.015537775026255373,
+              "null_mean": 0.005904063932058751,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.06265592704974754,
+              "null_mean": 0.011878535196450409,
+              "p_value": 0.04477611940298507,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.14056642628064725,
+              "null_mean": 0.014579893477981432,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.04205868499457157,
+              "null_mean": 0.009720986283499712,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.03255144786173008,
+              "null_mean": 0.013157697688296133,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.019697540582285455,
+              "null_mean": 0.01123880752732187,
+              "p_value": 0.21890547263681592,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.026344885961101627,
+              "null_mean": 0.010303036196211987,
+              "p_value": 0.04975124378109453,
+              "significant": true
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.10282816341593168,
+              "null_mean": 0.014459601275473717,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.024429033242395655,
+              "null_mean": 0.004559524936827796,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.01218998501011946,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.12197573564704561,
+              "null_mean": 0.012961717723137412,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.031112567255552826,
+              "null_mean": 0.013226293714561948,
+              "p_value": 0.05472636815920398,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.011677424586662521,
+              "null_mean": 0.005004526436645145,
+              "p_value": 0.029850746268656716,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.02717109530005235,
+              "null_mean": 0.011507183556680914,
+              "p_value": 0.18407960199004975,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.076752326275011,
+              "null_mean": 0.013577667028752769,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          }
+        },
+        "1": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.13443288686650182,
+              "null_mean": 0.01416834013964296,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.016476190398763017,
+              "null_mean": 0.004939310282810421,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.08277101838420986,
+              "null_mean": 0.015111747178355523,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.1492451726376381,
+              "null_mean": 0.014922315904141305,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.07380733095793453,
+              "null_mean": 0.013010608115540383,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.020615371431778304,
+              "null_mean": 0.007363049813684919,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.06270566769816455,
+              "null_mean": 0.013568992417034784,
+              "p_value": 0.029850746268656716,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.10420289529960819,
+              "null_mean": 0.012990337860820322,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.08742807482731259,
+              "null_mean": 0.01250475044744513,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.01982948503297149,
+              "null_mean": 0.0056534174360223285,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0899180751847739,
+              "null_mean": 0.011944363797481436,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.10424833195358868,
+              "null_mean": 0.01312335426458187,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.017330413987617633,
+              "null_mean": 0.010659141131809748,
+              "p_value": 0.1791044776119403,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.02299839630059252,
+              "null_mean": 0.012817485190991972,
+              "p_value": 0.04975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.04507621451098842,
+              "null_mean": 0.011680541504254975,
+              "p_value": 0.07960199004975124,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.02366016857795783,
+              "null_mean": 0.01175392596115422,
+              "p_value": 0.07462686567164178,
+              "significant": false
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.07866147959359386,
+              "null_mean": 0.013357480305037972,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.02064295766367351,
+              "null_mean": 0.0046454659411186575,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0072799339654974204,
+              "null_mean": 0.01615958220243672,
+              "p_value": 0.43781094527363185,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.11287388633212203,
+              "null_mean": 0.013344402111635288,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.03159666597270725,
+              "null_mean": 0.01303064221875195,
+              "p_value": 0.06965174129353234,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.017729601292068197,
+              "null_mean": 0.004674250121643393,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 3.942908090159847e-05,
+              "null_mean": 0.013925763282127192,
+              "p_value": 0.5223880597014925,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.05065024228054876,
+              "null_mean": 0.013137172350946571,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          }
+        },
+        "2": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.13623822864662616,
+              "null_mean": 0.014324139138128512,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.02066444675966667,
+              "null_mean": 0.004728314016183894,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.10275116656065642,
+              "null_mean": 0.014832185981328232,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.1403077343137576,
+              "null_mean": 0.014421779151851602,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.06605589558966204,
+              "null_mean": 0.013656870632480701,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.014700857949466399,
+              "null_mean": 0.0073823748410787714,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.03917217266035955,
+              "null_mean": 0.01455400547909707,
+              "p_value": 0.17412935323383086,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.07502531009807878,
+              "null_mean": 0.01318688920289548,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.08348051164831549,
+              "null_mean": 0.01335723445356384,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.016169860291432955,
+              "null_mean": 0.005473375358181871,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0363165474049989,
+              "null_mean": 0.013579271312608365,
+              "p_value": 0.13930348258706468,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.08540638555737484,
+              "null_mean": 0.013623274781023209,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.023113712028495038,
+              "null_mean": 0.010233636456705695,
+              "p_value": 0.07462686567164178,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.02084408523162645,
+              "null_mean": 0.012299227574781196,
+              "p_value": 0.06467661691542288,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.011883188775144897,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.03701736090917973,
+              "null_mean": 0.01038908496725449,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.06491347086668364,
+              "null_mean": 0.012767239198237874,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.02032161006326912,
+              "null_mean": 0.00471514829909005,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.01450328029804057,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.10762150420452415,
+              "null_mean": 0.014011053439877763,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.019454309652809698,
+              "null_mean": 0.013107983217972963,
+              "p_value": 0.23383084577114427,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.011616358031403366,
+              "null_mean": 0.004665194949063494,
+              "p_value": 0.024875621890547265,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0034231383220033607,
+              "null_mean": 0.011442081655810635,
+              "p_value": 0.42786069651741293,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.05294272429135327,
+              "null_mean": 0.013783415932964166,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          }
+        },
+        "3": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.12950808108100506,
+              "null_mean": 0.013796728671492469,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.025948125136605677,
+              "null_mean": 0.004302526769070667,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.08228759954253029,
+              "null_mean": 0.014620595852778915,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.11465768262378273,
+              "null_mean": 0.013122611813941431,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.07170420423816175,
+              "null_mean": 0.012336219699600116,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.013248996290549379,
+              "null_mean": 0.0069268221986492455,
+              "p_value": 0.03980099502487562,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.05062998683643105,
+              "null_mean": 0.012305441316711683,
+              "p_value": 0.06965174129353234,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.08404911828985479,
+              "null_mean": 0.011864308247700777,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.08105852400269313,
+              "null_mean": 0.012607898588702236,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.023707474480556892,
+              "null_mean": 0.005748361477165833,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.11957309440052644,
+              "null_mean": 0.01237416792682469,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.0943631410206458,
+              "null_mean": 0.0127482711360073,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.022623200562432368,
+              "null_mean": 0.01023229561234701,
+              "p_value": 0.07960199004975124,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.01563006296290969,
+              "null_mean": 0.0134578172920367,
+              "p_value": 0.3383084577114428,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.011791791078886824,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.03352216024184118,
+              "null_mean": 0.010341667689612803,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.06797914500255357,
+              "null_mean": 0.01238905384413426,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.022218295077321003,
+              "null_mean": 0.0047702227036869535,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.014870977821328957,
+              "null_mean": 0.013664655587948963,
+              "p_value": 0.29850746268656714,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.10289188039291364,
+              "null_mean": 0.013726638655011988,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.045943017448362336,
+              "null_mean": 0.013378252480533728,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.010853169159370587,
+              "null_mean": 0.0048683383475567185,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.04582735815364014,
+              "null_mean": 0.013633649124649358,
+              "p_value": 0.09950248756218906,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.05989058753734694,
+              "null_mean": 0.013784100986816922,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "bank_path": "checkpoints/_shared_refine_cache/v4/regime_bank_nsw_price__watt_pv_mag.npz",
+      "dates_covered": 367,
+      "per_lag": {
+        "0": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.1167082103224443,
+              "null_mean": 0.013152233858611185,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.06686148303748829,
+              "null_mean": 0.008969061208903027,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.04029261643860238,
+              "null_mean": 0.014371919314134023,
+              "p_value": 0.12437810945273632,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.11451016547301318,
+              "null_mean": 0.013657733686514214,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.06404327029043681,
+              "null_mean": 0.011536466897006055,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.03962752042421071,
+              "null_mean": 0.010109206788681675,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.09347914555119718,
+              "null_mean": 0.015121529736680607,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.069217527484148,
+              "null_mean": 0.012072964728847644,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.061973347895526484,
+              "null_mean": 0.012760403006464667,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.03856719060640254,
+              "null_mean": 0.009284606375394798,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.08882481575469825,
+              "null_mean": 0.01411845342490821,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.06583142665028363,
+              "null_mean": 0.012452074602606111,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.013360478448108105,
+              "null_mean": 0.010488199380382835,
+              "p_value": 0.31840796019900497,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.03412722364828351,
+              "null_mean": 0.011842316279610896,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.021270507685887452,
+              "null_mean": 0.010804326178705978,
+              "p_value": 0.21890547263681592,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.03460119723142441,
+              "null_mean": 0.009837510521076369,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.08885634021830384,
+              "null_mean": 0.014491497103052364,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.0471172465054072,
+              "null_mean": 0.00937619209186905,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.07579518208540614,
+              "null_mean": 0.014615368659899592,
+              "p_value": 0.01990049751243781,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.08759216583133417,
+              "null_mean": 0.01374706571037943,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.04624799219971827,
+              "null_mean": 0.012893363688764694,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.032016282805931,
+              "null_mean": 0.009198230795715934,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0338328986920331,
+              "null_mean": 0.013902582250338255,
+              "p_value": 0.15422885572139303,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.06336611078075838,
+              "null_mean": 0.013329161188695742,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          }
+        },
+        "1": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.11910344609808377,
+              "null_mean": 0.013748653696694552,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.056365475944574,
+              "null_mean": 0.009773624184247926,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.029537436352876867,
+              "null_mean": 0.0117916136532248,
+              "p_value": 0.17412935323383086,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.10773473003477851,
+              "null_mean": 0.014257830702524303,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.05104649466576454,
+              "null_mean": 0.011698182761221294,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.0315581059119679,
+              "null_mean": 0.009750288266782089,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.042734174314066564,
+              "null_mean": 0.015513267343854697,
+              "p_value": 0.13432835820895522,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.05738409157500979,
+              "null_mean": 0.012939256770487084,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.05623473730288531,
+              "null_mean": 0.012374974410716803,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.04134436071844639,
+              "null_mean": 0.009463803995394727,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.06298748364614681,
+              "null_mean": 0.013406172559949163,
+              "p_value": 0.04477611940298507,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.06230919324158701,
+              "null_mean": 0.012897729432967502,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.0013676916940386975,
+              "null_mean": 0.010931870047838535,
+              "p_value": 0.9154228855721394,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.018939719616630768,
+              "null_mean": 0.011750688239901618,
+              "p_value": 0.1044776119402985,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.04219528996326449,
+              "null_mean": 0.00990917588635825,
+              "p_value": 0.06467661691542288,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.007852515047725883,
+              "null_mean": 0.00942898120186759,
+              "p_value": 0.5472636815920398,
+              "significant": false
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.10937460969134731,
+              "null_mean": 0.014222359066542732,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.03744374639195731,
+              "null_mean": 0.008971894181821457,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0898593706073032,
+              "null_mean": 0.014206496462646257,
+              "p_value": 0.01990049751243781,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.07031678058287344,
+              "null_mean": 0.014413092650352627,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.030119913902051466,
+              "null_mean": 0.013349058923151573,
+              "p_value": 0.05970149253731343,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.021016683371178946,
+              "null_mean": 0.009284590834368696,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.04650482687357549,
+              "null_mean": 0.015025382970597235,
+              "p_value": 0.0945273631840796,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.04078425766025673,
+              "null_mean": 0.01343244243032971,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          }
+        },
+        "2": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.11357952648230948,
+              "null_mean": 0.014559777104836304,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.04590342493438431,
+              "null_mean": 0.009703512727441566,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.00748116909562313,
+              "null_mean": 0.013856374158876883,
+              "p_value": 0.417910447761194,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.09936930292146728,
+              "null_mean": 0.01454869919387701,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.060030852024103784,
+              "null_mean": 0.013483127856683472,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.03021893092052159,
+              "null_mean": 0.00967831280827994,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0740203937569417,
+              "null_mean": 0.012799027026662078,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.051286304393409976,
+              "null_mean": 0.012240889872633422,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.08127088992334741,
+              "null_mean": 0.013910902022455589,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.036477998572564806,
+              "null_mean": 0.009481402175065328,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.07942220826825608,
+              "null_mean": 0.012785242041697776,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.05651766428592486,
+              "null_mean": 0.012964458017029437,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.00911677064796983,
+              "null_mean": 0.01115047643781785,
+              "p_value": 0.5373134328358209,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.023805455460799062,
+              "null_mean": 0.011397646650954961,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.008639535407624521,
+              "null_mean": 0.01118615580454306,
+              "p_value": 0.35323383084577115,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.022063336039268133,
+              "null_mean": 0.010774513390016454,
+              "p_value": 0.06965174129353234,
+              "significant": false
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.08212767876174124,
+              "null_mean": 0.01423522279358323,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.04017273854234625,
+              "null_mean": 0.009368962686717856,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.03115678529086452,
+              "null_mean": 0.015727445177639864,
+              "p_value": 0.22885572139303484,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.07206406678506388,
+              "null_mean": 0.013455049316353045,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.03576302974135572,
+              "null_mean": 0.01270550608769055,
+              "p_value": 0.03482587064676617,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.020055724245127138,
+              "null_mean": 0.008816289764863502,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.01956496113990802,
+              "null_mean": 0.01275001526682367,
+              "p_value": 0.263681592039801,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.020292072796072036,
+              "null_mean": 0.013200653504762178,
+              "p_value": 0.12935323383084577,
+              "significant": false
+            }
+          }
+        },
+        "3": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.10352256679286125,
+              "null_mean": 0.013731690456183386,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.050149712384514,
+              "null_mean": 0.00900580118957496,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.009938587006574906,
+              "null_mean": 0.011911462378846145,
+              "p_value": 0.34328358208955223,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.11291227699002526,
+              "null_mean": 0.013717414530398674,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.0667550959273436,
+              "null_mean": 0.011494154861380095,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.02819636600038149,
+              "null_mean": 0.009877915929037367,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0026922629695125266,
+              "null_mean": 0.012316606221960846,
+              "p_value": 0.4129353233830846,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.049221926619135714,
+              "null_mean": 0.011834955141607427,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.06556923870080933,
+              "null_mean": 0.012869769638227559,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.04025090307285593,
+              "null_mean": 0.009453209023606655,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.005366178406338129,
+              "null_mean": 0.011704678783274844,
+              "p_value": 0.3880597014925373,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.07417237438745283,
+              "null_mean": 0.012994389817025808,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.029702367016311727,
+              "null_mean": 0.010738571485724208,
+              "p_value": 0.024875621890547265,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.018233032329906015,
+              "null_mean": 0.012054421210644435,
+              "p_value": 0.11940298507462686,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.008142708703894894,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.024056835661298792,
+              "null_mean": 0.011016146052138475,
+              "p_value": 0.05472636815920398,
+              "significant": false
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.06483137637682938,
+              "null_mean": 0.014834099414332955,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.04040286367475852,
+              "null_mean": 0.009558786640759456,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.05761840741879087,
+              "null_mean": 0.012152098714386496,
+              "p_value": 0.05970149253731343,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.09235618320704325,
+              "null_mean": 0.013965632297717159,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.017725918643178674,
+              "null_mean": 0.013428649528620402,
+              "p_value": 0.27860696517412936,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.02481523190879288,
+              "null_mean": 0.009126760897997084,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.01338711126931357,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.040649849540266625,
+              "null_mean": 0.01307658055286847,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "bank_path": "checkpoints/_shared_refine_cache/v4/regime_bank_nsw_price__reneweconomy_web_stories_2024.npz",
+      "dates_covered": 367,
+      "per_lag": {
+        "0": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.09372068331359609,
+              "null_mean": 0.010028021704036338,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.01783888950916542,
+              "null_mean": 0.0026998727522333254,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.020031805965082583,
+              "null_mean": 0.010952542917768076,
+              "p_value": 0.2537313432835821,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.14799228531512348,
+              "null_mean": 0.009546368855140366,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.0462685722416956,
+              "null_mean": 0.01038423024199073,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.012315295702913105,
+              "null_mean": 0.005688333926572661,
+              "p_value": 0.01990049751243781,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.010832851790066274,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.07945973598845468,
+              "null_mean": 0.010376273101229723,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.04585552952859251,
+              "null_mean": 0.008640871529858088,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.006361146097828259,
+              "null_mean": 0.0038342556531590134,
+              "p_value": 0.12437810945273632,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.02775306054688631,
+              "null_mean": 0.009779852224590841,
+              "p_value": 0.14925373134328357,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.07945207609017407,
+              "null_mean": 0.008676579489876605,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.0417708525397801,
+              "null_mean": 0.012193137383511132,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.020037988702925346,
+              "null_mean": 0.013161569170224761,
+              "p_value": 0.1044776119402985,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.0017923143273366193,
+              "null_mean": 0.010627713778683812,
+              "p_value": 0.4079601990049751,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.07527461732781926,
+              "null_mean": 0.011263640812845244,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.1363721585936105,
+              "null_mean": 0.00870436432951481,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.018752903111020278,
+              "null_mean": 0.0025177214467070295,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.11085171495824397,
+              "null_mean": 0.009187915803480828,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.1670248800040079,
+              "null_mean": 0.009247136699632301,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.03700926234822077,
+              "null_mean": 0.010024568495669602,
+              "p_value": 0.024875621890547265,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.0062371687889060555,
+              "null_mean": 0.002978628171836692,
+              "p_value": 0.07462686567164178,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.030223314796062883,
+              "null_mean": 0.010158452844770696,
+              "p_value": 0.13432835820895522,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.04704827467068329,
+              "null_mean": 0.010650608072189172,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            }
+          }
+        },
+        "1": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.09635148140185815,
+              "null_mean": 0.009975784019730347,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.014373398361207834,
+              "null_mean": 0.0026194465460052537,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0233367368421753,
+              "null_mean": 0.010132816696249068,
+              "p_value": 0.19402985074626866,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.13314500010658825,
+              "null_mean": 0.010281742800288794,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.04761514987608919,
+              "null_mean": 0.01095766672280332,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.0132016126294904,
+              "null_mean": 0.00598524856978659,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0029826951587996753,
+              "null_mean": 0.009262632197283212,
+              "p_value": 0.44776119402985076,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.07686417257570755,
+              "null_mean": 0.011972524135612719,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.03348012628282291,
+              "null_mean": 0.01029409948634548,
+              "p_value": 0.04975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.007619513386133721,
+              "null_mean": 0.004034873233442416,
+              "p_value": 0.07960199004975124,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.017788705524778514,
+              "null_mean": 0.010457398159684033,
+              "p_value": 0.25870646766169153,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.0756322379705322,
+              "null_mean": 0.011270394457563114,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.02392984747837188,
+              "null_mean": 0.011578998434099565,
+              "p_value": 0.11442786069651742,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.025969291013002493,
+              "null_mean": 0.013981142588424667,
+              "p_value": 0.029850746268656716,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.009299167979462593,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.06360843594126464,
+              "null_mean": 0.012444245186394722,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.13911294451923356,
+              "null_mean": 0.010055144377842069,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.0182375987037958,
+              "null_mean": 0.0028049842770836594,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0902493726039415,
+              "null_mean": 0.010157852261854316,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.1645325069765214,
+              "null_mean": 0.010411625597568207,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.030998844199210573,
+              "null_mean": 0.010707186921957254,
+              "p_value": 0.05472636815920398,
+              "significant": false
+            },
+            "topic_tag_mass": {
+              "mi": 0.004724209132762288,
+              "null_mean": 0.002996959070570336,
+              "p_value": 0.1890547263681592,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.0009564405479767224,
+              "null_mean": 0.008864396257333707,
+              "p_value": 0.4626865671641791,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.03849108171139026,
+              "null_mean": 0.010235941501878468,
+              "p_value": 0.01990049751243781,
+              "significant": true
+            }
+          }
+        },
+        "2": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.09406818568125956,
+              "null_mean": 0.01001197083680195,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.014721047922554954,
+              "null_mean": 0.002874124172885796,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.048288635107625044,
+              "null_mean": 0.008346300150582263,
+              "p_value": 0.029850746268656716,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.12781418036367992,
+              "null_mean": 0.01153639816678317,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.04752091748036937,
+              "null_mean": 0.010519460180417259,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.011782928562294051,
+              "null_mean": 0.00604078884239183,
+              "p_value": 0.029850746268656716,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.010743837399804055,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.06502580074026248,
+              "null_mean": 0.010759688399497076,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.04461220095399145,
+              "null_mean": 0.010411942642263592,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.011594215414742615,
+              "null_mean": 0.0039741242921765155,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.024804336749412847,
+              "null_mean": 0.01014286457765178,
+              "p_value": 0.17412935323383086,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.09009611966798253,
+              "null_mean": 0.010488565933005558,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.05612966333680243,
+              "null_mean": 0.012833016312267879,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.01474787115578883,
+              "null_mean": 0.013672995175769581,
+              "p_value": 0.40298507462686567,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.013027832829188082,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.05650704056807576,
+              "null_mean": 0.012093482073149203,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.1576707278249679,
+              "null_mean": 0.010109942108328223,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.023058307401477733,
+              "null_mean": 0.0027050282795986593,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.13150825443907932,
+              "null_mean": 0.011245672633304529,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.20992560178698144,
+              "null_mean": 0.009635823275205348,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.03833050703458172,
+              "null_mean": 0.01037558795033572,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.007996087920508129,
+              "null_mean": 0.0028684480820301284,
+              "p_value": 0.024875621890547265,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.00016440609596113376,
+              "null_mean": 0.008753027482974986,
+              "p_value": 0.472636815920398,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.04386570423205083,
+              "null_mean": 0.010621457548743975,
+              "p_value": 0.014925373134328358,
+              "significant": true
+            }
+          }
+        },
+        "3": {
+          "mean": {
+            "regime_vec": {
+              "mi": 0.10463186592658591,
+              "null_mean": 0.009760172725143153,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.017214496043855707,
+              "null_mean": 0.0026995204034021367,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.05396822792073053,
+              "null_mean": 0.009929178699016156,
+              "p_value": 0.01990049751243781,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.13353213350247833,
+              "null_mean": 0.010379864866816049,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "max": {
+            "regime_vec": {
+              "mi": 0.050853795867180994,
+              "null_mean": 0.01067328208424855,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.006893620614038539,
+              "null_mean": 0.005704880701793726,
+              "p_value": 0.2885572139303483,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.00946795995765101,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.06272488004230142,
+              "null_mean": 0.010875671656625263,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            }
+          },
+          "p95": {
+            "regime_vec": {
+              "mi": 0.05788390441970712,
+              "null_mean": 0.010689173780077969,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.011833753185302064,
+              "null_mean": 0.004270109247831619,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.015210300178114977,
+              "null_mean": 0.011027108603931192,
+              "p_value": 0.31343283582089554,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.09528758816175392,
+              "null_mean": 0.01017444679325605,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "spike_count": {
+            "regime_vec": {
+              "mi": 0.06327508304618172,
+              "null_mean": 0.011853245451754897,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.012480071356470763,
+              "null_mean": 0.013987567520176469,
+              "p_value": 0.572139303482587,
+              "significant": false
+            },
+            "relevance_mass": {
+              "mi": 0.0,
+              "null_mean": 0.012456810424212166,
+              "p_value": 1.0,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.04932193938472784,
+              "null_mean": 0.011257195880819668,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            }
+          },
+          "resid_mean": {
+            "regime_vec": {
+              "mi": 0.16280096186278784,
+              "null_mean": 0.010134285273398514,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.020076476296575406,
+              "null_mean": 0.002610624554388574,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.12962088406397765,
+              "null_mean": 0.011591708785765695,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            },
+            "text_emb_pca8": {
+              "mi": 0.22901544391248718,
+              "null_mean": 0.009688021997823525,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          },
+          "resid_max": {
+            "regime_vec": {
+              "mi": 0.06446092492532536,
+              "null_mean": 0.00942423062742164,
+              "p_value": 0.009950248756218905,
+              "significant": true
+            },
+            "topic_tag_mass": {
+              "mi": 0.007808281958579499,
+              "null_mean": 0.002950646599691099,
+              "p_value": 0.029850746268656716,
+              "significant": true
+            },
+            "relevance_mass": {
+              "mi": 0.02687743578363211,
+              "null_mean": 0.009683215785345665,
+              "p_value": 0.12437810945273632,
+              "significant": false
+            },
+            "text_emb_pca8": {
+              "mi": 0.06826557507225783,
+              "null_mean": 0.010881606931993576,
+              "p_value": 0.004975124378109453,
+              "significant": true
+            }
+          }
+        }
+      }
+    }
+  ],
+  "config": {
+    "regime_banks": [
+      "checkpoints/_shared_refine_cache/v4/regime_bank_nsw_price__pv_magazine_australia_news.npz",
+      "checkpoints/_shared_refine_cache/v4/regime_bank_nsw_price__watt_pv_mag.npz",
+      "checkpoints/_shared_refine_cache/v4/regime_bank_nsw_price__reneweconomy_web_stories_2024.npz"
+    ],
+    "train_file": "dataset/2024NSWelecPRICE/2024NSWelecPRICE_trainset.csv",
+    "val_file": "dataset/2024NSWelecPRICE/2024NSWelecPRICE_valset.csv",
+    "test_file": "dataset/2024NSWelecPRICE/2024NSWelecPRICE_testset.csv",
+    "time_col": "date",
+    "value_col": "RRP",
+    "day_first": true,
+    "lags": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "n_perms": 200,
+    "seed": 0,
+    "output": "results/diagnose_news_price_signal.json"
+  }
+}
