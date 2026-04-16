@@ -5,6 +5,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from ..delta.core import _build_delta_scheduler
+
 
 def _iter_batches(payload: dict[str, torch.Tensor], batch_size: int, *, shuffle: bool):
     if not payload:
@@ -30,6 +32,9 @@ def run_regime_self_supervised_pretrain(
     lr: float,
     device,
     batch_size: int = 64,
+    scheduler_name: str = "warmup_cosine",
+    warmup_pct: float = 0.10,
+    min_lr_ratio: float = 0.05,
     live_logger=None,
 ):
     if int(max(0, epochs)) <= 0:
@@ -47,6 +52,15 @@ def run_regime_self_supervised_pretrain(
         list(model.regime_projector.parameters()) + list(helper_head.parameters()),
         lr=float(lr),
         weight_decay=1e-5,
+    )
+    steps_per_epoch = math.ceil(int(next(iter(train_payload.values())).shape[0]) / max(1, int(batch_size)))
+    total_steps = int(max(1, steps_per_epoch) * int(epochs))
+    scheduler = _build_delta_scheduler(
+        optimizer,
+        total_steps=total_steps,
+        scheduler_name=scheduler_name,
+        warmup_pct=warmup_pct,
+        min_lr_ratio=min_lr_ratio,
     )
 
     best_loss = math.inf
@@ -71,6 +85,8 @@ def run_regime_self_supervised_pretrain(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             train_loss_sum += float(loss.detach().cpu())
             train_steps += 1
 
@@ -98,7 +114,8 @@ def run_regime_self_supervised_pretrain(
         if live_logger is not None:
             live_logger.info(
                 f"[DELTA_V3][PRETRAIN_V2] epoch={epoch + 1} "
-                f"train_loss={train_loss_sum / max(1, train_steps):.4f} val_loss={val_loss:.4f}"
+                f"train_loss={train_loss_sum / max(1, train_steps):.4f} val_loss={val_loss:.4f} "
+                f"lr={optimizer.param_groups[0]['lr']:.2e}"
             )
         if val_loss < best_loss:
             best_loss = val_loss

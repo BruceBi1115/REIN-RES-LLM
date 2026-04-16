@@ -22,7 +22,7 @@ from ..base.common import (
     _z_batch_tensors,
 )
 from ..base_backbone import load_base_backbone_checkpoint
-from ..delta.core import _build_delta_optimizer, skill_score
+from ..delta.core import _build_delta_optimizer, _build_delta_scheduler, skill_score
 from ..delta_news_hooks import build_news_api_adapter
 from ..utils.batch_utils import _batch_time_seq_for_sample
 from ..utils.utils import draw_pred_true, record_test_results_csv
@@ -930,6 +930,9 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
         epochs=cfg.pretrain_epochs,
         lr=cfg.pretrain_lr,
         device=device,
+        scheduler_name=cfg.scheduler,
+        warmup_pct=cfg.pretrain_warmup_pct,
+        min_lr_ratio=cfg.min_lr_ratio,
         live_logger=live_logger,
     )
     if math.isfinite(float(pretrain_diag.get("best_loss", float("nan")))):
@@ -946,6 +949,22 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
         drop_last=False,
     )
     optimizer = _build_delta_optimizer(model, args)
+    total_steps = len(train_loader) * int(args.epochs)
+    scheduler = _build_delta_scheduler(
+        optimizer,
+        total_steps=total_steps,
+        scheduler_name=cfg.scheduler,
+        warmup_pct=cfg.warmup_pct,
+        min_lr_ratio=cfg.min_lr_ratio,
+    )
+    warmup_steps = min(
+        max(0, int(total_steps * float(max(0.0, cfg.warmup_pct)))),
+        max(0, total_steps - 1),
+    )
+    live_logger.info(
+        f"[DELTA_V3][LR] scheduler={cfg.scheduler} total_steps={total_steps} "
+        f"warmup_steps={warmup_steps} min_lr={float(args.lr) * float(cfg.min_lr_ratio):.2e}"
+    )
 
     best_metric = float("inf")
     best_fallback_metric = float("inf")  # Plan B safety net: tracks lowest val_mae when gate never passes
@@ -1132,6 +1151,8 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
             if cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             train_loss_sum += float(loss.detach().cpu())
             train_steps += 1
@@ -1206,6 +1227,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
             f"inactive_gap_pct={float(diag.get('inactive_blank_gap_pct', float('nan'))):.3f} "
             f"perm_active={float(diag.get('permuted_active_subset_mae', float('nan'))):.6f} "
             f"gate={gate_reason} "
+            f"lr={optimizer.param_groups[0]['lr']:.2e} "
             f"lambda={float(diag.get('lambda_base_mean', 0.0)):.4f} "
             f"lambda_sat={float(diag.get('lambda_saturation_pct', 0.0)):.3f} "
             f"shape_gain={float(diag.get('shape_gain_mean', 1.0)):.4f} "

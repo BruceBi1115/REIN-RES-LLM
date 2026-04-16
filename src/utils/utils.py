@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import os
 import random
+import re
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -73,22 +74,45 @@ def draw_pred_true(live_logger, args, true_pred_csv_path):
         live_logger.error(f"Failed to draw Pred vs True plot: {exc}")
 
 
+def _sanitize_task_component(value, *, default: str = "na", strip_extension: bool = False) -> str:
+    text = "" if value is None else str(value).strip()
+    if strip_extension:
+        text = os.path.splitext(os.path.basename(text))[0]
+    if not text:
+        text = default
+    text = text.replace("/", "-").replace("\\", "-")
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or default
+
+
+def _extract_task_name_parts(raw_task_name: str) -> tuple[str, str]:
+    text = "" if raw_task_name is None else str(raw_task_name).strip()
+    match = re.match(r"^(?P<base>.+?)__lr(?P<lr>[^_]+)__ga[^_]+__sch[^_]+(?P<suffix>.*)$", text)
+    if match:
+        base_name = f"{match.group('base')}{match.group('suffix')}" or "task1"
+        return base_name, match.group("lr").strip()
+    return text or "task1", ""
+
+
 def build_experiment_task_name(args) -> str:
-    base_task_name = str(
+    raw_task_name = str(
         getattr(args, "_raw_task_name", None) or getattr(args, "taskName", "task1") or "task1"
     ).strip()
+    task_base_name, task_lr = _extract_task_name_parts(raw_task_name)
     parts = [
-        base_task_name,
-        str(getattr(args, "stage", "all") or "all").strip(),
-        f"s{int(getattr(args, 'stride', 1) or 1)}",
-        f"h{int(getattr(args, 'horizon', 1) or 1)}",
-        f"dataset-{str(getattr(args, 'dataset_key', 'unknown') or 'unknown').strip()}",
-        f"base-{str(getattr(args, 'base_backbone', 'mlp') or 'mlp').strip()}",
+        _sanitize_task_component(task_base_name, default="task1"),
+        _sanitize_task_component(getattr(args, "base_backbone", "mlp"), default="mlp"),
+        _sanitize_task_component(getattr(args, "news_path", ""), default="no-news", strip_extension=True),
+        _sanitize_task_component(getattr(args, "stride", 1), default="1"),
+        _sanitize_task_component(getattr(args, "horizon", 1), default="1"),
+        _sanitize_task_component(task_lr or getattr(args, "lr", "1e-4"), default="1e-4"),
+        _sanitize_task_component(getattr(args, "delta_v3_active_mass_threshold", "0.7"), default="0.7"),
+        _sanitize_task_component(
+            getattr(args, "delta_v3_text_encoder_model_id", "intfloat-e5-small-v2"),
+            default="intfloat-e5-small-v2",
+        ),
     ]
-    if str(getattr(args, "stage", "all")).lower() in {"delta", "all"}:
-        parts.append(f"delta-v3-{str(getattr(args, 'delta_v3_schema_variant', 'generic') or 'generic').strip()}")
-    if getattr(args, "news_path", None):
-        parts.append(os.path.basename(str(getattr(args, "news_path"))))
     return "_".join(parts)
 
 

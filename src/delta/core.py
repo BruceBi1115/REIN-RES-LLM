@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 
 def _match_horizon_shape(values: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -67,6 +68,59 @@ def _build_delta_optimizer(model: torch.nn.Module, args) -> AdamW:
     lr = float(getattr(args, "lr", 1e-4))
     weight_decay = float(getattr(args, "weight_decay", 0.0))
     return AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+
+def _build_delta_scheduler(
+    optimizer: AdamW,
+    *,
+    total_steps: int,
+    scheduler_name: str,
+    warmup_pct: float,
+    min_lr_ratio: float,
+):
+    total_steps = int(max(0, total_steps))
+    name = str(scheduler_name or "none").strip().lower()
+    if name == "none" or total_steps <= 0:
+        return None
+
+    base_lr = float(optimizer.param_groups[0].get("lr", 0.0))
+    eta_min = max(0.0, float(base_lr) * float(max(0.0, min_lr_ratio)))
+
+    if name == "cosine":
+        return CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, total_steps),
+            eta_min=eta_min,
+        )
+
+    if name != "warmup_cosine":
+        raise ValueError(f"Unknown delta scheduler: {scheduler_name}")
+
+    warmup_steps = int(total_steps * float(max(0.0, warmup_pct)))
+    warmup_steps = min(max(0, warmup_steps), max(0, total_steps - 1))
+    if warmup_steps <= 0:
+        return CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, total_steps),
+            eta_min=eta_min,
+        )
+
+    warmup = LinearLR(
+        optimizer,
+        start_factor=1e-3,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, total_steps - warmup_steps),
+        eta_min=eta_min,
+    )
+    return SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps],
+    )
 
 
 def skill_score(metric_value: float, base_value: float) -> float:

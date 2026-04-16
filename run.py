@@ -125,6 +125,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--delta_v3_pretrain_epochs", type=int, default=12)
     parser.add_argument("--delta_v3_pretrain_lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--delta_v3_scheduler",
+        type=str,
+        default="warmup_cosine",
+        choices=["none", "cosine", "warmup_cosine"],
+    )
+    parser.add_argument("--delta_v3_warmup_pct", type=float, default=0.05)
+    parser.add_argument("--delta_v3_min_lr_ratio", type=float, default=0.05)
+    parser.add_argument("--delta_v3_pretrain_warmup_pct", type=float, default=0.10)
     parser.add_argument("--delta_v3_price_winsor_low", type=float, default=0.005)
     parser.add_argument("--delta_v3_price_winsor_high", type=float, default=0.995)
 

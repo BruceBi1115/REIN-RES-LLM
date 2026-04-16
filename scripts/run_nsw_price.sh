@@ -19,7 +19,7 @@ DAY_FIRST="1"
 TRAIN_FILE="dataset/2024NSWelecPRICE/2024NSWelecPRICE_trainset.csv"
 VAL_FILE="dataset/2024NSWelecPRICE/2024NSWelecPRICE_valset.csv"
 TEST_FILE="dataset/2024NSWelecPRICE/2024NSWelecPRICE_testset.csv"
-DEFAULT_NEWS_PATH="dataset/pv_magazine_australia_news.json"
+DEFAULT_NEWS_PATH="dataset/[price]freeNews_reneweconomy_pvmag_watt.json"
 
 BASE_EPOCHS="40"
 DELTA_EPOCHS="30"

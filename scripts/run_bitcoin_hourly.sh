@@ -6,7 +6,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 RUN_SCRIPT_NAME="scripts/run_bitcoin_hourly.sh"
 RUN_SCRIPT_PATH="$SCRIPT_DIR/run_bitcoin_hourly.sh"
 
-DATASET_KEY="bitcoin_hourly_22_23_open"
+DATASET_KEY="bitcoin_hourly_24"
 TIME_COL="DATETIME"
 VALUE_COL="OPEN"
 ID_COL=""
@@ -16,10 +16,10 @@ REGION="Global crypto market"
 FREQ_MIN="60"
 DAY_FIRST="1"
 
-TRAIN_FILE="dataset/bitcoin_hourly_22_23_open/bitcoin-hourly-technical-indicators_22_23_trainset.csv"
-VAL_FILE="dataset/bitcoin_hourly_22_23_open/bitcoin-hourly-technical-indicators_22_23_valset.csv"
-TEST_FILE="dataset/bitcoin_hourly_22_23_open/bitcoin-hourly-technical-indicators_22_23_testset.csv"
-DEFAULT_NEWS_PATH="dataset/nasdaq_news_summary.json"
+TRAIN_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_trainset.csv"
+VAL_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_valset.csv"
+TEST_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_testset.csv"
+DEFAULT_NEWS_PATH="dataset/"
 
 STAGE="all"
 BASE_EPOCHS="40"
@@ -38,10 +38,11 @@ TASK_NAME_BASE="delta_v3_bitcoin_hourly"
 PRE_RUN_HOOK=""
 
 DELTA_V3_REGIME_BANK_BUILD="1"
+DELTA_V3_ACTIVE_MASS_THRESHOLD="0.3"
 
 NEWS_API_ENABLE="1"
 DELTA_V3_SCHEMA_VARIANT="price"
-DELTA_V3_REGIME_BANK_PATH="checkpoints/_shared_refine_cache/v4/regime_bank_bitcoin_hourly_22_23_open.npz"
+DELTA_V3_REGIME_BANK_PATH="checkpoints/_shared_refine_cache/v4/regime_bank_bitcoin_hourly_24.npz"
 
 DELTA_V3_TEXT_ENCODER_MODEL_ID="intfloat/e5-small-v2"
 DELTA_V3_TEXT_ENCODER_MAX_LENGTH="256"
@@ -68,7 +69,7 @@ DELTA_V3_CONSISTENCY_WEIGHT="0.30"
 DELTA_V3_COUNTERFACTUAL_WEIGHT="0.25"
 DELTA_V3_COUNTERFACTUAL_MARGIN="0.02"
 DELTA_V3_SPIKE_BIAS_L2="1e-3"
-DELTA_V3_ACTIVE_MASS_THRESHOLD="0.7"
+
 DELTA_V3_LAMBDA_MIN="0.05"
 DELTA_V3_LAMBDA_TS_CAP="0.30"
 DELTA_V3_LAMBDA_NEWS_CAP="0.12"
@@ -92,7 +93,7 @@ NEWS_PATH="${NEWS_PATH:-$DEFAULT_NEWS_PATH}"
 NEWS_CACHE_TAG="$(basename -- "${NEWS_PATH%.json}")"
 
 if [[ -z "${DELTA_V3_REGIME_BANK_BUILD+x}" ]]; then
-  if [[ -f "checkpoints/_shared_refine_cache/v4/regime_bank_bitcoin_hourly_22_23_open__${NEWS_CACHE_TAG}.npz" || -f "$DELTA_V3_REGIME_BANK_PATH" ]]; then
+  if [[ -f "checkpoints/_shared_refine_cache/v4/regime_bank_bitcoin_hourly_24__${NEWS_CACHE_TAG}.npz" || -f "$DELTA_V3_REGIME_BANK_PATH" ]]; then
     DELTA_V3_REGIME_BANK_BUILD="0"
   else
     DELTA_V3_REGIME_BANK_BUILD="1"

@@ -136,54 +136,101 @@ def _default_record(doc: dict[str, Any], schema_variant: str) -> dict[str, Any]:
     }
 
 
-def _build_prompts(doc: dict[str, Any], schema_variant: str) -> tuple[str, str]:
+def _is_bitcoin_price_corpus(corpus_hint: str) -> bool:
+    hint = os.path.basename(str(corpus_hint or "")).strip().lower()
+    return any(token in hint for token in ("bitcoin", "btc", "crypto"))
+
+
+def _build_prompts(doc: dict[str, Any], schema_variant: str, corpus_hint: str = "") -> tuple[str, str]:
     title = str(doc.get("title", "")).strip()
     published_at = str(doc.get("date", "")).strip()
     content = str(doc.get("content", "") or doc.get("summary", "") or "").strip()
     body = _compact_summary(content, max_words=220)
     if schema_variant == "price":
-        system_prompt = (
-            "You are refining generic energy news for NSW electricity price forecasting into JSON. "
-            "Return JSON only, no markdown. "
-            "Favor recall over precision for is_actionable. "
-            "If an article has any plausible near-term pathway to move NSW wholesale price level or volatility, keep it actionable even if the impact is indirect, probabilistic, or only moderate. "
-            "For price, keep near-term operational and market-microstructure drivers, not just broad macro supply-demand themes. "
-            "Treat the following as potentially actionable if they are current, imminent, recently announced and still relevant, or likely to shape trader expectations within the next 14 days: "
-            "generator outages, deratings, planned maintenance, forced outages, unit returns, rebidding or bidding behavior, interconnector flows or constraints, transmission limits, fuel supply or spot-price shocks, heatwaves and cooling-demand peaks, renewable drought or renewable surges, reserve scarcity, market notices, operational advisories, and market interventions. "
-            "Do not filter out an article just because it is operational, plant-specific, scheduled rather than forced, framed as a market notice or advisory, or about another connected NEM region that can move NSW prices through interconnectors, shared weather, or fuel markets. "
-            "Routine maintenance notices, forecast updates, renewable output outlooks, and interconnector advisories can still be actionable if they plausibly affect price or volatility. "
-            "Set is_actionable=false only if the article is clearly retrospective, purely corporate or project news without a near-term operational cue, generic commentary with no concrete signal, or not plausibly relevant to NSW wholesale price within 14 days. "
-            "For borderline cases, prefer is_actionable=true with lower confidence rather than defaulting to false. "
-            "Use only the closed topic vocabulary: "
-            + ", ".join(TOPIC_TAGS)
-            + ". "
-            "If an article is clearly price-relevant but no topic fits well, keep is_actionable=true and include other instead of routine. "
-            "Reserve routine for articles with no clear operational or market signal. "
-            "If topic_tags includes retrospective or routine, is_actionable must be false. "
-            "Map price drivers into the existing tags and regime fields as follows: "
-            "outage, derating, maintenance, unit trip, tight reserve margin -> outage or supply_tight; "
-            "fuel shortage or fuel-cost shock -> fuel_shock; "
-            "interstate flow changes, interconnector outages, binding transmission constraints -> interconnector_limit; "
-            "heat-driven demand peaks -> heatwave; cold-driven demand peaks -> cold_snap; "
-            "high wind, solar, hydro, or excess imports suppressing price -> renewable_surge or supply_surplus; "
-            "low wind, low solar, drought, or import scarcity lifting price -> renewable_drought or supply_tight; "
-            "rebidding, scarcity pricing, spike risk, or abrupt operational uncertainty should raise volatility_tone; "
-            "administered pricing, market suspension, or intervention already in force -> market_intervention or policy_active and policy_in_effect=1. "
-            "Interpret regime_vec for price as: "
-            "tightness = near-term NSW supply-demand tightness and scarcity pressure on price; "
-            "demand_outlook = near-term load and cooling-demand pressure; "
-            "renewable_surplus = expected renewable abundance or import relief that suppresses price, negative when renewable scarcity lifts price; "
-            "volatility_tone = spike, scarcity, rebidding, outage, or constraint-driven price volatility risk; "
-            "policy_in_effect = 1 only when a policy or market intervention is already active. "
-            "For indirect but still relevant signals, use smaller-magnitude regime values instead of zeroing them out. "
-            "Return fields exactly: "
-            "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
-            "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
-            "volatility_tone is in [0,1]. "
-            "policy_in_effect is 0 or 1. "
-            "horizon_days is an integer in [0,14]. "
-            "summary must stay under 60 words and be factual."
-        )
+        if _is_bitcoin_price_corpus(corpus_hint):
+            system_prompt = (
+                "You are refining generic news for Bitcoin hourly price forecasting into JSON. "
+                "Return JSON only, no markdown. "
+                "Favor recall over precision for is_actionable, and be slightly loose on borderline cases. "
+                "If an article has any plausible near-term pathway to move BTC spot level, flows, positioning, or volatility within the next 14 days, keep it actionable even if the pathway is indirect, sentiment-driven, or only moderate. "
+                "Treat the following as potentially actionable if they are current, imminent, recently announced and still relevant, or likely to shape trader expectations within the next 14 days: "
+                "ETF approvals or ETF flow updates, exchange or custody outages, regulatory or enforcement actions, stablecoin or crypto-liquidity stress, hacks or exploits, miner disruption or miner selling pressure, treasury or institutional accumulation, exchange reserve shifts, large liquidations, derivatives or funding stress, major macro rates or dollar shocks, and geopolitical or risk-asset shocks that plausibly spill into BTC. "
+                "Broader macro and geopolitical articles can still be actionable for BTC if they plausibly affect crypto risk appetite, liquidity, safe-haven demand, or volatility. "
+                "However, clearly unrelated human-interest, local civic, lifestyle, or sector-specific news with no plausible BTC or macro-risk transmission path should be non-actionable even if it is current. "
+                "Set is_actionable=false only if the article is clearly unrelated to BTC and broad risk conditions, purely retrospective, generic commentary with no fresh signal, or stale corporate or project news without a near-term trading path. "
+                "For borderline cases, prefer is_actionable=true with lower confidence rather than defaulting to false. "
+                "Use only the closed topic vocabulary: "
+                + ", ".join(TOPIC_TAGS)
+                + ". "
+                "If an article is clearly BTC-relevant but the legacy topic set is awkward, keep is_actionable=true and include other instead of routine. "
+                "Reserve routine for articles with no clear BTC or macro trading signal. "
+                "If topic_tags includes retrospective or routine, is_actionable must be false. "
+                "Map BTC drivers into the existing tags and regime fields as follows: "
+                "ETF inflows, treasury buying, exchange outflows, supply squeeze, or bullish positioning pressure -> supply_tight; "
+                "ETF outflows, miner selling, large holder distribution, or exchange inflows -> supply_surplus; "
+                "exchange outages, custody disruptions, settlement problems, or mining/network disruptions -> outage; "
+                "stablecoin stress, funding stress, liquidation cascades, sharp rates or dollar shocks, or macro liquidity tightening -> fuel_shock or other; "
+                "regulation, ETF approval, enforcement, or trading restrictions already in force -> policy_active or market_intervention and policy_in_effect=1; "
+                "broad risk-on or liquidity-relief conditions that support BTC absorption and calm stress -> renewable_surge or other; "
+                "risk-off, deleveraging, or liquidity drain that pressures BTC -> renewable_drought or other. "
+                "Interpret regime_vec for BTC as: "
+                "tightness = near-term BTC spot supply scarcity, squeeze pressure, or upward price pressure; "
+                "demand_outlook = near-term investor demand, ETF or treasury flow, or adoption pressure; "
+                "renewable_surplus = use this slot as broad liquidity and risk-relief tone that cushions BTC, negative when tightening or risk-off conditions pressure BTC; "
+                "volatility_tone = event, leverage, liquidation, regulatory, macro, or shock-driven BTC volatility risk; "
+                "policy_in_effect = 1 only when a policy, approval, restriction, or intervention is already active. "
+                "For indirect but still relevant signals, use smaller-magnitude regime values instead of zeroing them out. "
+                "Return fields exactly: "
+                "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
+                "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
+                "volatility_tone is in [0,1]. "
+                "policy_in_effect is 0 or 1. "
+                "horizon_days is an integer in [0,14]. "
+                "summary must stay under 60 words and be factual."
+            )
+        else:
+            system_prompt = (
+                "You are refining generic energy news for NSW electricity price forecasting into JSON. "
+                "Return JSON only, no markdown. "
+                "Favor recall over precision for is_actionable. "
+                "If an article has any plausible near-term pathway to move NSW wholesale price level or volatility, keep it actionable even if the impact is indirect, probabilistic, or only moderate. "
+                "For price, keep near-term operational and market-microstructure drivers, not just broad macro supply-demand themes. "
+                "Treat the following as potentially actionable if they are current, imminent, recently announced and still relevant, or likely to shape trader expectations within the next 14 days: "
+                "generator outages, deratings, planned maintenance, forced outages, unit returns, rebidding or bidding behavior, interconnector flows or constraints, transmission limits, fuel supply or spot-price shocks, heatwaves and cooling-demand peaks, renewable drought or renewable surges, reserve scarcity, market notices, operational advisories, and market interventions. "
+                "Do not filter out an article just because it is operational, plant-specific, scheduled rather than forced, framed as a market notice or advisory, or about another connected NEM region that can move NSW prices through interconnectors, shared weather, or fuel markets. "
+                "Routine maintenance notices, forecast updates, renewable output outlooks, and interconnector advisories can still be actionable if they plausibly affect price or volatility. "
+                "Set is_actionable=false only if the article is clearly retrospective, purely corporate or project news without a near-term operational cue, generic commentary with no concrete signal, or not plausibly relevant to NSW wholesale price within 14 days. "
+                "For borderline cases, prefer is_actionable=true with lower confidence rather than defaulting to false. "
+                "Use only the closed topic vocabulary: "
+                + ", ".join(TOPIC_TAGS)
+                + ". "
+                "If an article is clearly price-relevant but no topic fits well, keep is_actionable=true and include other instead of routine. "
+                "Reserve routine for articles with no clear operational or market signal. "
+                "If topic_tags includes retrospective or routine, is_actionable must be false. "
+                "Map price drivers into the existing tags and regime fields as follows: "
+                "outage, derating, maintenance, unit trip, tight reserve margin -> outage or supply_tight; "
+                "fuel shortage or fuel-cost shock -> fuel_shock; "
+                "interstate flow changes, interconnector outages, binding transmission constraints -> interconnector_limit; "
+                "heat-driven demand peaks -> heatwave; cold-driven demand peaks -> cold_snap; "
+                "high wind, solar, hydro, or excess imports suppressing price -> renewable_surge or supply_surplus; "
+                "low wind, low solar, drought, or import scarcity lifting price -> renewable_drought or supply_tight; "
+                "rebidding, scarcity pricing, spike risk, or abrupt operational uncertainty should raise volatility_tone; "
+                "administered pricing, market suspension, or intervention already in force -> market_intervention or policy_active and policy_in_effect=1. "
+                "Interpret regime_vec for price as: "
+                "tightness = near-term NSW supply-demand tightness and scarcity pressure on price; "
+                "demand_outlook = near-term load and cooling-demand pressure; "
+                "renewable_surplus = expected renewable abundance or import relief that suppresses price, negative when renewable scarcity lifts price; "
+                "volatility_tone = spike, scarcity, rebidding, outage, or constraint-driven price volatility risk; "
+                "policy_in_effect = 1 only when a policy or market intervention is already active. "
+                "For indirect but still relevant signals, use smaller-magnitude regime values instead of zeroing them out. "
+                "Return fields exactly: "
+                "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
+                "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
+                "volatility_tone is in [0,1]. "
+                "policy_in_effect is 0 or 1. "
+                "horizon_days is an integer in [0,14]. "
+                "summary must stay under 60 words and be factual."
+            )
     elif schema_variant == "gas_demand":
         system_prompt = (
             "You are refining generic energy news for Netherlands gas demand forecasting into strict JSON. "
@@ -258,13 +305,14 @@ def refine_one_news_doc(
     doc: dict[str, Any],
     *,
     schema_variant: str,
+    corpus_hint: str = "",
     api_adapter: OpenAINewsApiAdapter | None,
 ) -> dict[str, Any]:
     record = _default_record(doc, schema_variant=schema_variant)
     if api_adapter is None:
         return record
 
-    system_prompt, user_prompt = _build_prompts(doc, schema_variant)
+    system_prompt, user_prompt = _build_prompts(doc, schema_variant, corpus_hint=corpus_hint)
     try:
         raw_output = api_adapter.chat_json(system_prompt, user_prompt, max_tokens=260)
     except Exception:
@@ -337,7 +385,12 @@ def refine_dataset_news_corpus(
         progress.set_postfix_str("actionable=0")
     with open(cache_path, "w", encoding="utf-8") as handle:
         for doc in progress:
-            refined = refine_one_news_doc(doc, schema_variant=schema_variant, api_adapter=api_adapter)
+            refined = refine_one_news_doc(
+                doc,
+                schema_variant=schema_variant,
+                corpus_hint=news_path,
+                api_adapter=api_adapter,
+            )
             if bool(refined.get("is_actionable", False)):
                 actionable_count += 1
             progress.set_postfix_str(f"actionable={actionable_count}")

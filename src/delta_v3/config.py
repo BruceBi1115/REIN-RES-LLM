@@ -86,6 +86,10 @@ class DeltaV3Config:
     hard_residual_pct: float
     pretrain_epochs: int
     pretrain_lr: float
+    scheduler: str
+    warmup_pct: float
+    min_lr_ratio: float
+    pretrain_warmup_pct: float
     price_winsor_low: float
     price_winsor_high: float
     grad_clip: float
@@ -160,6 +164,10 @@ class DeltaV3Config:
             hard_residual_pct=float(getattr(args, "delta_v3_hard_residual_pct", 0.10) or 0.10),
             pretrain_epochs=int(getattr(args, "delta_v3_pretrain_epochs", 12) or 12),
             pretrain_lr=float(getattr(args, "delta_v3_pretrain_lr", 1e-3) or 1e-3),
+            scheduler=str(getattr(args, "delta_v3_scheduler", "warmup_cosine") or "warmup_cosine").strip(),
+            warmup_pct=float(getattr(args, "delta_v3_warmup_pct", 0.05) or 0.05),
+            min_lr_ratio=float(getattr(args, "delta_v3_min_lr_ratio", 0.05) or 0.05),
+            pretrain_warmup_pct=float(getattr(args, "delta_v3_pretrain_warmup_pct", 0.10) or 0.10),
             price_winsor_low=float(getattr(args, "delta_v3_price_winsor_low", 0.005) or 0.005),
             price_winsor_high=float(getattr(args, "delta_v3_price_winsor_high", 0.995) or 0.995),
             grad_clip=float(getattr(args, "delta_v3_grad_clip", 1.0) or 1.0),
