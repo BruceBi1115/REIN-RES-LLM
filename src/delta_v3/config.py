@@ -4,6 +4,10 @@ import os
 import re
 from dataclasses import dataclass
 
+DEFAULT_SHARED_REFINE_CACHE_DIR = os.path.join("_shared_refine_cache", "v4")
+LEGACY_SHARED_REFINE_CACHE_DIR = os.path.join("checkpoints", "_shared_refine_cache", "v4")
+LEGACY_BACKUP_DIR = os.path.join("_shared_refine_cache", "LEGACY_BACKUP")
+
 
 def _sanitize_cache_component(value: str, *, fallback: str) -> str:
     clean = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "").strip())
@@ -19,6 +23,10 @@ def news_dataset_cache_tag(news_path: str) -> str:
     return _sanitize_cache_component(stem, fallback="news")
 
 
+def _news_cache_filename(news_path: str) -> str:
+    return _sanitize_cache_component(news_dataset_cache_tag(news_path), fallback="news")
+
+
 def append_cache_tag_to_path(path: str, cache_tag: str) -> str:
     raw_path = str(path or "").strip()
     tag = _sanitize_cache_component(cache_tag, fallback="news") if str(cache_tag or "").strip() else ""
@@ -32,21 +40,39 @@ def append_cache_tag_to_path(path: str, cache_tag: str) -> str:
     return os.path.join(directory, f"{stem}__{tag}{ext}")
 
 
-def build_refined_cache_path(cache_dir: str, dataset_key: str, schema_variant: str, cache_tag: str = "") -> str:
+def build_refined_cache_path(cache_dir: str, news_path: str) -> str:
+    news_key = _news_cache_filename(news_path)
+    return os.path.join(cache_dir, f"refined_{news_key}.jsonl")
+
+
+def build_regime_bank_path(cache_dir: str, news_path: str) -> str:
+    news_key = _news_cache_filename(news_path)
+    return os.path.join(cache_dir, f"regime_bank_{news_key}.npz")
+
+
+def build_legacy_refined_cache_path(cache_dir: str, dataset_key: str, schema_variant: str, news_path: str) -> str:
     base_path = os.path.join(cache_dir, f"refined_{dataset_key}_{schema_variant}_regime_v2.jsonl")
-    return append_cache_tag_to_path(base_path, cache_tag)
+    return append_cache_tag_to_path(base_path, news_dataset_cache_tag(news_path))
+
+
+def build_legacy_regime_bank_path(cache_dir: str, dataset_key: str, news_path: str) -> str:
+    base_path = os.path.join(cache_dir, f"regime_bank_{dataset_key}.npz")
+    return append_cache_tag_to_path(base_path, news_dataset_cache_tag(news_path))
 
 
 @dataclass(slots=True)
 class DeltaV3Config:
     dataset_key: str
+    news_path: str
     news_cache_tag: str
+    cache_dir: str
+    legacy_cache_dir: str
     history_len: int
     horizon: int
     schema_variant: str
     regime_bank_path: str
     regime_bank_legacy_path: str
-    regime_bank_build: bool
+    refined_bank_build: bool
     text_encoder_model_id: str
     text_encoder_max_length: int
     regime_tau_days: float
@@ -99,24 +125,28 @@ class DeltaV3Config:
     @classmethod
     def from_args(cls, args) -> "DeltaV3Config":
         dataset_key = str(getattr(args, "dataset_key", "dataset") or "dataset").strip()
-        news_cache_tag = news_dataset_cache_tag(getattr(args, "news_path", "") or "")
-        default_bank_path = os.path.join(
-            "checkpoints",
-            "_shared_refine_cache",
-            "v4",
-            f"regime_bank_{dataset_key}.npz",
+        news_path = str(getattr(args, "news_path", "") or "").strip()
+        news_cache_tag = news_dataset_cache_tag(news_path)
+        override_bank_path = str(getattr(args, "delta_v3_regime_bank_path", "") or "").strip()
+        regime_bank_path = override_bank_path or build_regime_bank_path(DEFAULT_SHARED_REFINE_CACHE_DIR, news_path)
+        legacy_bank_path = override_bank_path or build_legacy_regime_bank_path(
+            DEFAULT_SHARED_REFINE_CACHE_DIR,
+            dataset_key,
+            news_path,
         )
-        legacy_bank_path = str(getattr(args, "delta_v3_regime_bank_path", "") or "").strip() or default_bank_path
-        regime_bank_path = append_cache_tag_to_path(legacy_bank_path, news_cache_tag)
+        refined_bank_build = getattr(args, "delta_v3_refined_bank_build", 0)
         return cls(
             dataset_key=dataset_key,
+            news_path=news_path,
             news_cache_tag=news_cache_tag,
+            cache_dir=DEFAULT_SHARED_REFINE_CACHE_DIR,
+            legacy_cache_dir=LEGACY_SHARED_REFINE_CACHE_DIR,
             history_len=int(getattr(args, "history_len", 48) or 48),
             horizon=int(getattr(args, "horizon", 48) or 48),
             schema_variant=str(getattr(args, "delta_v3_schema_variant", "load") or "load").strip(),
             regime_bank_path=regime_bank_path,
             regime_bank_legacy_path=legacy_bank_path,
-            regime_bank_build=bool(int(getattr(args, "delta_v3_regime_bank_build", 0) or 0)),
+            refined_bank_build=bool(int(refined_bank_build or 0)),
             text_encoder_model_id=str(
                 getattr(args, "delta_v3_text_encoder_model_id", "intfloat/e5-small-v2") or "intfloat/e5-small-v2"
             ).strip(),

@@ -2,7 +2,7 @@ schema:
   variant: load
 
 regime_bank:
-  path: checkpoints/_shared_refine_cache/v4/regime_bank_nsw_load.npz
+  path: ""
   build: false
   tau_days: 5.0
   ema_alpha: 0.5

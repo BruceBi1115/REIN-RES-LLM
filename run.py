@@ -75,8 +75,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--news_api_max_retries", type=int, default=2)
 
     parser.add_argument("--delta_v3_regime_bank_path", type=str, default="")
-    parser.add_argument("--delta_v3_regime_bank_build", type=int, default=0, choices=[0, 1])
-    parser.add_argument("--delta_v3_schema_variant", type=str, default="load", choices=["load", "price", "gas_demand"])
+    parser.add_argument(
+        "--delta_v3_refined_bank_build",
+        type=int,
+        default=0,
+        choices=[0, 1],
+    )
+    parser.add_argument(
+        "--delta_v3_schema_variant",
+        type=str,
+        default="load",
+        choices=["load", "price", "gas_demand", "traffic", "bitcoin"],
+    )
     parser.add_argument("--delta_v3_text_encoder_model_id", type=str, default="intfloat/e5-small-v2")
     parser.add_argument("--delta_v3_text_encoder_max_length", type=int, default=256)
     parser.add_argument("--delta_v3_regime_tau_days", type=float, default=5.0)

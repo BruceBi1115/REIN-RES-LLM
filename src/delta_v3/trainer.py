@@ -26,22 +26,92 @@ from ..delta.core import _build_delta_optimizer, _build_delta_scheduler, skill_s
 from ..delta_news_hooks import build_news_api_adapter
 from ..utils.batch_utils import _batch_time_seq_for_sample
 from ..utils.utils import draw_pred_true, record_test_results_csv
-from .config import DeltaV3Config, build_refined_cache_path
+from .config import (
+    DeltaV3Config,
+    build_legacy_refined_cache_path,
+    build_legacy_regime_bank_path,
+    build_refined_cache_path,
+)
 from .importance import HardResidualSampler
 from .model import build_delta_v3_model
 from .modulation_heads import RegimePretrainHeads
 from .pretrain_v2 import run_regime_self_supervised_pretrain
-from .regime_bank import build_regime_bank, load_regime_bank
+from .regime_bank import build_regime_bank, load_regime_bank, read_regime_bank_metadata
 from .schema_refine_v2 import refine_dataset_news_corpus
 from .targets import ResidualTargetDecomposer, compute_residual_calendar_baseline
 
 
-def _resolve_v3_paths(args, cfg: DeltaV3Config) -> tuple[str, str, str, str]:
-    cache_dir = os.path.join("checkpoints", "_shared_refine_cache", "v4")
-    os.makedirs(cache_dir, exist_ok=True)
-    refined_path = build_refined_cache_path(cache_dir, cfg.dataset_key, cfg.schema_variant, cfg.news_cache_tag)
-    legacy_refined_path = build_refined_cache_path(cache_dir, cfg.dataset_key, cfg.schema_variant, "")
-    return refined_path, legacy_refined_path, cfg.regime_bank_path, cfg.regime_bank_legacy_path
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw_path in paths:
+        path = str(raw_path or "").strip()
+        if not path:
+            continue
+        norm = os.path.normpath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(path)
+    return out
+
+
+def _resolve_v3_paths(args, cfg: DeltaV3Config) -> tuple[str, list[str], str, list[str]]:
+    os.makedirs(cfg.cache_dir, exist_ok=True)
+    refined_path = build_refined_cache_path(cfg.cache_dir, cfg.news_path)
+    legacy_refined_paths = _dedupe_paths(
+        [
+            build_legacy_refined_cache_path(cfg.cache_dir, cfg.dataset_key, cfg.schema_variant, cfg.news_path),
+            build_legacy_refined_cache_path(cfg.legacy_cache_dir, cfg.dataset_key, cfg.schema_variant, cfg.news_path),
+        ]
+    )
+    legacy_bank_paths = _dedupe_paths(
+        [
+            cfg.regime_bank_legacy_path,
+            build_legacy_regime_bank_path(cfg.legacy_cache_dir, cfg.dataset_key, cfg.news_path),
+        ]
+    )
+    return refined_path, legacy_refined_paths, cfg.regime_bank_path, legacy_bank_paths
+
+
+def _expected_regime_bank_metadata(args, bundle, cfg: DeltaV3Config) -> dict[str, str | float | int]:
+    date_start, date_end = _series_day_bounds(bundle, args)
+    return {
+        "source_news_file": os.path.basename(str(cfg.news_path or "").strip()),
+        "source_news_stem": os.path.splitext(os.path.basename(str(cfg.news_path or "").strip()))[0],
+        "schema_variant": str(cfg.schema_variant or "").strip(),
+        "dataset_key": str(cfg.dataset_key or "").strip(),
+        "encoder_model_id": str(cfg.text_encoder_model_id or "").strip(),
+        "max_length": int(cfg.text_encoder_max_length),
+        "date_start": str(pd.Timestamp(date_start).date()),
+        "date_end": str(pd.Timestamp(date_end).date()),
+        "tau_days": float(cfg.regime_tau_days),
+        "ema_alpha": float(cfg.regime_ema_alpha),
+        "ema_window": int(cfg.regime_ema_window),
+    }
+
+
+def _regime_bank_metadata_matches(
+    path: str,
+    expected: dict[str, str | float | int],
+) -> tuple[bool | None, dict[str, str | float | int]]:
+    actual = read_regime_bank_metadata(path)
+    if not actual:
+        return None, {}
+    for key, expected_value in expected.items():
+        if key not in actual:
+            return None, actual
+        actual_value = actual[key]
+        if isinstance(expected_value, float):
+            try:
+                if abs(float(actual_value) - float(expected_value)) > 1e-8:
+                    return False, actual
+            except Exception:
+                return False, actual
+            continue
+        if str(actual_value) != str(expected_value):
+            return False, actual
+    return True, actual
 
 
 def _summarize_refined_corpus(refined_path: str) -> dict[str, float | int]:
@@ -70,6 +140,82 @@ def _summarize_refined_corpus(refined_path: str) -> dict[str, float | int]:
         "parseable_dates": int(parseable_dates),
         "actionable_pct": float(actionable_pct),
     }
+
+
+def _inspect_refined_corpus(refined_path: str) -> dict[str, object]:
+    total_docs = 0
+    schema_variants: set[str] = set()
+    source_news_files: set[str] = set()
+    source_news_stems: set[str] = set()
+    with open(refined_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            text = str(line).strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except Exception:
+                continue
+            total_docs += 1
+            schema_variant = str(row.get("schema_variant", "") or "").strip()
+            if schema_variant:
+                schema_variants.add(schema_variant)
+            source_news_file = os.path.basename(str(row.get("source_news_file", "") or "").strip())
+            if source_news_file:
+                source_news_files.add(source_news_file)
+            source_news_stem = str(row.get("source_news_stem", "") or "").strip()
+            if source_news_stem:
+                source_news_stems.add(source_news_stem)
+    return {
+        "total_docs": int(total_docs),
+        "schema_variants": sorted(schema_variants),
+        "source_news_files": sorted(source_news_files),
+        "source_news_stems": sorted(source_news_stems),
+    }
+
+
+def _refined_corpus_matches(
+    refined_path: str,
+    cfg: DeltaV3Config,
+) -> tuple[bool, dict[str, object]]:
+    metadata = _inspect_refined_corpus(refined_path)
+    if int(metadata.get("total_docs", 0) or 0) <= 0:
+        return False, metadata
+
+    expected_schema_variant = str(cfg.schema_variant or "").strip()
+    schema_variants = list(metadata.get("schema_variants", []) or [])
+    if len(schema_variants) != 1 or schema_variants[0] != expected_schema_variant:
+        return False, metadata
+
+    expected_news_file = os.path.basename(str(cfg.news_path or "").strip())
+    expected_news_stem = os.path.splitext(expected_news_file)[0]
+
+    source_news_files = list(metadata.get("source_news_files", []) or [])
+    if source_news_files and (len(source_news_files) != 1 or source_news_files[0] != expected_news_file):
+        return False, metadata
+
+    source_news_stems = list(metadata.get("source_news_stems", []) or [])
+    if source_news_stems and (len(source_news_stems) != 1 or source_news_stems[0] != expected_news_stem):
+        return False, metadata
+
+    return True, metadata
+
+
+def _select_usable_refined_path(candidate_paths: list[str], cfg: DeltaV3Config, live_logger) -> str | None:
+    for path in candidate_paths:
+        if not os.path.exists(path):
+            continue
+        matches, metadata = _refined_corpus_matches(path, cfg)
+        if matches:
+            return path
+        if live_logger is not None:
+            live_logger.info(
+                "[DELTA_V3] refined corpus cache mismatch; skipping cache "
+                f"path={path} actual_meta={json.dumps(metadata, ensure_ascii=True, sort_keys=True)} "
+                f"expected_schema_variant={json.dumps(str(cfg.schema_variant or '').strip())} "
+                f"expected_news_file={json.dumps(os.path.basename(str(cfg.news_path or '').strip()))}"
+            )
+    return None
 
 
 def _summarize_regime_bank(bank, *, active_mass_threshold: float) -> dict[str, float | int]:
@@ -103,7 +249,7 @@ def _fail_fast_on_empty_bank(bank, *, bank_path: str, refined_path: str):
     raise RuntimeError(
         "delta_v3 regime bank is empty. "
         f"bank_path={bank_path} refined_path={refined_path} dates={num_dates} active_days={num_active_days}. "
-        "Delete stale v4 cache files and rebuild with delta_v3_regime_bank_build=1."
+        "Delete stale v4 cache files and rebuild with delta_v3_refined_bank_build=1."
     )
 
 
@@ -123,51 +269,76 @@ def _series_day_bounds(bundle, args) -> tuple[pd.Timestamp, pd.Timestamp]:
 
 def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
     live_logger = bundle["live_logger"]
-    refined_path, legacy_refined_path, bank_path, legacy_bank_path = _resolve_v3_paths(args, cfg)
-    if os.path.exists(bank_path) and not cfg.regime_bank_build:
-        bank = load_regime_bank(bank_path)
-        _fail_fast_on_empty_bank(bank, bank_path=bank_path, refined_path=refined_path)
-        return bank, refined_path, bank_path
-
-    if (
-        not cfg.regime_bank_build
-        and bank_path != legacy_bank_path
-        and os.path.exists(legacy_bank_path)
-    ):
-        actual_refined_path = refined_path
-        if refined_path != legacy_refined_path and not os.path.exists(refined_path) and os.path.exists(legacy_refined_path):
-            actual_refined_path = legacy_refined_path
+    refined_path, legacy_refined_paths, bank_path, legacy_bank_paths = _resolve_v3_paths(args, cfg)
+    refined_candidate_paths = _dedupe_paths([refined_path] + legacy_refined_paths)
+    reusable_refined_path = _select_usable_refined_path(refined_candidate_paths, cfg, live_logger)
+    refined_debug_path = reusable_refined_path or refined_path
+    expected_bank_meta = _expected_regime_bank_metadata(args, bundle, cfg)
+    if os.path.exists(bank_path) and not cfg.refined_bank_build:
+        meta_matches, actual_meta = _regime_bank_metadata_matches(bank_path, expected_bank_meta)
+        if meta_matches is not False:
+            bank = load_regime_bank(bank_path)
+            _fail_fast_on_empty_bank(bank, bank_path=bank_path, refined_path=refined_debug_path)
+            return bank, refined_debug_path, bank_path
         live_logger.info(
-            "[DELTA_V3] using legacy regime bank cache "
-            f"legacy_path={legacy_bank_path} preferred_path={bank_path}"
+            "[DELTA_V3] preferred regime bank cache metadata mismatch; ignoring cache "
+            f"path={bank_path} actual_meta={json.dumps(actual_meta, ensure_ascii=True, sort_keys=True)} "
+            f"expected_meta={json.dumps(expected_bank_meta, ensure_ascii=True, sort_keys=True)}"
         )
-        bank = load_regime_bank(legacy_bank_path)
-        _fail_fast_on_empty_bank(bank, bank_path=legacy_bank_path, refined_path=actual_refined_path)
-        return bank, actual_refined_path, legacy_bank_path
 
-    if not cfg.regime_bank_build:
+    if not cfg.refined_bank_build:
+        for legacy_bank_path in legacy_bank_paths:
+            if bank_path == legacy_bank_path or not os.path.exists(legacy_bank_path):
+                continue
+            meta_matches, actual_meta = _regime_bank_metadata_matches(legacy_bank_path, expected_bank_meta)
+            if meta_matches is False:
+                live_logger.info(
+                    "[DELTA_V3] legacy regime bank cache metadata mismatch; skipping cache "
+                    f"path={legacy_bank_path} actual_meta={json.dumps(actual_meta, ensure_ascii=True, sort_keys=True)} "
+                    f"expected_meta={json.dumps(expected_bank_meta, ensure_ascii=True, sort_keys=True)}"
+                )
+                continue
+            live_logger.info(
+                "[DELTA_V3] using legacy regime bank cache "
+                f"legacy_path={legacy_bank_path} preferred_path={bank_path}"
+            )
+            bank = load_regime_bank(legacy_bank_path)
+            _fail_fast_on_empty_bank(bank, bank_path=legacy_bank_path, refined_path=refined_debug_path)
+            return bank, refined_debug_path, legacy_bank_path
+
+    actual_refined_path = reusable_refined_path
+    if actual_refined_path is None and not cfg.refined_bank_build:
         raise FileNotFoundError(
             f"delta_v3 regime bank missing: {bank_path}. "
-            f"legacy_checked={legacy_bank_path}. "
-            "Set --delta_v3_regime_bank_build 1 to rebuild from --news_path."
+            f"refined_checked={refined_candidate_paths}. "
+            f"legacy_checked={legacy_bank_paths}. "
+            "Provide a compatible refined_{news_file}.jsonl cache or set --delta_v3_refined_bank_build 1 to rebuild from --news_path."
         )
 
-    live_logger.info(f"[DELTA_V3] building regime refine corpus at {refined_path}")
-    api_adapter = build_news_api_adapter(args, live_logger=live_logger)
-    if api_adapter is None:
-        raise RuntimeError(
-            "delta_v3 regime bank build requested but no API key was discovered. "
-            "Set OPENAI_API_KEY or point --news_api_key_path to a readable key file "
-            "(default .secrets/api_key.txt)."
+    if actual_refined_path is None:
+        live_logger.info(f"[DELTA_V3] building regime refine corpus at {refined_path}")
+        api_adapter = build_news_api_adapter(args, live_logger=live_logger)
+        if api_adapter is None:
+            raise RuntimeError(
+                "delta_v3 regime bank build requested but no API key was discovered. "
+                "Set OPENAI_API_KEY or point --news_api_key_path to a readable key file "
+                "(default .secrets/api_key.txt)."
+            )
+
+        refine_dataset_news_corpus(
+            news_path=args.news_path,
+            schema_variant=cfg.schema_variant,
+            api_adapter=api_adapter,
+            cache_path=refined_path,
+        )
+        actual_refined_path = refined_path
+    else:
+        live_logger.info(
+            "[DELTA_V3] reusing refined corpus cache and building regime bank locally "
+            f"refined_path={actual_refined_path} bank_path={bank_path}"
         )
 
-    refine_dataset_news_corpus(
-        news_path=args.news_path,
-        schema_variant=cfg.schema_variant,
-        api_adapter=api_adapter,
-        cache_path=refined_path,
-    )
-    refined_stats = _summarize_refined_corpus(refined_path)
+    refined_stats = _summarize_refined_corpus(actual_refined_path)
     live_logger.info(
         "[DELTA_V3] regime refine stats "
         f"total_docs={refined_stats['total_docs']} "
@@ -176,29 +347,32 @@ def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
         f"parseable_dates={refined_stats['parseable_dates']}"
     )
     if refined_stats["total_docs"] <= 0:
-        raise RuntimeError(f"delta_v3 regime refine corpus is empty: {refined_path}")
+        raise RuntimeError(f"delta_v3 regime refine corpus is empty: {actual_refined_path}")
     if refined_stats["actionable_docs"] <= 0:
         raise RuntimeError(
             "delta_v3 regime refine corpus produced zero actionable articles. "
-            f"refined_path={refined_path}."
+            f"refined_path={actual_refined_path}."
         )
 
     date_start, date_end = _series_day_bounds(bundle, args)
     live_logger.info(f"[DELTA_V3] building regime bank at {bank_path}")
     build_regime_bank(
-        refined_jsonl=refined_path,
+        refined_jsonl=actual_refined_path,
         out_path=bank_path,
         encoder_model_id=cfg.text_encoder_model_id,
         max_length=cfg.text_encoder_max_length,
         date_start=date_start,
         date_end=date_end,
+        source_news_path=cfg.news_path,
+        schema_variant=cfg.schema_variant,
+        dataset_key=cfg.dataset_key,
         tau_days=cfg.regime_tau_days,
         ema_alpha=cfg.regime_ema_alpha,
         ema_window=cfg.regime_ema_window,
     )
     bank = load_regime_bank(bank_path)
-    _fail_fast_on_empty_bank(bank, bank_path=bank_path, refined_path=refined_path)
-    return bank, refined_path, bank_path
+    _fail_fast_on_empty_bank(bank, bank_path=bank_path, refined_path=actual_refined_path)
+    return bank, actual_refined_path, bank_path
 
 
 def _sample_history_times(batch) -> list[list[str]]:

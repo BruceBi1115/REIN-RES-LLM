@@ -348,7 +348,7 @@ init_common_defaults() {
   set_default NEWS_API_MAX_RETRIES "2"
 
   set_default DELTA_V3_REGIME_BANK_PATH ""
-  set_default DELTA_V3_REGIME_BANK_BUILD "0"
+  set_default DELTA_V3_REFINED_BANK_BUILD "0"
   set_default DELTA_V3_SCHEMA_VARIANT "load"
   set_default DELTA_V3_TEXT_ENCODER_MODEL_ID "intfloat/e5-small-v2"
   set_default DELTA_V3_TEXT_ENCODER_MAX_LENGTH "256"
@@ -504,7 +504,7 @@ build_run_args() {
     --news_api_base_url "$NEWS_API_BASE_URL"
     --news_api_timeout_sec "$NEWS_API_TIMEOUT_SEC"
     --news_api_max_retries "$NEWS_API_MAX_RETRIES"
-    --delta_v3_regime_bank_build "$DELTA_V3_REGIME_BANK_BUILD"
+    --delta_v3_refined_bank_build "$DELTA_V3_REFINED_BANK_BUILD"
     --delta_v3_schema_variant "$DELTA_V3_SCHEMA_VARIANT"
     --delta_v3_text_encoder_model_id "$DELTA_V3_TEXT_ENCODER_MODEL_ID"
     --delta_v3_text_encoder_max_length "$DELTA_V3_TEXT_ENCODER_MAX_LENGTH"

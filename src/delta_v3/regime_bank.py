@@ -109,6 +109,9 @@ def build_regime_bank(
     max_length: int,
     date_start,
     date_end,
+    source_news_path: str = "",
+    schema_variant: str = "",
+    dataset_key: str = "",
     tau_days: float = 5.0,
     ema_alpha: float = 0.5,
     ema_window: int = 5,
@@ -196,6 +199,19 @@ def build_regime_bank(
     topic_tag_mass = _ema_smooth(topic_tag_mass, ema_alpha)
     text_emb = _ema_smooth(text_emb, ema_alpha)
     relevance_mass = _ema_smooth(relevance_mass[:, None], ema_alpha).reshape(-1)
+    metadata = {
+        "source_news_file": os.path.basename(str(source_news_path or "").strip()),
+        "source_news_stem": os.path.splitext(os.path.basename(str(source_news_path or "").strip()))[0],
+        "schema_variant": str(schema_variant or "").strip(),
+        "dataset_key": str(dataset_key or "").strip(),
+        "encoder_model_id": str(encoder_model_id or "").strip(),
+        "max_length": int(max_length),
+        "date_start": str(start_day.date()),
+        "date_end": str(end_day.date()),
+        "tau_days": float(tau_days),
+        "ema_alpha": float(ema_alpha),
+        "ema_window": int(ema_window),
+    }
 
     np.savez_compressed(
         out_path,
@@ -207,6 +223,7 @@ def build_regime_bank(
         in_force_doc_count=in_force_doc_count.astype(np.int64),
         topic_tags=np.asarray(TOPIC_TAGS, dtype="<U32"),
         regime_keys=np.asarray(REGIME_KEYS, dtype="<U32"),
+        metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=True)),
     )
 
 
@@ -275,7 +292,7 @@ def load_regime_bank(path: str) -> RegimeBank:
     if missing:
         raise RuntimeError(
             f"Regime bank at {path} is missing fields {sorted(missing)}. "
-            "This usually means it was built by the removed daily-news scheme; rebuild with delta_v3_regime_bank_build=1."
+            "This usually means it was built by the removed daily-news scheme; rebuild with delta_v3_refined_bank_build=1."
         )
     return RegimeBank(
         dates=payload["dates"],
@@ -285,3 +302,19 @@ def load_regime_bank(path: str) -> RegimeBank:
         relevance_mass=np.asarray(payload["relevance_mass"], dtype=np.float32).reshape(-1),
         in_force_doc_count=np.asarray(payload["in_force_doc_count"], dtype=np.int64).reshape(-1),
     )
+
+
+def read_regime_bank_metadata(path: str) -> dict[str, str | float | int]:
+    with np.load(path, allow_pickle=False) as payload:
+        if "metadata_json" not in payload.files:
+            return {}
+        raw = payload["metadata_json"]
+        if getattr(raw, "shape", ()) == ():
+            text = str(raw.item())
+        else:
+            text = str(np.asarray(raw).reshape(-1)[0])
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}

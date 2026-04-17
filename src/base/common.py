@@ -312,8 +312,8 @@ def _log_cache_decision(args, live_logger) -> None:
         return
     live_logger.info(
         "[CACHE] "
-        f"legacy_backup_dir=checkpoints/_shared_refine_cache/LEGACY_BACKUP "
-        f"regime_cache_dir=checkpoints/_shared_refine_cache/v4 "
+        f"legacy_backup_dir=_shared_refine_cache/LEGACY_BACKUP "
+        f"regime_cache_dir=_shared_refine_cache/v4 "
         f"delta_v3_regime_bank_path={getattr(args, 'delta_v3_regime_bank_path', '') or '<unset>'}"
     )
 

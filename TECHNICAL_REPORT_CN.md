@@ -260,7 +260,7 @@ hidden: torch.Tensor        # (B, D_base), float32 —— 内部表征
 
 ### 7.3 输出：`.npz` 文件
 
-保存于 `checkpoints/_shared_refine_cache/v4/regime_bank_{dataset}.npz`：
+保存于 `_shared_refine_cache/v4/regime_bank_{新闻文件名}.npz`：
 
 ```python
 {
@@ -637,8 +637,8 @@ Spike_Gate_Hit_Rate, Spike_Target_Hit_Rate
 |---|---|---|---|
 | 前置 | `{train,val,test}_file` | CSV/Parquet | 原始时间序列（用户提供） |
 | 前置 | `{news_path}.jsonl` | JSONL | 原始新闻语料（用户提供） |
-| 节点 4 | `checkpoints/_shared_refine_cache/v4/refined_*.jsonl` | JSONL | LLM 精炼后的文章 |
-| 节点 5 | `checkpoints/_shared_refine_cache/v4/regime_bank_*.npz` | NumPy npz | 按日聚合的 regime |
+| 节点 4 | `_shared_refine_cache/v4/refined_{新闻文件名}.jsonl` | JSONL | LLM 精炼后的文章 |
+| 节点 5 | `_shared_refine_cache/v4/regime_bank_{新闻文件名}.npz` | NumPy npz | 按日聚合的 regime |
 | 阶段 1 | `checkpoints/{taskName}/best_base_backbone/base_backbone.pt` | PyTorch | 冻结的 base 权重 |
 | 阶段 1 | `checkpoints/{taskName}/best_base_backbone/meta.json` | JSON | Backbone 配置 + zstats |
 | 阶段 3 | `checkpoints/{taskName}/best_delta_v3_{taskName}/delta_v3.pt` | PyTorch | Delta V3 权重 |

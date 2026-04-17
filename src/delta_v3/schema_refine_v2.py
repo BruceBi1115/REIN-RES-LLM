@@ -12,7 +12,7 @@ from tqdm import tqdm
 from ..delta_news_hooks import OpenAINewsApiAdapter, build_news_api_adapter
 
 SCHEMA_VERSION = "v4_regime_v2"
-SCHEMA_VARIANTS = ("load", "price", "gas_demand")
+SCHEMA_VARIANTS = ("load", "price", "gas_demand", "traffic")
 TOPIC_TAGS = (
     "supply_tight",
     "supply_surplus",
@@ -273,6 +273,46 @@ def _build_prompts(doc: dict[str, Any], schema_variant: str, corpus_hint: str = 
             "horizon_days is an integer in [0,14]. "
             "summary must stay under 60 words and be factual."
         )
+    elif schema_variant == "traffic":
+        system_prompt = (
+            "You are refining generic news for hourly road traffic count forecasting into strict JSON. "
+            "Return JSON only, no markdown. "
+            "The goal is to keep articles that describe a current or near-term condition that can plausibly change "
+            "road traffic volume, congestion, route availability, commuter behavior, freight flow, or hourly traffic "
+            "volatility within the next 14 days. "
+            "Treat the following as potentially actionable if they are current, imminent, recently announced and still relevant, or likely to shape travel behavior within 14 days: "
+            "public holidays, school holidays, long weekends, major sports or entertainment events, festivals, protest activity, road closures, lane reductions, tunnel or bridge restrictions, major crashes with lingering disruption, rail strikes or transit outages that spill travelers onto roads, airport disruptions, port disruptions, severe weather, heatwaves, cold snaps, flooding, evacuations, fuel shortages, fuel-price shocks, major logistics or freight bottlenecks, congestion charging, and traffic-control interventions already in force. "
+            "Do not filter out an article just because it is operational, local, event-specific, or framed as a traffic notice, transport advisory, or disruption update. "
+            "Set is_actionable=false only if the article is clearly retrospective, generic commentary with no live signal, corporate or infrastructure planning news without near-term travel impact, or not plausibly relevant to road traffic counts within 14 days. "
+            "Use only the closed topic vocabulary: "
+            + ", ".join(TOPIC_TAGS)
+            + ". "
+            "If an article is clearly traffic-relevant but the topic vocabulary is awkward, keep is_actionable=true and include other instead of routine. "
+            "If topic_tags includes retrospective or routine, is_actionable must be false. "
+            "Map traffic drivers into the existing tags and regime fields as follows: "
+            "public holidays, school holidays, long weekends, vacation travel, or event-driven travel surges -> holiday; "
+            "road closures, crashes with ongoing disruption, rail or transit outages, strikes, or infrastructure failures -> outage; "
+            "bridge, tunnel, motorway, border, corridor, or lane-capacity restrictions -> interconnector_limit; "
+            "heat-driven travel changes, heatwave warnings, or fire-weather disruptions -> heatwave; "
+            "snow, ice, or cold-weather commuting disruption -> cold_snap; "
+            "fuel shortages, strong fuel-cost shocks, or freight cost shocks -> fuel_shock; "
+            "traffic control, emergency restrictions, congestion charging, or government intervention already active -> policy_active or market_intervention and policy_in_effect=1; "
+            "route reopening, transit relief, remote-work or modal-shift relief, or unusually weak travel demand -> supply_surplus or renewable_surge; "
+            "network scarcity, strong commuter demand, freight bottlenecks, or event-driven congestion pressure -> supply_tight or renewable_drought. "
+            "Interpret regime_vec for traffic as: "
+            "tightness = near-term road-network tightness, congestion pressure, and capacity scarcity; "
+            "demand_outlook = near-term traffic demand pressure from commuting, freight, holidays, and major events; "
+            "renewable_surplus = use this slot as mobility relief and alternate-capacity availability that reduces road counts or congestion, negative when relief is weak and road usage is pushed higher; "
+            "volatility_tone = disruption and uncertainty risk for hourly traffic from outages, closures, weather, protests, strikes, or major events; "
+            "policy_in_effect = 1 only when a policy, restriction, emergency measure, or traffic intervention is already active. "
+            "Return fields exactly: "
+            "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
+            "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
+            "volatility_tone is in [0,1]. "
+            "policy_in_effect is 0 or 1. "
+            "horizon_days is an integer in [0,14]. "
+            "summary must stay under 60 words and be factual."
+        )
     else:
         system_prompt = (
             "You are refining generic energy news for NSW electricity load forecasting into strict JSON. "
@@ -391,6 +431,8 @@ def refine_dataset_news_corpus(
                 corpus_hint=news_path,
                 api_adapter=api_adapter,
             )
+            refined["source_news_file"] = os.path.basename(str(news_path or "").strip())
+            refined["source_news_stem"] = os.path.splitext(os.path.basename(str(news_path or "").strip()))[0]
             if bool(refined.get("is_actionable", False)):
                 actionable_count += 1
             progress.set_postfix_str(f"actionable={actionable_count}")

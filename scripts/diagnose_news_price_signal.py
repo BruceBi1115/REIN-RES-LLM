@@ -12,9 +12,9 @@ signal for delta's job (predict what base cannot).
 
 Usage:
   python scripts/diagnose_news_price_signal.py \
-      --regime_banks checkpoints/_shared_refine_cache/v4/regime_bank_nsw_price__pv_magazine_australia_news.npz \
-                     checkpoints/_shared_refine_cache/v4/regime_bank_nsw_price__watt_pv_mag.npz \
-                     checkpoints/_shared_refine_cache/v4/regime_bank_nsw_price__reneweconomy_web_stories_2024.npz \
+      --regime_banks _shared_refine_cache/v4/regime_bank_pv_magazine_australia_news.npz \
+                     _shared_refine_cache/v4/regime_bank_watt_pv_mag.npz \
+                     _shared_refine_cache/v4/regime_bank_reneweconomy_web_stories_2024.npz \
       --train_file dataset/2024NSWelecPRICE/2024NSWelecPRICE_trainset.csv \
       --val_file   dataset/2024NSWelecPRICE/2024NSWelecPRICE_valset.csv \
       --test_file  dataset/2024NSWelecPRICE/2024NSWelecPRICE_testset.csv \

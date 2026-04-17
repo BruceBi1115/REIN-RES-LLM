@@ -19,7 +19,7 @@ DAY_FIRST="1"
 TRAIN_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_trainset.csv"
 VAL_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_valset.csv"
 TEST_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_testset.csv"
-DEFAULT_NEWS_PATH="dataset/"
+DEFAULT_NEWS_PATH="dataset/bitcoin_2024.json"
 
 STAGE="all"
 BASE_EPOCHS="40"
@@ -29,7 +29,7 @@ GRAD_ACCS=("4")
 LRS=("1e-4")
 HORIZONS=("48")
 SCHEDULERS=("1")
-BASE_BACKBONES=("mlp")
+BASE_BACKBONES=("dlinear")
 
 EARLY_STOP_PATIENCE="5"
 NEWS_WINDOW_DAYS="1"
@@ -37,12 +37,12 @@ NEWS_WINDOW_DAYS="1"
 TASK_NAME_BASE="delta_v3_bitcoin_hourly"
 PRE_RUN_HOOK=""
 
-DELTA_V3_REGIME_BANK_BUILD="1"
-DELTA_V3_ACTIVE_MASS_THRESHOLD="0.3"
+DELTA_V3_REFINED_BANK_BUILD="0"
+DELTA_V3_ACTIVE_MASS_THRESHOLD="13"
 
 NEWS_API_ENABLE="1"
-DELTA_V3_SCHEMA_VARIANT="price"
-DELTA_V3_REGIME_BANK_PATH="checkpoints/_shared_refine_cache/v4/regime_bank_bitcoin_hourly_24.npz"
+DELTA_V3_SCHEMA_VARIANT="bitcoin"
+DELTA_V3_REGIME_BANK_PATH="_shared_refine_cache/v4/regime_bank_$(basename -- "${NEWS_PATH:-$DEFAULT_NEWS_PATH}" .json).npz"
 
 DELTA_V3_TEXT_ENCODER_MODEL_ID="intfloat/e5-small-v2"
 DELTA_V3_TEXT_ENCODER_MAX_LENGTH="256"
@@ -92,11 +92,11 @@ SPIKE_CLIP_THRESHOLD="0"
 NEWS_PATH="${NEWS_PATH:-$DEFAULT_NEWS_PATH}"
 NEWS_CACHE_TAG="$(basename -- "${NEWS_PATH%.json}")"
 
-if [[ -z "${DELTA_V3_REGIME_BANK_BUILD+x}" ]]; then
-  if [[ -f "checkpoints/_shared_refine_cache/v4/regime_bank_bitcoin_hourly_24__${NEWS_CACHE_TAG}.npz" || -f "$DELTA_V3_REGIME_BANK_PATH" ]]; then
-    DELTA_V3_REGIME_BANK_BUILD="0"
+if [[ -z "${DELTA_V3_REFINED_BANK_BUILD+x}" ]]; then
+  if [[ -f "_shared_refine_cache/v4/regime_bank_${NEWS_CACHE_TAG}.npz" ]]; then
+    DELTA_V3_REFINED_BANK_BUILD="0"
   else
-    DELTA_V3_REGIME_BANK_BUILD="1"
+    DELTA_V3_REFINED_BANK_BUILD="1"
   fi
 fi
 

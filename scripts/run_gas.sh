@@ -27,13 +27,13 @@ DELTA_EPOCHS="30"
 BATCH_SIZE="16"
 GRAD_ACCS=("4")
 LRS=("1e-4")
-HORIZONS=( "48" "96" "192" "336" "720")
+HORIZONS=("96" "192" "336" "720")
 # HORIZONS=( "48")
 SCHEDULERS=("1")
-BASE_BACKBONES=("mlp")
+BASE_BACKBONES=("dlinear")
 
-DELTA_V3_REGIME_BANK_BUILD="0"
-DELTA_V3_ACTIVE_MASS_THRESHOLD="0.3"
+DELTA_V3_REFINED_BANK_BUILD="0"
+DELTA_V3_ACTIVE_MASS_THRESHOLD="0.1"
 # NORMALIZATION_MODE="zscore"
 DELTA_V3_TEXT_ENCODER_MODEL_ID="intfloat/e5-small-v2"
 
@@ -45,13 +45,15 @@ EARLY_STOP_PATIENCE=5
 
 NEWS_API_ENABLE="1"
 DELTA_V3_SCHEMA_VARIANT="gas_demand"
-DELTA_V3_REGIME_BANK_PATH="checkpoints/_shared_refine_cache/v4/regime_bank_gas_demand.npz"
+DELTA_V3_REGIME_BANK_PATH=""
 
-if [[ -z "${DELTA_V3_REGIME_BANK_BUILD:-}" ]]; then
-  if [[ -f "checkpoints/_shared_refine_cache/v4/regime_bank_gas_demand__gasunie_news_2025.npz" || -f "$DELTA_V3_REGIME_BANK_PATH" ]]; then
-    DELTA_V3_REGIME_BANK_BUILD="0"
+if [[ -z "${DELTA_V3_REFINED_BANK_BUILD:-}" ]]; then
+  NEWS_PATH="${NEWS_PATH:-$DEFAULT_NEWS_PATH}"
+  NEWS_CACHE_TAG="$(basename -- "${NEWS_PATH%.json}")"
+  if [[ -f "_shared_refine_cache/v4/regime_bank_${NEWS_CACHE_TAG}.npz" ]]; then
+    DELTA_V3_REFINED_BANK_BUILD="0"
   else
-    DELTA_V3_REGIME_BANK_BUILD="1"
+    DELTA_V3_REFINED_BANK_BUILD="1"
   fi
 fi
 
