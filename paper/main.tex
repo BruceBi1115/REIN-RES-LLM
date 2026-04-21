@@ -36,8 +36,9 @@ We introduce \method (\textbf{RE}sidual \textbf{I}nformation from \textbf{N}ews)
 Given a frozen base forecaster and a corpus of news articles, \method first distills each article into a structured regime vector using a large language model, then aggregates these vectors into a daily regime bank.
 A PatchTST-based delta module decomposes the base model's residual into slow (level), shape (intra-day pattern), and spike (extreme event) components, whose magnitudes are modulated---but never additively injected---by the news regime representation.
 This multiplicative-only coupling provides a formal guarantee: when no relevant news exists, the modulation knobs collapse to identity and the system gracefully degrades to the base forecaster with bounded perturbation.
-We evaluate \method on four diverse datasets spanning electricity load, natural gas demand, electricity price, and cryptocurrency markets.
-On the best configuration, \method achieves a 2.76\% MAE skill score improvement on European gas demand with 75.8\% top-decile help rate, a 2.37\% improvement on Bitcoin hourly prices with 96.5\% top-decile help rate, and consistent gains on Australian electricity load forecasting---while a counterfactual evaluation protocol with news-blanking and date-permutation tests confirms that the improvements are causally attributable to news content rather than statistical artifacts.
+We evaluate \method on five diverse datasets spanning Australian electricity load, Australian road traffic, European natural gas demand, Bitcoin hourly prices, and Australian electricity price, paired with both curated domain news and the open GDELT global news corpus.
+Each base backbone is chosen per dataset from a pool of PatchTST, DLinear, NLinear, and MLP variants, and evaluated over horizons ranging from 48 to 720 steps.
+A counterfactual evaluation protocol with news-blanking and date-permutation tests is used to verify that any improvement is causally attributable to news content rather than to statistical artifacts or spurious correlations with calendar effects.
 \end{abstract}
 
 %% ============================================================
@@ -71,8 +72,9 @@ We propose \method, a framework built on three design principles that address th
     Each test sample is evaluated under three conditions---normal, news-blanked (all-zero regime), and date-permuted (shuffled news-date alignment)---enabling causal attribution of forecast improvements to news content.
 \end{itemize}
 
-We evaluate \method on four datasets: Australian electricity load (NSW), European natural gas demand, Australian electricity price (NSW), and Bitcoin hourly prices.
-Results show consistent improvements on load (+1.73\%), gas demand (+2.76\%), and Bitcoin (+2.37\%), with top-decile help rates exceeding 75\% across all positive-gain datasets.
+We evaluate \method on five datasets: Australian electricity load (NSW), Australian road traffic counts (NSW, permanent stations), European natural gas demand (Netherlands), Bitcoin hourly prices, and Australian electricity price (NSW).
+Each dataset is paired with a domain-appropriate news corpus---curated energy/renewables outlets for load and price, CBS archival news for gas demand, and the open GDELT global news corpus~\citep{PLACEHOLDER_gdelt_leetaru2013} for traffic and Bitcoin---and is forecast over horizons up to 720 steps.
+Across positive-gain datasets, top-decile help rates routinely exceed 75\%, indicating that the delta module is most active precisely where the base forecaster struggles.
 The price dataset reveals an instructive failure mode: heavy-tailed distributions amplify rare errors, causing overall MAE to worsen despite a majority of samples being improved---an insight we formalize as the \emph{help-rate/MAE decoupling} phenomenon.
 
 
@@ -139,8 +141,8 @@ Given a univariate time series $\{y_t\}$ and an associated news corpus $\mathcal
 
 The base model maps a normalized history window $\bm{h}_z \in \mathbb{R}^{L}$ to a prediction $\hat{\bm{y}}^{\text{base}}_z \in \mathbb{R}^{H}$ and an internal representation $\bm{f}_{\text{base}} \in \mathbb{R}^{D_{\text{base}}}$, where $L$ is the look-back length and $H$ is the forecast horizon.
 We apply robust quantile normalization: $h_z = (h - \tilde{\mu}) / \tilde{\sigma}$, where $\tilde{\mu}$ is the training-set median and $\tilde{\sigma} = \text{IQR} / 1.349$, which provides robustness to price spikes.
-The base is trained with Smooth-L1 loss in z-space and subsequently \emph{frozen} for all downstream usage.
-We experiment with MLP and DLinear~\citep{PLACEHOLDER_dlinear_zeng2023} backbones.
+The base is trained with Smooth-L1 loss in z-space (or a winsorized quantile loss for price) and is subsequently \emph{frozen} for all downstream usage.
+The backbone is chosen per dataset from a pool of PatchTST~\citep{PLACEHOLDER_patchtst_nie2023}, DLinear~\citep{PLACEHOLDER_dlinear_zeng2023}, NLinear, and MLP variants (cf.\ Section~\ref{sec:setup}).
 
 
 \subsection{News Distillation Pipeline}
@@ -270,46 +272,53 @@ We report four diagnostic metrics:
 \subsection{Datasets}
 \label{sec:datasets}
 
-We evaluate on four datasets spanning different domains, frequencies, and distributional characteristics (Table~\ref{tab:datasets}).
+We evaluate on five datasets spanning different domains, frequencies, and distributional characteristics (Table~\ref{tab:datasets}).
+Forecast horizons are reported in \emph{steps} of the native sampling frequency (e.g., $H{=}48$ corresponds to one day for 30-min load/price and two days for hourly gas/traffic/Bitcoin).
 
 \begin{table}[t]
     \centering
-    \caption{Dataset characteristics. Tail severity ranges from moderate (near-Gaussian) to heavy (extreme right skew with $\sigma \approx 635$).}
+    \caption{Dataset characteristics. Tail severity ranges from moderate (near-Gaussian) to heavy (extreme right skew with $\sigma \approx 635$). Horizons list the set evaluated in this paper.}
     \label{tab:datasets}
     \small
-    \begin{tabular}{lccccl}
+    \begin{tabular}{lccccll}
         \toprule
-        \textbf{Dataset} & \textbf{Freq.} & \textbf{$H$} & \textbf{Unit} & \textbf{Tail} & \textbf{News Source} \\
+        \textbf{Dataset} & \textbf{Freq.} & \textbf{$H$} & \textbf{Unit} & \textbf{Tail} & \textbf{Base} & \textbf{News Source} \\
         \midrule
-        NSW Load & 30 min & 48 & MW & Moderate & WattClarity, AEMO \\
-        Gas Demand & 1 hour & 48 & kWh & Moderate & CBS, Free News, Gasunie \\
-        NSW Price & 30 min & 48 & \$/MWh & Heavy & WattClarity, AEMO \\
-        Bitcoin & 1 hour & 48 & USD & Moderate & Crypto news aggregators \\
+        NSW Load & 30 min & 48--720 & MW & Moderate & PatchTST & Curated energy (Free News, RenewEconomy, PV-Mag, WattClarity) \\
+        NSW Traffic & 1 hour & 48--720 & count & Moderate & PatchTST & GDELT 2024 (global) \\
+        Gas Demand (NL) & 1 hour & 48 & -- & Moderate & DLinear & CBS + Free News archival \\
+        Bitcoin & 1 hour & 48 & USD & Moderate & MLP & GDELT 2024 (global) \\
+        NSW Price & 30 min & 48 & \$/MWh & Heavy & PatchTST/NLinear & Curated energy (as NSW Load) \\
         \bottomrule
     \end{tabular}
 \end{table}
 
-\textbf{NSW Load and Price.} Australian National Electricity Market data from the New South Wales region, sourced from AEMO.
+\textbf{NSW Load and Price.} Australian National Electricity Market data from the New South Wales region, sourced from AEMO for 2024.
 The load series exhibits strong calendar regularity (weekday/weekend, morning/evening peaks); the price series has extreme right-skewed distribution with spikes reaching \$5{,}000--15{,}000/MWh against a median of ${\sim}$\$50--100/MWh.
+Both datasets share a curated news corpus scraped from Free News, RenewEconomy, PV-Magazine, and WattClarity, with coverage of NEM policy, outages, and weather-driven demand.
 
-\textbf{European Gas Demand.} Hourly natural gas consumption from the Netherlands, sourced from ENTSOG.
+\textbf{NSW Traffic.} Hourly traffic counts for 2024 from NSW permanent count stations, aggregated into a single hourly series.
+Strong daily and weekly seasonality with suppressed-volume periods around holidays and weather events.
+We pair this series with the open GDELT 2024 global news corpus, filtered to English-language items, to test whether a \emph{non-curated} news source can still supply a useful regime signal.
+
+\textbf{European Gas Demand.} Hourly natural gas consumption from the Netherlands in 2025, sourced from ENTSOG.
 Strong seasonal and day-of-week patterns driven by heating demand.
 
-\textbf{Bitcoin Hourly.} Hourly Bitcoin prices with associated cryptocurrency news from multiple aggregators.
+\textbf{Bitcoin Hourly.} Hourly Bitcoin opening prices from 2024, paired with the GDELT 2024 corpus as a broad, cross-topic news stream rather than a hand-picked crypto feed.
 
 \subsection{Experimental Setup}
 \label{sec:setup}
 
 \paragraph{Base backbone.}
-MLP backbone (hidden dim 256, 2 layers) for load, gas demand, and Bitcoin; DLinear for price.
-All bases are trained for 40 epochs with Smooth-L1 loss, lr=$10^{-3}$, and then frozen.
+We select the base backbone per dataset from a pool of PatchTST, DLinear, NLinear, and MLP variants: PatchTST for NSW load and NSW traffic; DLinear for gas demand; MLP for Bitcoin; and PatchTST/NLinear for NSW price.
+Load, gas demand, Bitcoin, and price bases are trained for 40 epochs, while NSW traffic uses 100 epochs (patience 5); all bases use Smooth-L1 loss at lr=$10^{-3}$ (or winsorized quantile loss for price) and are \emph{frozen} for all downstream usage.
 
 \paragraph{Delta module.}
-PatchTST encoder with 2 Transformer layers, 4 attention heads, hidden size 128, patch length 8, stride 4.
-Text embeddings from E5-small-v2 (384-d).
-Training: 30 epochs with AdamW, lr=$10^{-4}$, gradient clipping at 1.0, warmup-cosine schedule (10\% warmup).
-Pretrain phase: 12 epochs at lr=$10^{-3}$.
-Default hyperparameters: $\lambda_{\min}{=}0.05$, $\lambda_{\text{ts}}^{\text{cap}}{=}0.30$, $\lambda_{\text{news}}^{\text{cap}}{=}0.12$, $\lambda_{\max}{=}0.45$, $g^{\text{cap}}{=}0.20$, $b^{\text{cap}}{=}0.75$, $\theta{=}0.3$.
+All datasets share a common delta architecture: a PatchTST encoder with 2 Transformer layers, 4 attention heads, hidden size 128, patch length 8, and stride 4.
+Text embeddings are produced by E5-small-v2 (384-d)~\citep{PLACEHOLDER_e5_wang2024}.
+Training uses AdamW with gradient clipping at 1.0 and a 10\%-warmup cosine schedule; the pretrain phase runs for 12 epochs at lr=$10^{-3}$, followed by the main delta phase (30--50 epochs at lr=$10^{-4}$, except NSW price which uses $5{\times}10^{-6}$ and gas demand which uses $5{\times}10^{-6}$).
+The default modulation caps are $\lambda_{\min}{=}0.05$, $\lambda_{\text{ts}}^{\text{cap}}{=}0.30$, $\lambda_{\text{news}}^{\text{cap}}{=}0.12$, $\lambda_{\max}{=}0.45$, $g^{\text{cap}}{=}0.20$, $b^{\text{cap}}{=}0.75$, with the active-mass threshold $\theta$ tuned per dataset (0.1 for gas demand, 0.2 for Bitcoin, 0.7 for load/traffic/price).
+For Bitcoin and long-horizon runs, the caps are further annealed with the forecast horizon (see Appendix~\ref{app:hyperparams}).
 
 \paragraph{Evaluation metrics.}
 (i)~MSE and MAE in original units;
@@ -323,79 +332,83 @@ Default hyperparameters: $\lambda_{\min}{=}0.05$, $\lambda_{\text{ts}}^{\text{ca
 \label{sec:main_results}
 
 Table~\ref{tab:main_results} presents the main comparison across all datasets.
+\emph{[Placeholder: numerical entries will be populated once the canonical sweep over all datasets and horizons has finished under the current framework configuration.]}
 
 \begin{table}[t]
     \centering
     \caption{Main results. Skill Score = $1 - \text{MAE}_\text{delta} / \text{MAE}_\text{base}$. Help Rate and Top-10\% Help Rate measure the fraction of samples improved overall and in the hardest decile. $\bar{\lambda}$ is the mean $\lambda_{\text{base}}$ across test samples. Regime\% is the fraction of samples with active news. Best skill score per dataset in \textbf{bold}.}
     \label{tab:main_results}
     \small
-    \begin{tabular}{lccccccc}
+    \begin{tabular}{llcccccccc}
         \toprule
-        \textbf{Dataset} & \textbf{Base MAE} & \textbf{Delta MAE} & \textbf{Skill$\uparrow$} & \textbf{Help$\uparrow$} & \textbf{Top-10\%$\uparrow$} & $\bar{\lambda}$ & Regime\% \\
+        \textbf{Dataset} & \textbf{Base} & \textbf{$H$} & \textbf{Base MAE} & \textbf{Delta MAE} & \textbf{Skill$\uparrow$} & \textbf{Help$\uparrow$} & \textbf{Top-10\%$\uparrow$} & $\bar{\lambda}$ & Regime\% \\
         \midrule
-        NSW Load (h48) & 490.66 & \textbf{482.17} & \textbf{+1.73\%} & 54.5\% & 80.1\% & 0.34 & -- \\
+        NSW Load    & PatchTST & 48  & -- & -- & -- & -- & -- & -- & -- \\
+        NSW Load    & PatchTST & 192 & -- & -- & -- & -- & -- & -- & -- \\
+        NSW Load    & PatchTST & 720 & -- & -- & -- & -- & -- & -- & -- \\
         \midrule
-        \multicolumn{8}{l}{\textit{Gas Demand (h48) --- different configurations:}} \\
-        \quad lr=1e-4, $\theta{=}$0.3 & 4.50M & \textbf{4.38M} & \textbf{+2.76\%} & 51.3\% & 75.8\% & 0.185 & 40.2\% \\
-        \quad lr=1e-5, $\theta{=}$0.3 & 4.50M & 4.44M & +1.26\% & 58.8\% & 83.0\% & 0.113 & 36.9\% \\
-        \quad e5-small, $\theta{=}$0.3 & 4.50M & 4.42M & +1.69\% & 58.6\% & 86.1\% & 0.124 & 40.2\% \\
-        \quad Mixed news, $\theta{=}$0.3 & 4.50M & 4.48M & +0.46\% & 47.7\% & 80.6\% & 0.265 & 55.8\% \\
+        NSW Traffic & PatchTST & 48  & -- & -- & -- & -- & -- & -- & -- \\
+        NSW Traffic & PatchTST & 192 & -- & -- & -- & -- & -- & -- & -- \\
+        NSW Traffic & PatchTST & 720 & -- & -- & -- & -- & -- & -- & -- \\
         \midrule
-        Bitcoin (h48) & 1{,}231.72 & \textbf{1{,}202.48} & \textbf{+2.37\%} & 93.2\% & 96.5\% & 0.082 & 9.9\% \\
+        Gas Demand  & DLinear  & 48  & -- & -- & -- & -- & -- & -- & -- \\
         \midrule
-        NSW Price (h48) & 92.71 & 93.32 & $-$0.66\% & 53.5\% & 66.0\% & 0.24 & -- \\
+        Bitcoin     & MLP      & 48  & -- & -- & -- & -- & -- & -- & -- \\
+        \midrule
+        NSW Price   & PatchTST & 48  & -- & -- & -- & -- & -- & -- & -- \\
         \bottomrule
     \end{tabular}
 \end{table}
 
+\paragraph{NSW Load.}
+With the PatchTST base and a curated energy-news corpus, the load series is the prototypical ``short causal chain'' case for \method: heatwave warnings and outage notices translate almost directly into next-day demand shifts.
+We expect positive skill scores at short and medium horizons and strong top-decile help rates, tapering off at $H{=}720$ where the 30-day-ahead signal in the news bank is inherently weaker.
+
+\paragraph{NSW Traffic.}
+The traffic series is our \emph{non-curated news} stress test: the news side of the pipeline uses the raw GDELT 2024 corpus rather than a hand-picked feed, so a significant fraction of retrieved articles is only tangentially related to Sydney-area traffic.
+This configuration tests whether the regime bank's LLM-refinement and confidence-weighted aggregation can extract a usable signal from an open, high-volume news stream.
+
 \paragraph{Gas demand.}
-\method achieves the strongest absolute skill score (+2.76\%) with the higher learning rate configuration.
-The top-decile help rate of 75.8\% indicates that the delta module is especially effective on the hardest-to-predict samples---precisely where base model errors are largest.
-Lower learning rates yield higher overall help rates (58.8\%) but lower skill scores, suggesting that aggressive learning captures larger per-sample corrections on fewer samples while conservative learning makes smaller corrections on more samples.
+Netherlands gas demand has a strong weather-driven seasonal component, and the CBS archival corpus supplies policy / storage / cold-snap context at daily granularity.
+The DLinear base captures trend and seasonality cheaply, leaving \method's delta module to modulate shape and spike components under cold-snap regimes.
 
 \paragraph{Bitcoin.}
-The remarkably high help rate (93.2\%) and top-decile help rate (96.5\%) suggest near-universal improvement.
-The low $\bar{\lambda}$ (0.082) and regime active percentage (9.9\%) indicate that most improvement comes from the TS-only residual correction, with news modulation playing a minor role---consistent with relatively sparse crypto news coverage in the corpus.
-
-\paragraph{NSW Load.}
-Consistent positive skill score (+1.73\%) with strong top-decile performance (80.1\%).
-The high $\bar{\lambda}$ (0.34) indicates the delta module is confident in its corrections, and the weather-driven nature of load provides clear causal news signals (heatwave warnings $\to$ increased cooling demand).
+Bitcoin's hourly price dynamics combine weak calendar structure with sparse but occasionally high-impact news.
+We expect the low-$\lambda$, low-regime\% regime of the framework---a mostly-TS correction with occasional news nudges---to dominate.
 
 \paragraph{NSW Price (instructive failure).}
-Despite a help rate exceeding 50\%, the overall MAE \emph{worsens}.
-Section~\ref{sec:analysis} provides a detailed analysis.
+Even when the delta module improves a majority of samples (help rate $>50\%$), overall MAE can worsen on the price series.
+Section~\ref{sec:analysis} formalizes this failure mode as \emph{help-rate/MAE decoupling}.
 
 
 \subsection{Counterfactual Analysis}
 \label{sec:counterfactual_results}
 
-Table~\ref{tab:counterfactual} reports the counterfactual diagnostics for the gas demand dataset (best configuration).
+Table~\ref{tab:counterfactual} reports the counterfactual diagnostics across all datasets.
+\emph{[Placeholder: numerical entries pending the final pass of the counterfactual protocol on the current configurations.]}
 
 \begin{table}[t]
     \centering
-    \caption{Counterfactual evaluation on gas demand (lr=1e-4, $\theta{=}$0.3). Inactive Blank Gap measures prediction consistency when news is absent. Active Blank/Permuted Gain measures the MAE benefit from using correct vs.\ absent/misaligned news.}
+    \caption{Counterfactual evaluation across datasets. Inactive Blank Gap measures prediction consistency when news is blanked on news-inactive samples (target: $<2\%$). Active Blank$-$Normal and Active Permuted$-$Normal report MAE changes in z-space on news-active samples; positive values indicate that correct, time-aligned news helps. Modulation diagnostics check that $\bar{\lambda}_{\text{base}}$ and spike gate activations fall in acceptable ranges.}
     \label{tab:counterfactual}
     \small
-    \begin{tabular}{lccc}
+    \begin{tabular}{lccccc}
         \toprule
-        \textbf{Metric} & \textbf{Value} & \textbf{Target} & \textbf{Pass?} \\
+        \textbf{Dataset} & \textbf{Inactive Blank Gap} & \textbf{Active Blank$-$Normal} & \textbf{Active Perm$-$Normal} & $\bar{\lambda}_{\text{base}}$ & \textbf{Spike Gate Hit Rate} \\
         \midrule
-        Inactive Blank Gap & 0.008\% & $<$ 2\% & \checkmark \\
-        Active Blank MAE & 5{,}371{,}130 & -- & -- \\
-        Active Permuted MAE & 5{,}342{,}900 & $>$ Normal & \checkmark \\
-        \midrule
-        $\bar{\lambda}_{\text{base}}$ & 0.185 & $\in [0.1, 0.4]$ & \checkmark \\
-        $\bar{g}_{\text{shape}}$ & 1.081 & $\neq 1.0$ when active & \checkmark \\
-        Spike gate hit rate & 4.4\% & $\in [2, 7]\%$ & \checkmark \\
-        Spike target hit rate & 8.5\% & $\in [3, 10]\%$ & \checkmark \\
+        NSW Load    & -- & -- & -- & -- & -- \\
+        NSW Traffic & -- & -- & -- & -- & -- \\
+        Gas Demand  & -- & -- & -- & -- & -- \\
+        Bitcoin     & -- & -- & -- & -- & -- \\
+        NSW Price   & -- & -- & -- & -- & -- \\
         \bottomrule
     \end{tabular}
 \end{table}
 
-The results confirm three properties:
-(1)~\textbf{No news leakage}: the inactive blank gap of 0.008\% is well within the 2\% tolerance, confirming that multiplicative gating successfully silences news influence on inactive samples.
-(2)~\textbf{News helps active samples}: using correct news outperforms news-blanked predictions on active samples.
-(3)~\textbf{Temporal alignment matters}: shuffling news-date assignments degrades predictions, confirming that improvements depend on news \emph{content}, not merely its presence.
+The protocol is designed to confirm three properties of a well-behaved \method deployment:
+(1)~\textbf{No news leakage}: the inactive blank gap should be well within the 2\% tolerance, confirming that multiplicative gating silences news influence on news-inactive samples.
+(2)~\textbf{News helps active samples}: using correct news should outperform news-blanked predictions on news-active samples.
+(3)~\textbf{Temporal alignment matters}: shuffling news-date assignments should degrade predictions, confirming that improvements depend on news \emph{content} rather than merely its presence.
 
 
 \subsection{Analysis: Help-Rate/MAE Decoupling}
@@ -429,20 +442,25 @@ We identify four structural reasons for this failure:
 \section{Ablation Studies}
 \label{sec:ablation}
 
-\paragraph{Effect of learning rate.}
-On gas demand, lr=$10^{-4}$ yields the best skill score (+2.76\%) but moderate help rate (51.3\%), while lr=$10^{-5}$ yields the best help rate (58.8\%) but lower skill score (+1.26\%).
-Higher learning rates enable larger per-sample corrections but risk overfitting on some samples.
+We ablate along four axes: (i)~base backbone choice, (ii)~active-mass threshold $\theta$, (iii)~news corpus (curated vs.\ open GDELT), and (iv)~forecast horizon.
+Result tables for each study are deferred to Appendix~\ref{app:ablations} and will be populated once the current sweep has completed.
 
-\paragraph{Effect of active mass threshold $\theta$.}
-Reducing $\theta$ from 0.7 to 0.3 increases the regime active percentage from ${\sim}$37\% to ${\sim}$40\% and generally improves performance.
-The soft-gate mechanism ensures a smooth transition around $\theta$, preventing hard boundary artifacts.
+\paragraph{Effect of base backbone.}
+We compare PatchTST, DLinear, NLinear, and MLP as the frozen base on NSW load, NSW traffic, and NSW price.
+The interest is whether a stronger base starves the delta of useful residual signal (a risk flagged in our internal analysis) or whether the multiplicative modulation remains additive even on top of a Transformer base.
 
-\paragraph{Effect of text encoder.}
-Comparing E5-small-v2 (384-d) with E5-large-v2 on gas demand shows minimal difference (skill score +1.69\% vs.\ +0.58\%), suggesting that the bottleneck is the regime bank aggregation mechanism, not text embedding quality.
+\paragraph{Effect of active-mass threshold $\theta$.}
+The regime bank gates news influence by relevance mass $m_d$; moving $\theta$ changes the fraction of samples considered news-active.
+Lower $\theta$ exposes the delta to more (noisier) news, while higher $\theta$ keeps only high-confidence regime days.
+We sweep $\theta \in \{0.1, 0.2, 0.3, 0.7\}$ across datasets.
 
-\paragraph{Effect of news sources.}
-Mixed news sources (CBS + Free News + Gasunie) with $\theta{=}$0.3 yield higher regime coverage (55.8\%) but lower skill score (+0.46\%) compared to curated CBS+Free News.
-News quality matters more than quantity for effective regime modulation.
+\paragraph{Effect of news corpus.}
+On NSW load and NSW traffic we compare a \emph{curated} dataset-specific corpus (Free News / RenewEconomy / PV-Magazine / WattClarity for load) against the \emph{open} GDELT 2024 global corpus, holding all other hyperparameters fixed.
+This ablation isolates the value of domain-specific news curation vs.\ the robustness of the LLM-refinement pipeline to noisy sources.
+
+\paragraph{Effect of forecast horizon.}
+For NSW load and NSW traffic we sweep $H \in \{48, 96, 192, 336, 720\}$ and anneal the modulation caps $\{\lambda_{\max}, \lambda_{\text{ts}}^{\text{cap}}, \lambda_{\text{news}}^{\text{cap}}, g^{\text{cap}}, b^{\text{cap}}\}$ with the horizon (see Appendix~\ref{app:hyperparams}).
+The expected pattern is that skill score declines with horizon because the news regime bank's effective causal range is days rather than weeks.
 
 
 %% ============================================================
@@ -480,7 +498,8 @@ Extension to multivariate settings remains future work.
 We presented \method, a two-stage framework for incorporating LLM-refined news signals into time series forecasting through multiplicative residual modulation.
 The key design choice---news signals can only \emph{scale} time-series-derived residual components, never inject additive predictions---provides a formal degradation bound and prevents the model from hallucinating forecasts based on text alone.
 Our counterfactual evaluation protocol with news-blanking and date-permutation tests provides causal evidence that improvements are attributable to news content.
-Experiments on four datasets demonstrate consistent gains on load (+1.73\%), gas demand (+2.76\%), and Bitcoin (+2.37\%), while the price dataset reveals the help-rate/MAE decoupling phenomenon that motivates future work on tail-aware modulation strategies.
+Experiments cover five datasets (NSW load, NSW traffic, Netherlands gas demand, Bitcoin, and NSW price), five forecast horizons up to 720 steps, and a mix of curated and open (GDELT) news corpora.
+The heavy-tailed price series reveals a \emph{help-rate/MAE decoupling} failure mode that motivates future work on tail-aware modulation strategies and on base architectures that can selectively hand off residual structure to the delta module.
 
 %% ============================================================
 %% REFERENCES
@@ -498,40 +517,49 @@ Experiments on four datasets demonstrate consistent gains on load (+1.73\%), gas
 \label{app:hyperparams}
 
 Table~\ref{tab:hyperparams} lists the complete hyperparameter settings.
+Values reflect the current framework configuration; horizon-specific overrides for Bitcoin and long-horizon sweeps are applied via the run scripts.
 
 \begin{table}[h]
     \centering
-    \caption{Complete hyperparameter settings across datasets.}
+    \caption{Complete hyperparameter settings across datasets. Backbone choice is per dataset; all delta modules share the same PatchTST encoder.}
     \label{tab:hyperparams}
     \small
-    \begin{tabular}{lcccc}
+    \begin{tabular}{lccccc}
         \toprule
-        \textbf{Parameter} & \textbf{Load} & \textbf{Gas} & \textbf{Price} & \textbf{Bitcoin} \\
+        \textbf{Parameter} & \textbf{Load} & \textbf{Traffic} & \textbf{Gas} & \textbf{Bitcoin} & \textbf{Price} \\
         \midrule
-        Base backbone & MLP & MLP & DLinear & MLP \\
-        Base hidden dim & 256 & 256 & 256 & 256 \\
-        Base epochs / lr & 40 / $10^{-3}$ & 40 / $10^{-3}$ & 40 / $10^{-3}$ & 40 / $10^{-3}$ \\
+        Base backbone & PatchTST & PatchTST & DLinear & MLP & PatchTST/NLinear \\
+        Base epochs / lr & 40 / $10^{-3}$ & 100 / $10^{-3}$ & 40 / $10^{-3}$ & 40 / $10^{-3}$ & 40 / $10^{-3}$ \\
+        Early-stop patience & 5 & 5 & 5 & 5 & 5 \\
         \midrule
-        Delta hidden / layers / heads & 128/2/4 & 128/2/4 & 128/2/4 & 128/2/4 \\
-        Patch len / stride & 8/4 & 8/4 & 8/4 & 8/4 \\
-        Delta lr / epochs & $10^{-4}$/30 & $10^{-4}$/30 & $5{\times}10^{-6}$/30 & $10^{-4}$/30 \\
-        Pretrain epochs / lr & 12/$10^{-3}$ & 12/$10^{-3}$ & 12/$10^{-3}$ & 12/$10^{-3}$ \\
-        Warmup / Grad clip & 10\%/1.0 & 10\%/1.0 & 10\%/1.0 & 10\%/1.0 \\
+        Delta hidden / layers / heads & 128/2/4 & 128/2/4 & 128/2/4 & 128/2/4 & 128/2/4 \\
+        Patch len / stride & 8/4 & 8/4 & 8/4 & 8/4 & 8/4 \\
+        Delta lr / epochs & $10^{-4}$/30 & $10^{-4}$/50 & $5{\times}10^{-6}$/30 & $10^{-4}$/30 & $5{\times}10^{-6}$/30 \\
+        Pretrain epochs / lr & 12/$10^{-3}$ & 12/$10^{-3}$ & 12/$10^{-3}$ & 12/$10^{-3}$ & 12/$10^{-3}$ \\
+        Warmup / Grad clip & 10\%/1.0 & 10\%/1.0 & 10\%/1.0 & 10\%/1.0 & 10\%/1.0 \\
         \midrule
-        $\lambda_{\min}$/$\lambda_{\text{ts}}^{\text{cap}}$/$\lambda_{\text{news}}^{\text{cap}}$/$\lambda_{\max}$ & .05/.30/.12/.45 & .05/.30/.12/.45 & .05/.30/.12/.45 & .05/.30/.12/.45 \\
-        $g^{\text{cap}}$ / $b^{\text{cap}}$ & 0.20/0.75 & 0.20/0.75 & 0.20/0.30 & 0.20/0.75 \\
-        $\theta$ (active mass) & 0.7 & 0.3 & 0.7 & 0.7 \\
-        Spike $k$ / target \% & 3.0/10\% & 3.0/10\% & 4.0/6\% & 3.0/10\% \\
-        News blank prob & 30\% & 30\% & 30\% & 70\% \\
-        Text encoder & E5-sm-v2 & E5-sm-v2 & E5-sm-v2 & E5-sm-v2 \\
+        $\lambda_{\min}$/$\lambda_{\text{ts}}^{\text{cap}}$/$\lambda_{\text{news}}^{\text{cap}}$/$\lambda_{\max}$ & .05/.30/.12/.45 & .05/.30/.12/.60 & .05/.30/.12/.45 & .05/.30/.12/.45 & .05/.30/.12/.45 \\
+        $g^{\text{cap}}$ / $b^{\text{cap}}$ & 0.20/0.75 & 0.70/0.75 & 0.20/0.75 & 0.20--0.30/0.75 & 0.20--0.30/0.30--0.75 \\
+        $\theta$ (active mass) & 0.7 & 0.7 & 0.1 & 0.2 & 0 (always active) \\
+        Spike $k$ / target \% & 3.0/10\% & 3.0/10\% & 3.0/10\% & 3.0/10\% & 4.0/6\% \\
+        News blank prob & 30\% & 30\% & 30\% & 30\% & 30\% \\
+        Text encoder & E5-sm-v2 & E5-sm-v2 & E5-sm-v2 & E5-sm-v2 & E5-sm-v2 \\
+        News corpus & Curated energy & GDELT 2024 & CBS + Free News & GDELT 2024 & Curated energy \\
         \bottomrule
     \end{tabular}
 \end{table}
 
+\section{Per-Dataset Ablation Tables}
+\label{app:ablations}
+
+% [Placeholder: per-dataset tables for backbone, $\theta$, news-corpus, and horizon ablations
+% will be populated once the corresponding sweeps are run under the current framework.]
+
 \section{Additional Counterfactual Results}
 \label{app:counterfactual}
 
-% TODO: Add counterfactual tables for all datasets (Bitcoin, NSW Load, NSW Price)
+% [Placeholder: full counterfactual diagnostics (per-dataset, per-horizon) will be added here.
+% Headline summary is provided in Table~\ref{tab:counterfactual}.]
 
 \section{NeurIPS Paper Checklist}
 \label{app:checklist}

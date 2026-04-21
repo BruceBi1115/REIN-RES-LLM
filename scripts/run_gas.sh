@@ -19,7 +19,7 @@ DAY_FIRST="0"
 TRAIN_FILE="dataset/gas_demand/entsog_gas_demand_nl_2025_hour_extracted_trainset.csv"
 VAL_FILE="dataset/gas_demand/entsog_gas_demand_nl_2025_hour_extracted_valset.csv"
 TEST_FILE="dataset/gas_demand/entsog_gas_demand_nl_2025_hour_extracted_testset.csv"
-DEFAULT_NEWS_PATH="dataset/free-news-cbs_2025.json"
+DEFAULT_NEWS_PATH="dataset/gdelt_gas_nl_2025.json"
 
 STAGE="all"
 BASE_EPOCHS="40"
@@ -27,13 +27,13 @@ DELTA_EPOCHS="30"
 BATCH_SIZE="16"
 GRAD_ACCS=("4")
 LRS=("5e-6")
-HORIZONS=("48" "96" "192" "336" "720")
+HORIZONS=("96" "192" "336" "720")
 # HORIZONS=( "48")
 SCHEDULERS=("1")
 BASE_BACKBONES=("dlinear")
 
 DELTA_V3_REFINED_BANK_BUILD="0"
-DELTA_V3_ACTIVE_MASS_THRESHOLDS=("0.1")
+DELTA_V3_ACTIVE_MASS_THRESHOLDS=("0.7")
 # NORMALIZATION_MODE="zscore"
 DELTA_V3_TEXT_ENCODER_MODEL_ID="intfloat/e5-small-v2"
 

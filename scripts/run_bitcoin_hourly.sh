@@ -19,7 +19,7 @@ DAY_FIRST="1"
 TRAIN_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_trainset.csv"
 VAL_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_valset.csv"
 TEST_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_testset.csv"
-DEFAULT_NEWS_PATH="dataset/news_from_sources/coindesk_archive_2024_new.json"
+DEFAULT_NEWS_PATH="dataset/gdelt_bitcoin_2024.json"
 
 STAGE="all"
 BASE_EPOCHS="40"
@@ -29,7 +29,7 @@ GRAD_ACCS=("4")
 LRS=("1e-4")
 HORIZONS=("48")
 SCHEDULERS=("1")
-BASE_BACKBONES=("mlp")
+BASE_BACKBONES=("dlinear")
 
 EARLY_STOP_PATIENCE="5"
 NEWS_WINDOW_DAYS="1"
@@ -37,8 +37,8 @@ NEWS_WINDOW_DAYS="1"
 TASK_NAME_BASE="delta_v3_bitcoin_hourly"
 PRE_RUN_HOOK=""
 
-DELTA_V3_REFINED_BANK_BUILD="0"
-DELTA_V3_ACTIVE_MASS_THRESHOLDS=("0.2")
+DELTA_V3_REFINED_BANK_BUILD="1"
+DELTA_V3_ACTIVE_MASS_THRESHOLDS=("0.7")
 
 NEWS_API_ENABLE="1"
 DELTA_V3_SCHEMA_VARIANT="bitcoin"
