@@ -19,7 +19,7 @@ DAY_FIRST="0"
 TRAIN_FILE="dataset/traffic_count/road_traffic_counts_hourly_permanent3_2024_hourly_trainset.csv"
 VAL_FILE="dataset/traffic_count/road_traffic_counts_hourly_permanent3_2024_hourly_valset.csv"
 TEST_FILE="dataset/traffic_count/road_traffic_counts_hourly_permanent3_2024_hourly_testset.csv"
-DEFAULT_NEWS_PATH="dataset/news_from_sources/reneweconomy_web_stories_2024.json"
+DEFAULT_NEWS_PATH="dataset/gdelt_2024.json"
 
 # News is intentionally left empty for now, so default to base-only runs.
 # When a traffic-news source is ready, set:
@@ -31,9 +31,10 @@ DELTA_EPOCHS="50"
 BATCH_SIZE="16"
 GRAD_ACCS=("4")
 LRS=("1e-4")
-HORIZONS=( "48")
+HORIZONS=("96" "192" "336" "720" )
+# HORIZONS=( "48" )
 SCHEDULERS=("1")
-BASE_BACKBONES=("mlp")
+BASE_BACKBONES=("dlinear" )
 
 EARLY_STOP_PATIENCE="5"
 NEWS_WINDOW_DAYS="1"
@@ -43,8 +44,8 @@ PRE_RUN_HOOK=""
 
 NEWS_API_ENABLE="1"
 
-DELTA_V3_REFINED_BANK_BUILD="1"
-DELTA_V3_ACTIVE_MASS_THRESHOLD="0.7"
+DELTA_V3_REFINED_BANK_BUILD="0"
+DELTA_V3_ACTIVE_MASS_THRESHOLDS=("0.7")
 DELTA_V3_SCHEMA_VARIANT="traffic"
 DELTA_V3_REGIME_BANK_PATH=""
 
@@ -77,8 +78,8 @@ DELTA_V3_SPIKE_BIAS_L2="1e-3"
 DELTA_V3_LAMBDA_MIN="0.05"
 DELTA_V3_LAMBDA_TS_CAP="0.30"
 DELTA_V3_LAMBDA_NEWS_CAP="0.12"
-DELTA_V3_LAMBDA_MAX="0.45"
-DELTA_V3_SHAPE_GAIN_CAP="0.20"
+DELTA_V3_LAMBDA_MAX="0.60"
+DELTA_V3_SHAPE_GAIN_CAP="0.70"
 DELTA_V3_SPIKE_BIAS_CAP="0.75"
 DELTA_V3_SELECTION_COUNTERFACTUAL_GAIN_MIN="0.01"
 DELTA_V3_SELECTION_LAMBDA_SATURATION_MAX_PCT="0.35"

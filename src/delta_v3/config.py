@@ -105,6 +105,10 @@ class DeltaV3Config:
     lambda_news_cap: float
     lambda_max: float
     shape_gain_cap: float
+    shape_gain_l2_weight: float
+    hard_gate_mass_threshold: float
+    direction_weight: float
+    residual_history_channel: bool
     spike_bias_cap: float
     selection_counterfactual_gain_min: float
     selection_lambda_saturation_max_pct: float
@@ -182,7 +186,19 @@ class DeltaV3Config:
             lambda_ts_cap=float(getattr(args, "delta_v3_lambda_ts_cap", 0.45) or 0.45),
             lambda_news_cap=float(getattr(args, "delta_v3_lambda_news_cap", 0.20) or 0.20),
             lambda_max=float(getattr(args, "delta_v3_lambda_max", 0.60) or 0.60),
-            shape_gain_cap=float(getattr(args, "delta_v3_shape_gain_cap", 0.30) or 0.30),
+            shape_gain_cap=float(getattr(args, "delta_v3_shape_gain_cap", 0.50) or 0.50),
+            shape_gain_l2_weight=float(
+                getattr(args, "delta_v3_shape_gain_l2_weight", 0.01) or 0.0
+            ),
+            hard_gate_mass_threshold=float(
+                getattr(args, "delta_v3_hard_gate_mass_threshold", 0.0) or 0.0
+            ),
+            direction_weight=float(
+                getattr(args, "delta_v3_direction_weight", 0.05) or 0.0
+            ),
+            residual_history_channel=bool(
+                int(getattr(args, "delta_v3_residual_history_channel", 1) or 0)
+            ),
             spike_bias_cap=float(getattr(args, "delta_v3_spike_bias_cap", 0.75) or 0.75),
             selection_counterfactual_gain_min=float(
                 getattr(args, "delta_v3_selection_counterfactual_gain_min", 0.01) or 0.01

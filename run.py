@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patch_len", type=int, default=4)
     parser.add_argument("--patch_stride", type=int, default=4)
 
-    parser.add_argument("--base_backbone", type=str, default="mlp", choices=["mlp", "dlinear"])
+    parser.add_argument("--base_backbone", type=str, default="mlp", choices=["mlp", "dlinear", "nlinear", "patchtst"])
     parser.add_argument("--base_hidden_dim", type=int, default=256)
     parser.add_argument("--base_moving_avg", type=int, default=25)
     parser.add_argument("--base_dropout", type=float, default=0.0)
@@ -119,14 +119,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delta_v3_consistency_weight", type=float, default=0.05)
     parser.add_argument("--delta_v3_counterfactual_weight", type=float, default=0.1)
     parser.add_argument("--delta_v3_counterfactual_margin", type=float, default=0.02)
-    parser.add_argument("--delta_v3_inactive_residual_weight", type=float, default=0.1)
+    parser.add_argument("--delta_v3_inactive_residual_weight", type=float, default=0.5)
     parser.add_argument("--delta_v3_spike_bias_l2", type=float, default=1e-3)
     parser.add_argument("--delta_v3_active_mass_threshold", type=float, default=0.7)
     parser.add_argument("--delta_v3_lambda_min", type=float, default=0.05)
     parser.add_argument("--delta_v3_lambda_ts_cap", type=float, default=0.45)
     parser.add_argument("--delta_v3_lambda_news_cap", type=float, default=0.20)
     parser.add_argument("--delta_v3_lambda_max", type=float, default=0.60)
-    parser.add_argument("--delta_v3_shape_gain_cap", type=float, default=0.30)
+    parser.add_argument("--delta_v3_shape_gain_cap", type=float, default=0.50)
+    parser.add_argument("--delta_v3_shape_gain_l2_weight", type=float, default=0.01,
+                        help="L2 pull toward shape_gain=1.0; prevents saturation at the cap.")
+    parser.add_argument("--delta_v3_hard_gate_mass_threshold", type=float, default=0.0,
+                        help="If >0, samples with relevance_mass<threshold have delta forced to 0 (train & eval). 0 disables.")
+    parser.add_argument("--delta_v3_direction_weight", type=float, default=0.05,
+                        help="M5: weight on the cosine-based direction-agreement loss between delta contribution and true residual.")
+    parser.add_argument("--delta_v3_residual_history_channel", type=int, default=1, choices=[0, 1],
+                        help="M1: enable residual-history channel (history minus moving-average trend) as extra encoder input.")
     parser.add_argument("--delta_v3_spike_bias_cap", type=float, default=0.75)
     parser.add_argument("--delta_v3_selection_counterfactual_gain_min", type=float, default=0.01)
     parser.add_argument("--delta_v3_selection_lambda_saturation_max_pct", type=float, default=0.35)

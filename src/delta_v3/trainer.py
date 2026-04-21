@@ -37,7 +37,7 @@ from .model import build_delta_v3_model
 from .modulation_heads import RegimePretrainHeads
 from .pretrain_v2 import run_regime_self_supervised_pretrain
 from .regime_bank import build_regime_bank, load_regime_bank, read_regime_bank_metadata
-from .schema_refine_v2 import refine_dataset_news_corpus
+from .schema_refine_v2 import compute_news_corpus_signature, refine_dataset_news_corpus
 from .targets import ResidualTargetDecomposer, compute_residual_calendar_baseline
 
 
@@ -74,11 +74,19 @@ def _resolve_v3_paths(args, cfg: DeltaV3Config) -> tuple[str, list[str], str, li
     return refined_path, legacy_refined_paths, cfg.regime_bank_path, legacy_bank_paths
 
 
-def _expected_regime_bank_metadata(args, bundle, cfg: DeltaV3Config) -> dict[str, str | float | int]:
+def _expected_regime_bank_metadata(
+    args,
+    bundle,
+    cfg: DeltaV3Config,
+    *,
+    news_signature: dict[str, object],
+) -> dict[str, str | float | int]:
     date_start, date_end = _series_day_bounds(bundle, args)
     return {
         "source_news_file": os.path.basename(str(cfg.news_path or "").strip()),
         "source_news_stem": os.path.splitext(os.path.basename(str(cfg.news_path or "").strip()))[0],
+        "source_news_doc_count": int(news_signature.get("doc_count", 0) or 0),
+        "source_news_digest": str(news_signature.get("digest", "") or "").strip(),
         "schema_variant": str(cfg.schema_variant or "").strip(),
         "dataset_key": str(cfg.dataset_key or "").strip(),
         "encoder_model_id": str(cfg.text_encoder_model_id or "").strip(),
@@ -100,7 +108,7 @@ def _regime_bank_metadata_matches(
         return None, {}
     for key, expected_value in expected.items():
         if key not in actual:
-            return None, actual
+            return False, actual
         actual_value = actual[key]
         if isinstance(expected_value, float):
             try:
@@ -147,6 +155,8 @@ def _inspect_refined_corpus(refined_path: str) -> dict[str, object]:
     schema_variants: set[str] = set()
     source_news_files: set[str] = set()
     source_news_stems: set[str] = set()
+    source_news_doc_counts: set[int] = set()
+    source_news_digests: set[str] = set()
     with open(refined_path, "r", encoding="utf-8") as handle:
         for line in handle:
             text = str(line).strip()
@@ -166,17 +176,30 @@ def _inspect_refined_corpus(refined_path: str) -> dict[str, object]:
             source_news_stem = str(row.get("source_news_stem", "") or "").strip()
             if source_news_stem:
                 source_news_stems.add(source_news_stem)
+            source_news_doc_count = row.get("source_news_doc_count", None)
+            if source_news_doc_count not in (None, ""):
+                try:
+                    source_news_doc_counts.add(int(source_news_doc_count))
+                except Exception:
+                    pass
+            source_news_digest = str(row.get("source_news_digest", "") or "").strip()
+            if source_news_digest:
+                source_news_digests.add(source_news_digest)
     return {
         "total_docs": int(total_docs),
         "schema_variants": sorted(schema_variants),
         "source_news_files": sorted(source_news_files),
         "source_news_stems": sorted(source_news_stems),
+        "source_news_doc_counts": sorted(source_news_doc_counts),
+        "source_news_digests": sorted(source_news_digests),
     }
 
 
 def _refined_corpus_matches(
     refined_path: str,
     cfg: DeltaV3Config,
+    *,
+    news_signature: dict[str, object],
 ) -> tuple[bool, dict[str, object]]:
     metadata = _inspect_refined_corpus(refined_path)
     if int(metadata.get("total_docs", 0) or 0) <= 0:
@@ -198,14 +221,30 @@ def _refined_corpus_matches(
     if source_news_stems and (len(source_news_stems) != 1 or source_news_stems[0] != expected_news_stem):
         return False, metadata
 
+    expected_doc_count = int(news_signature.get("doc_count", 0) or 0)
+    source_news_doc_counts = list(metadata.get("source_news_doc_counts", []) or [])
+    if len(source_news_doc_counts) != 1 or source_news_doc_counts[0] != expected_doc_count:
+        return False, metadata
+
+    expected_digest = str(news_signature.get("digest", "") or "").strip()
+    source_news_digests = list(metadata.get("source_news_digests", []) or [])
+    if len(source_news_digests) != 1 or source_news_digests[0] != expected_digest:
+        return False, metadata
+
     return True, metadata
 
 
-def _select_usable_refined_path(candidate_paths: list[str], cfg: DeltaV3Config, live_logger) -> str | None:
+def _select_usable_refined_path(
+    candidate_paths: list[str],
+    cfg: DeltaV3Config,
+    live_logger,
+    *,
+    news_signature: dict[str, object],
+) -> str | None:
     for path in candidate_paths:
         if not os.path.exists(path):
             continue
-        matches, metadata = _refined_corpus_matches(path, cfg)
+        matches, metadata = _refined_corpus_matches(path, cfg, news_signature=news_signature)
         if matches:
             return path
         if live_logger is not None:
@@ -269,11 +308,18 @@ def _series_day_bounds(bundle, args) -> tuple[pd.Timestamp, pd.Timestamp]:
 
 def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
     live_logger = bundle["live_logger"]
+    news_signature = compute_news_corpus_signature(cfg.news_path)
     refined_path, legacy_refined_paths, bank_path, legacy_bank_paths = _resolve_v3_paths(args, cfg)
     refined_candidate_paths = _dedupe_paths([refined_path] + legacy_refined_paths)
-    reusable_refined_path = _select_usable_refined_path(refined_candidate_paths, cfg, live_logger)
+    reusable_refined_path = _select_usable_refined_path(
+        refined_candidate_paths,
+        cfg,
+        live_logger,
+        news_signature=news_signature,
+    )
     refined_debug_path = reusable_refined_path or refined_path
-    expected_bank_meta = _expected_regime_bank_metadata(args, bundle, cfg)
+    existing_refined_seed_paths = [path for path in refined_candidate_paths if os.path.exists(path)]
+    expected_bank_meta = _expected_regime_bank_metadata(args, bundle, cfg, news_signature=news_signature)
     if os.path.exists(bank_path) and not cfg.refined_bank_build:
         meta_matches, actual_meta = _regime_bank_metadata_matches(bank_path, expected_bank_meta)
         if meta_matches is not False:
@@ -307,7 +353,8 @@ def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
             return bank, refined_debug_path, legacy_bank_path
 
     actual_refined_path = reusable_refined_path
-    if actual_refined_path is None and not cfg.refined_bank_build:
+    should_sync_from_existing_cache = actual_refined_path is None and len(existing_refined_seed_paths) > 0
+    if actual_refined_path is None and not cfg.refined_bank_build and not should_sync_from_existing_cache:
         raise FileNotFoundError(
             f"delta_v3 regime bank missing: {bank_path}. "
             f"refined_checked={refined_candidate_paths}. "
@@ -316,20 +363,20 @@ def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
         )
 
     if actual_refined_path is None:
-        live_logger.info(f"[DELTA_V3] building regime refine corpus at {refined_path}")
-        api_adapter = build_news_api_adapter(args, live_logger=live_logger)
-        if api_adapter is None:
-            raise RuntimeError(
-                "delta_v3 regime bank build requested but no API key was discovered. "
-                "Set OPENAI_API_KEY or point --news_api_key_path to a readable key file "
-                "(default .secrets/api_key.txt)."
+        if should_sync_from_existing_cache:
+            live_logger.info(
+                "[DELTA_V3] synchronizing refined corpus cache against current news file "
+                f"target_path={refined_path} seed_paths={existing_refined_seed_paths}"
             )
-
+        else:
+            live_logger.info(f"[DELTA_V3] building regime refine corpus at {refined_path}")
+        api_adapter = build_news_api_adapter(args, live_logger=live_logger)
         refine_dataset_news_corpus(
             news_path=args.news_path,
             schema_variant=cfg.schema_variant,
             api_adapter=api_adapter,
             cache_path=refined_path,
+            seed_cache_paths=existing_refined_seed_paths,
         )
         actual_refined_path = refined_path
     else:
@@ -436,6 +483,28 @@ def _base_forward(base_backbone, history_z: torch.Tensor):
         base_pred_z = out
         base_hidden = out
     return base_pred_z.to(torch.float32), base_hidden.to(torch.float32)
+
+
+def _compute_residual_history(history_z: torch.Tensor, window: int = 25) -> torch.Tensor:
+    """M1: detrended residual-history channel.
+
+    Returns history_z minus its rolling mean over a causal window. Captures short-term
+    deviations from the local trend — the fluctuation component that simple linear/MLP
+    bases tend to miss. Shape matches history_z: [B, T].
+    """
+    if history_z.ndim != 2:
+        return torch.zeros_like(history_z)
+    batch_size, seq_len = history_z.shape
+    if seq_len <= 0:
+        return torch.zeros_like(history_z)
+    window = max(1, min(int(window), seq_len))
+    # Causal rolling mean via left-padded 1D average pool.
+    x = history_z.unsqueeze(1)
+    pad = torch.zeros((batch_size, 1, window - 1), dtype=x.dtype, device=x.device)
+    x_padded = torch.cat([pad, x], dim=-1)
+    kernel = torch.ones((1, 1, window), dtype=x.dtype, device=x.device) / float(window)
+    trend = F.conv1d(x_padded, kernel)
+    return (x - trend).squeeze(1)
 
 
 def _collect_train_residual_magnitudes(train_eval_loader, base_backbone, args, global_zstats, device) -> np.ndarray:
@@ -734,6 +803,9 @@ def evaluate_delta_v3(
             if _spike_clip > 0:
                 targets_raw = targets_raw.clamp(-_spike_clip, _spike_clip)
             base_pred_z, base_hidden = _base_forward(base_backbone, history_z)
+            residual_history = (
+                _compute_residual_history(history_z) if cfg.residual_history_channel else None
+            )
             regime_pack, regime_active_used, in_force_docs_used = _build_regime_pack(
                 batch,
                 bank,
@@ -748,6 +820,7 @@ def evaluate_delta_v3(
                     base_pred_z=base_pred_z,
                     base_hidden=base_hidden if model.cfg.use_base_hidden else None,
                     regime_pack=regime_pack,
+                    residual_history=residual_history,
                 )
                 pred_z = out["pred_z"]
                 loss = _main_point_loss(
@@ -771,6 +844,7 @@ def evaluate_delta_v3(
                     base_pred_z=base_pred_z,
                     base_hidden=base_hidden if model.cfg.use_base_hidden else None,
                     regime_pack=blank_pack,
+                    residual_history=residual_history,
                 )
 
                 perm_out = None
@@ -787,6 +861,7 @@ def evaluate_delta_v3(
                         base_pred_z=base_pred_z,
                         base_hidden=base_hidden if model.cfg.use_base_hidden else None,
                         regime_pack=perm_pack,
+                        residual_history=residual_history,
                     )
 
             batch_size = pred_z.size(0)
@@ -1167,6 +1242,9 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
 
             with torch.no_grad():
                 base_pred_z, base_hidden = _base_forward(base_backbone, history_z)
+            residual_history = (
+                _compute_residual_history(history_z) if cfg.residual_history_channel else None
+            )
 
             # get regime pack
             regime_pack, _, _ = _build_regime_pack(
@@ -1189,6 +1267,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                 base_pred_z=base_pred_z,
                 base_hidden=base_hidden if cfg.use_base_hidden else None,
                 regime_pack=train_regime_pack,
+                residual_history=residual_history,
             )
             # delta prediction: the sum of the base prediction and the residual correction predicted by the delta model
             pred_z = out["pred_z"]
@@ -1251,6 +1330,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                         base_pred_z=base_pred_z,
                         base_hidden=base_hidden if cfg.use_base_hidden else None,
                         regime_pack=blank_all_pack,
+                        residual_history=residual_history,
                     )
                 inactive_mask = ~original_active
                 consistency_loss = F.mse_loss(pred_z[inactive_mask], out_blank_all["pred_z"][inactive_mask])
@@ -1270,6 +1350,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                             base_pred_z=base_pred_z,
                             base_hidden=base_hidden if cfg.use_base_hidden else None,
                             regime_pack=regime_pack,
+                            residual_history=residual_history,
                         )
                     blank_all_pack = _blank_regime_pack(regime_pack)
                     with torch.no_grad():
@@ -1279,6 +1360,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                             base_pred_z=base_pred_z,
                             base_hidden=base_hidden if cfg.use_base_hidden else None,
                             regime_pack=blank_all_pack,
+                            residual_history=residual_history,
                         )
                         perm_pack, _, _ = _build_regime_pack(
                             batch,
@@ -1292,6 +1374,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                             base_pred_z=base_pred_z,
                             base_hidden=base_hidden if cfg.use_base_hidden else None,
                             regime_pack=perm_pack,
+                            residual_history=residual_history,
                         )
                     margin = float(cfg.counterfactual_margin)
                     real_err = (real_out["pred_z"] - targets_z).abs().mean(dim=-1)
@@ -1307,6 +1390,18 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
             inactive_residual_loss = torch.zeros((), dtype=torch.float32, device=device)
             if cfg.inactive_residual_weight > 0 and bool((~original_active).any()):
                 inactive_residual_loss = out["residual_hat"][~original_active].pow(2).mean()
+            # 把 shape_gain 朝 1.0 拉的软正则：允许 shape_gain 偏离 1，但要付代价，避免 tanh 饱和到 cap 边界。
+            shape_gain_reg = (out["shape_gain"] - 1.0).pow(2).mean()
+            # M5: direction-aware auxiliary loss. Reward sign-agreement between the delta's
+            # contribution (pred_z - base_pred_z) and the true residual (targets_z - base_pred_z).
+            # Only applied on active samples — silent-news samples should have ~0 delta anyway.
+            direction_loss = torch.zeros((), dtype=torch.float32, device=device)
+            if cfg.direction_weight > 0 and bool(original_active.any()):
+                delta_contrib = (pred_z - base_pred_z)[original_active]
+                true_residual_active = residual_target[original_active]
+                direction_loss = 1.0 - F.cosine_similarity(
+                    delta_contrib, true_residual_active, dim=-1, eps=1e-6
+                ).mean()
             # 最终总损失是主损失加上各种辅助损失的加权和。每个辅助损失都有一个权重系数，可以通过 cfg 来调整它们的重要性。
             loss = (
                 point_loss
@@ -1318,6 +1413,8 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
                 + cfg.counterfactual_weight * counterfactual_loss
                 + cfg.inactive_residual_weight * inactive_residual_loss
                 + cfg.spike_bias_l2 * spike_bias_reg
+                + cfg.shape_gain_l2_weight * shape_gain_reg
+                + cfg.direction_weight * direction_loss
             )
 
             optimizer.zero_grad(set_to_none=True)

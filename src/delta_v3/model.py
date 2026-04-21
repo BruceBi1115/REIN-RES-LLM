@@ -21,6 +21,7 @@ class DeltaV3Regressor(nn.Module):
             num_heads=cfg.num_heads,
             dropout=cfg.dropout,
             use_base_hidden=cfg.use_base_hidden,
+            residual_channel=cfg.residual_history_channel,
         )
         self.regime_projector = RegimeProjector(cfg.hidden_size)
         self.slow_head = SlowHead(cfg.hidden_size)
@@ -65,8 +66,14 @@ class DeltaV3Regressor(nn.Module):
         base_pred_z: torch.Tensor,
         base_hidden: torch.Tensor | None,
         regime_pack: dict[str, torch.Tensor],
+        residual_history: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        ts_tokens, ts_summary = self.ts_encoder(history_z=history_z, history_times=history_times, base_hidden=base_hidden)
+        ts_tokens, ts_summary = self.ts_encoder(
+            history_z=history_z,
+            history_times=history_times,
+            base_hidden=base_hidden,
+            residual_history=residual_history,
+        )
         regime_repr = self.encode_regime(regime_pack)
 
         slow_ts = self.slow_head(ts_summary)
@@ -80,11 +87,24 @@ class DeltaV3Regressor(nn.Module):
 
         shape_z = shape_ts * modulation["shape_gain"].unsqueeze(-1)
         residual_z = slow_ts.unsqueeze(-1) + shape_z + spike_gate * spike_ts
-        pred_z = base_pred_z + modulation["lambda_base"].unsqueeze(-1) * residual_z
+
+        # Hard gate: zero out delta on samples with relevance_mass < threshold.
+        # Differs from the soft gate in RegimeModulationHeads (which shrinks lambda_base toward lambda_min
+        # via a sigmoid). Hard gate is a stricter data-level guard for datasets with sparse/noisy news
+        # coverage, so delta cannot inject noise on genuinely-silent days at inference or training time.
+        hard_gate_threshold = float(self.cfg.hard_gate_mass_threshold)
+        if hard_gate_threshold > 0.0:
+            relevance = regime_pack["relevance_mass"].to(base_pred_z.dtype).view(-1)
+            gate = (relevance >= hard_gate_threshold).to(base_pred_z.dtype).unsqueeze(-1)
+            pred_z = base_pred_z + gate * modulation["lambda_base"].unsqueeze(-1) * residual_z
+        else:
+            gate = torch.ones((base_pred_z.size(0), 1), dtype=base_pred_z.dtype, device=base_pred_z.device)
+            pred_z = base_pred_z + modulation["lambda_base"].unsqueeze(-1) * residual_z
 
         return {
             "pred_z": pred_z,
             "residual_hat": pred_z - base_pred_z,
+            "hard_gate": gate,
             "residual_ts_z": residual_z,
             "slow_ts": slow_ts,
             "shape_ts": shape_ts,

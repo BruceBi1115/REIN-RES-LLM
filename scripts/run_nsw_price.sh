@@ -28,7 +28,7 @@ GRAD_ACCS=("4")
 LRS=("1e-4")
 HORIZONS=("48")
 SCHEDULERS=("1")
-BASE_BACKBONES=("mlp")
+BASE_BACKBONES=("nlinear" "patchtst")
 
 EARLY_STOP_PATIENCE="5"
 NEWS_WINDOW_DAYS="1"
@@ -37,7 +37,7 @@ TASK_NAME_BASE="delta_v3_nsw_price"
 PRE_RUN_HOOK=""
 DELTA_V3_REFINED_BANK_BUILD="0"
 # NORMALIZATION_MODE="zscore"
-DELTA_V3_ACTIVE_MASS_THRESHOLD="0"
+DELTA_V3_ACTIVE_MASS_THRESHOLDS=("0")
 
 NEWS_API_ENABLE="1"
 DELTA_V3_SCHEMA_VARIANT="price"
@@ -143,17 +143,20 @@ run_nsw_price_main() {
         for scheduler in "${SCHEDULERS[@]}"; do
           for grad_acc in "${GRAD_ACCS[@]}"; do
             for horizon in "${HORIZONS[@]}"; do
-              local task_name
-              set_horizon_specific_params "$horizon"
-              task_name="${TASK_NAME_BASE}__lr${lr}__ga${grad_acc}__sch${scheduler}${TASK_NAME_SUFFIX}"
-              build_run_args "$task_name" "$base_backbone" "$horizon" "$lr" "$scheduler" "$grad_acc" "$news_path"
-              if [[ ${#EXTRA_RUN_ARGS[@]} -gt 0 ]]; then
-                RUN_ARGS+=( "${EXTRA_RUN_ARGS[@]}" )
-              fi
+              for active_mass_threshold in "${DELTA_V3_ACTIVE_MASS_THRESHOLDS[@]}"; do
+                local task_name
+                DELTA_V3_ACTIVE_MASS_THRESHOLD="$active_mass_threshold"
+                set_horizon_specific_params "$horizon"
+                task_name="${TASK_NAME_BASE}__lr${lr}__ga${grad_acc}__sch${scheduler}${TASK_NAME_SUFFIX}"
+                build_run_args "$task_name" "$base_backbone" "$horizon" "$lr" "$scheduler" "$grad_acc" "$news_path"
+                if [[ ${#EXTRA_RUN_ARGS[@]} -gt 0 ]]; then
+                  RUN_ARGS+=( "${EXTRA_RUN_ARGS[@]}" )
+                fi
 
-              echo "==> Running dataset=$DATASET_KEY backbone=$base_backbone horizon=$horizon lr=$lr grad_acc=$grad_acc stage=$STAGE"
-              echo "    horizon_caps: lambda_max=$DELTA_V3_LAMBDA_MAX lambda_ts_cap=$DELTA_V3_LAMBDA_TS_CAP lambda_news_cap=$DELTA_V3_LAMBDA_NEWS_CAP spike_bias_cap=$DELTA_V3_SPIKE_BIAS_CAP shape_gain_cap=$DELTA_V3_SHAPE_GAIN_CAP early_stop_patience=$EARLY_STOP_PATIENCE"
-              "$PYTHON_BIN" "$ENTRY" "${RUN_ARGS[@]}"
+                echo "==> Running dataset=$DATASET_KEY backbone=$base_backbone horizon=$horizon lr=$lr grad_acc=$grad_acc active_mass_threshold=$DELTA_V3_ACTIVE_MASS_THRESHOLD stage=$STAGE"
+                echo "    horizon_caps: lambda_max=$DELTA_V3_LAMBDA_MAX lambda_ts_cap=$DELTA_V3_LAMBDA_TS_CAP lambda_news_cap=$DELTA_V3_LAMBDA_NEWS_CAP spike_bias_cap=$DELTA_V3_SPIKE_BIAS_CAP shape_gain_cap=$DELTA_V3_SHAPE_GAIN_CAP early_stop_patience=$EARLY_STOP_PATIENCE"
+                "$PYTHON_BIN" "$ENTRY" "${RUN_ARGS[@]}"
+              done
             done
           done
         done

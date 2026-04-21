@@ -62,14 +62,24 @@ class PatchTSTTSEncoder(nn.Module):
         num_heads: int,
         dropout: float,
         use_base_hidden: bool = True,
+        residual_channel: bool = False,
     ):
         super().__init__()
         self.patch_len = int(patch_len)
         self.patch_stride = int(patch_stride)
         self.hidden_size = int(hidden_size)
         self.use_base_hidden = bool(use_base_hidden)
+        self.residual_channel = bool(residual_channel)
 
         self.patch_proj = nn.Linear(self.patch_len, self.hidden_size)
+        # M1: separate projection for the residual-history channel. Zero-init so the encoder
+        # behaves identically to the no-residual baseline until gradient flow moves it.
+        if self.residual_channel:
+            self.residual_patch_proj = nn.Linear(self.patch_len, self.hidden_size)
+            nn.init.zeros_(self.residual_patch_proj.weight)
+            nn.init.zeros_(self.residual_patch_proj.bias)
+        else:
+            self.residual_patch_proj = None
         self.dow_embed = nn.Embedding(7, self.hidden_size)
         self.hod_embed = nn.Embedding(48, self.hidden_size)
         self.holiday_embed = nn.Embedding(2, self.hidden_size)
@@ -90,9 +100,14 @@ class PatchTSTTSEncoder(nn.Module):
         history_z: torch.Tensor,
         history_times,
         base_hidden: torch.Tensor | None = None,
+        residual_history: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = _patchify(history_z, self.patch_len, self.patch_stride)
         tokens = self.patch_proj(tokens)
+
+        if self.residual_channel and residual_history is not None and self.residual_patch_proj is not None:
+            res_tokens = _patchify(residual_history, self.patch_len, self.patch_stride)
+            tokens = tokens + self.residual_patch_proj(res_tokens)
 
         dow_idx, hod_idx, holiday_idx = build_patch_calendar_indices(history_times, self.patch_len, self.patch_stride)
         if dow_idx.numel() > 0:

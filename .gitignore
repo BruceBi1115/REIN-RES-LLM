@@ -1,7 +1,6 @@
 # Ignore checkpoints directory
 checkpoints/
 dataset/
-src/chatgpt_4o_mini_keyword_generate/config.json
 .secrets/api_key.txt
 __pycache__/
 */__pycache__/

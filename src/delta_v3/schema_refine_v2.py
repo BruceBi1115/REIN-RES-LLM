@@ -58,6 +58,81 @@ def _doc_identity(doc: dict[str, Any]) -> str:
     return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
 
 
+def _load_news_payload(news_path: str) -> list[dict[str, Any]]:
+    with open(news_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, list):
+        raise TypeError(f"Expected a JSON array in {news_path}, got {type(payload).__name__}")
+    return payload
+
+
+def _limit_news_docs(payload: list[dict[str, Any]], max_items: int | None = None) -> list[dict[str, Any]]:
+    limit = len(payload) if max_items is None or int(max_items) <= 0 else min(len(payload), int(max_items))
+    return payload[:limit]
+
+
+def _corpus_digest(doc_keys: list[str]) -> str:
+    joined = "\n".join(str(key or "").strip() for key in doc_keys)
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+
+def compute_news_corpus_signature(news_path: str, *, max_items: int | None = None) -> dict[str, Any]:
+    docs = _limit_news_docs(_load_news_payload(news_path), max_items=max_items)
+    doc_keys = [_doc_identity(doc) for doc in docs]
+    return {
+        "doc_count": int(len(doc_keys)),
+        "digest": _corpus_digest(doc_keys),
+        "doc_keys": doc_keys,
+    }
+
+
+def _load_existing_refined_rows(
+    cache_paths: list[str],
+    *,
+    schema_variant: str,
+    source_news_file: str,
+    source_news_stem: str,
+) -> dict[str, dict[str, Any]]:
+    existing_by_key: dict[str, dict[str, Any]] = {}
+    seen_paths: set[str] = set()
+
+    for raw_path in cache_paths:
+        path = os.path.normpath(str(raw_path or "").strip())
+        if not path or path in seen_paths or not os.path.exists(path):
+            continue
+        seen_paths.add(path)
+
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                text = str(line).strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except Exception:
+                    continue
+
+                doc_key = str(row.get("doc_key", "") or "").strip()
+                if not doc_key or doc_key in existing_by_key:
+                    continue
+
+                row_schema_variant = str(row.get("schema_variant", "") or "").strip()
+                if row_schema_variant and row_schema_variant != str(schema_variant or "").strip():
+                    continue
+
+                row_source_news_file = os.path.basename(str(row.get("source_news_file", "") or "").strip())
+                if row_source_news_file and row_source_news_file != source_news_file:
+                    continue
+
+                row_source_news_stem = str(row.get("source_news_stem", "") or "").strip()
+                if row_source_news_stem and row_source_news_stem != source_news_stem:
+                    continue
+
+                existing_by_key[doc_key] = row
+
+    return existing_by_key
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     payload = str(text or "").strip()
     if not payload:
@@ -403,15 +478,28 @@ def refine_dataset_news_corpus(
     cache_path: str,
     *,
     max_items: int | None = None,
+    seed_cache_paths: list[str] | None = None,
 ) -> None:
-    with open(news_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, list):
-        raise TypeError(f"Expected a JSON array in {news_path}, got {type(payload).__name__}")
-
+    payload = _load_news_payload(news_path)
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    limit = len(payload) if max_items is None or int(max_items) <= 0 else min(len(payload), int(max_items))
-    docs = payload[:limit]
+    docs = _limit_news_docs(payload, max_items=max_items)
+    limit = len(docs)
+    source_news_file = os.path.basename(str(news_path or "").strip())
+    source_news_stem = os.path.splitext(source_news_file)[0]
+    news_signature = compute_news_corpus_signature(news_path, max_items=max_items)
+    existing_by_key = _load_existing_refined_rows(
+        [cache_path] + list(seed_cache_paths or []),
+        schema_variant=schema_variant,
+        source_news_file=source_news_file,
+        source_news_stem=source_news_stem,
+    )
+    missing_doc_count = sum(1 for doc in docs if _doc_identity(doc) not in existing_by_key)
+    if missing_doc_count > 0 and api_adapter is None:
+        raise RuntimeError(
+            "No news API adapter available to refine missing documents. "
+            f"news_path={news_path} schema_variant={schema_variant} missing_docs={missing_doc_count}"
+        )
+
     progress = tqdm(
         docs,
         total=limit,
@@ -421,21 +509,35 @@ def refine_dataset_news_corpus(
         disable=limit <= 0,
     )
     actionable_count = 0
+    reused_count = 0
+    refined_count = 0
     if limit > 0:
-        progress.set_postfix_str("actionable=0")
+        progress.set_postfix_str("reused=0 refined=0 actionable=0")
     with open(cache_path, "w", encoding="utf-8") as handle:
         for doc in progress:
-            refined = refine_one_news_doc(
-                doc,
-                schema_variant=schema_variant,
-                corpus_hint=news_path,
-                api_adapter=api_adapter,
-            )
-            refined["source_news_file"] = os.path.basename(str(news_path or "").strip())
-            refined["source_news_stem"] = os.path.splitext(os.path.basename(str(news_path or "").strip()))[0]
+            doc_key = _doc_identity(doc)
+            refined = dict(existing_by_key.get(doc_key, {}))
+            if refined:
+                reused_count += 1
+            else:
+                refined = refine_one_news_doc(
+                    doc,
+                    schema_variant=schema_variant,
+                    corpus_hint=news_path,
+                    api_adapter=api_adapter,
+                )
+                refined_count += 1
+
+            refined["doc_key"] = doc_key
+            refined["source_news_file"] = source_news_file
+            refined["source_news_stem"] = source_news_stem
+            refined["source_news_doc_count"] = int(news_signature["doc_count"])
+            refined["source_news_digest"] = str(news_signature["digest"])
             if bool(refined.get("is_actionable", False)):
                 actionable_count += 1
-            progress.set_postfix_str(f"actionable={actionable_count}")
+            progress.set_postfix_str(
+                f"reused={reused_count} refined={refined_count} actionable={actionable_count}"
+            )
             handle.write(json.dumps(refined, ensure_ascii=False) + "\n")
 
 

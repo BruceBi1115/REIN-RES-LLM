@@ -19,7 +19,7 @@ DAY_FIRST="1"
 TRAIN_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_trainset.csv"
 VAL_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_valset.csv"
 TEST_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_testset.csv"
-DEFAULT_NEWS_PATH="dataset/bitcoin_2024.json"
+DEFAULT_NEWS_PATH="dataset/news_from_sources/coindesk_archive_2024_new.json"
 
 STAGE="all"
 BASE_EPOCHS="40"
@@ -29,7 +29,7 @@ GRAD_ACCS=("4")
 LRS=("1e-4")
 HORIZONS=("48")
 SCHEDULERS=("1")
-BASE_BACKBONES=("dlinear")
+BASE_BACKBONES=("mlp")
 
 EARLY_STOP_PATIENCE="5"
 NEWS_WINDOW_DAYS="1"
@@ -38,7 +38,7 @@ TASK_NAME_BASE="delta_v3_bitcoin_hourly"
 PRE_RUN_HOOK=""
 
 DELTA_V3_REFINED_BANK_BUILD="0"
-DELTA_V3_ACTIVE_MASS_THRESHOLD="13"
+DELTA_V3_ACTIVE_MASS_THRESHOLDS=("0.2")
 
 NEWS_API_ENABLE="1"
 DELTA_V3_SCHEMA_VARIANT="bitcoin"
@@ -155,17 +155,20 @@ run_bitcoin_hourly_main() {
         for scheduler in "${SCHEDULERS[@]}"; do
           for grad_acc in "${GRAD_ACCS[@]}"; do
             for horizon in "${HORIZONS[@]}"; do
-              local task_name
-              set_horizon_specific_params "$horizon"
-              task_name="${TASK_NAME_BASE}__lr${lr}__ga${grad_acc}__sch${scheduler}${TASK_NAME_SUFFIX}"
-              build_run_args "$task_name" "$base_backbone" "$horizon" "$lr" "$scheduler" "$grad_acc" "$news_path"
-              if [[ ${#EXTRA_RUN_ARGS[@]} -gt 0 ]]; then
-                RUN_ARGS+=( "${EXTRA_RUN_ARGS[@]}" )
-              fi
+              for active_mass_threshold in "${DELTA_V3_ACTIVE_MASS_THRESHOLDS[@]}"; do
+                local task_name
+                DELTA_V3_ACTIVE_MASS_THRESHOLD="$active_mass_threshold"
+                set_horizon_specific_params "$horizon"
+                task_name="${TASK_NAME_BASE}__lr${lr}__ga${grad_acc}__sch${scheduler}${TASK_NAME_SUFFIX}"
+                build_run_args "$task_name" "$base_backbone" "$horizon" "$lr" "$scheduler" "$grad_acc" "$news_path"
+                if [[ ${#EXTRA_RUN_ARGS[@]} -gt 0 ]]; then
+                  RUN_ARGS+=( "${EXTRA_RUN_ARGS[@]}" )
+                fi
 
-              echo "==> Running dataset=$DATASET_KEY backbone=$base_backbone horizon=$horizon lr=$lr grad_acc=$grad_acc stage=$STAGE"
-              echo "    horizon_caps: lambda_max=$DELTA_V3_LAMBDA_MAX lambda_ts_cap=$DELTA_V3_LAMBDA_TS_CAP lambda_news_cap=$DELTA_V3_LAMBDA_NEWS_CAP spike_bias_cap=$DELTA_V3_SPIKE_BIAS_CAP shape_gain_cap=$DELTA_V3_SHAPE_GAIN_CAP early_stop_patience=$EARLY_STOP_PATIENCE"
-              "$PYTHON_BIN" "$ENTRY" "${RUN_ARGS[@]}"
+                echo "==> Running dataset=$DATASET_KEY backbone=$base_backbone horizon=$horizon lr=$lr grad_acc=$grad_acc active_mass_threshold=$DELTA_V3_ACTIVE_MASS_THRESHOLD stage=$STAGE"
+                echo "    horizon_caps: lambda_max=$DELTA_V3_LAMBDA_MAX lambda_ts_cap=$DELTA_V3_LAMBDA_TS_CAP lambda_news_cap=$DELTA_V3_LAMBDA_NEWS_CAP spike_bias_cap=$DELTA_V3_SPIKE_BIAS_CAP shape_gain_cap=$DELTA_V3_SHAPE_GAIN_CAP early_stop_patience=$EARLY_STOP_PATIENCE"
+                "$PYTHON_BIN" "$ENTRY" "${RUN_ARGS[@]}"
+              done
             done
           done
         done

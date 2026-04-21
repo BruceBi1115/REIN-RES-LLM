@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from .schema_refine_v2 import REGIME_KEYS, TOPIC_TAGS
+from .schema_refine_v2 import REGIME_KEYS, TOPIC_TAGS, compute_news_corpus_signature
 
 
 def _mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -212,6 +212,13 @@ def build_regime_bank(
         "ema_alpha": float(ema_alpha),
         "ema_window": int(ema_window),
     }
+    if str(source_news_path or "").strip():
+        try:
+            news_signature = compute_news_corpus_signature(source_news_path)
+            metadata["source_news_doc_count"] = int(news_signature.get("doc_count", 0) or 0)
+            metadata["source_news_digest"] = str(news_signature.get("digest", "") or "").strip()
+        except Exception:
+            pass
 
     np.savez_compressed(
         out_path,

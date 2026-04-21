@@ -374,14 +374,26 @@ init_common_defaults() {
   set_default DELTA_V3_CONSISTENCY_WEIGHT "0.05"
   set_default DELTA_V3_COUNTERFACTUAL_WEIGHT "0.1"
   set_default DELTA_V3_COUNTERFACTUAL_MARGIN "0.02"
-  set_default DELTA_V3_INACTIVE_RESIDUAL_WEIGHT "0.1"
+  set_default DELTA_V3_INACTIVE_RESIDUAL_WEIGHT "0.5"
   set_default DELTA_V3_SPIKE_BIAS_L2 "1e-3"
   set_default DELTA_V3_ACTIVE_MASS_THRESHOLD "0.7"
   set_default DELTA_V3_LAMBDA_MIN "0.05"
   set_default DELTA_V3_LAMBDA_TS_CAP "0.30"
   set_default DELTA_V3_LAMBDA_NEWS_CAP "0.12"
-  set_default DELTA_V3_LAMBDA_MAX "0.45"
-  set_default DELTA_V3_SHAPE_GAIN_CAP "0.20"
+  set_default DELTA_V3_LAMBDA_MAX "0.60"
+  # Per-backbone lambda_max overrides (plan P0.2). Used inside the main loop to select
+  # an effective cap for each backbone; empty means "use DELTA_V3_LAMBDA_MAX".
+  set_default DELTA_V3_LAMBDA_MAX_MLP ""
+  set_default DELTA_V3_LAMBDA_MAX_DLINEAR ""
+  set_default DELTA_V3_LAMBDA_MAX_NLINEAR ""
+  set_default DELTA_V3_LAMBDA_MAX_PATCHTST ""
+  set_default DELTA_V3_SHAPE_GAIN_CAP "0.50"
+  set_default DELTA_V3_SHAPE_GAIN_L2_WEIGHT "0.01"
+  set_default DELTA_V3_HARD_GATE_MASS_THRESHOLD "0.0"
+  # M5: direction-aware aux loss (cosine agreement between delta contribution and true residual).
+  set_default DELTA_V3_DIRECTION_WEIGHT "0.05"
+  # M1: residual-history channel (1=on, 0=off). Adds a detrended history channel to the delta encoder.
+  set_default DELTA_V3_RESIDUAL_HISTORY_CHANNEL "1"
   set_default DELTA_V3_SPIKE_BIAS_CAP "0.75"
   set_default DELTA_V3_SELECTION_COUNTERFACTUAL_GAIN_MIN "0.01"
   set_default DELTA_V3_SELECTION_LAMBDA_SATURATION_MAX_PCT "0.35"
@@ -410,6 +422,7 @@ init_common_defaults() {
   set_array_default LRS "1e-4"
   set_array_default SCHEDULERS "1"
   set_array_default GRAD_ACCS "1"
+  set_array_default DELTA_V3_ACTIVE_MASS_THRESHOLDS "$DELTA_V3_ACTIVE_MASS_THRESHOLD"
 
 }
 
@@ -436,6 +449,7 @@ validate_dataset_config() {
   require_array_set LRS
   require_array_set SCHEDULERS
   require_array_set GRAD_ACCS
+  require_array_set DELTA_V3_ACTIVE_MASS_THRESHOLDS
 
   if [[ -n "${PRE_RUN_HOOK:-}" ]] && ! declare -F "$PRE_RUN_HOOK" >/dev/null 2>&1; then
     echo "[ERROR] PRE_RUN_HOOK '$PRE_RUN_HOOK' is not defined." >&2
@@ -538,6 +552,10 @@ build_run_args() {
     --delta_v3_lambda_news_cap "$DELTA_V3_LAMBDA_NEWS_CAP"
     --delta_v3_lambda_max "$DELTA_V3_LAMBDA_MAX"
     --delta_v3_shape_gain_cap "$DELTA_V3_SHAPE_GAIN_CAP"
+    --delta_v3_shape_gain_l2_weight "$DELTA_V3_SHAPE_GAIN_L2_WEIGHT"
+    --delta_v3_hard_gate_mass_threshold "$DELTA_V3_HARD_GATE_MASS_THRESHOLD"
+    --delta_v3_direction_weight "$DELTA_V3_DIRECTION_WEIGHT"
+    --delta_v3_residual_history_channel "$DELTA_V3_RESIDUAL_HISTORY_CHANNEL"
     --delta_v3_spike_bias_cap "$DELTA_V3_SPIKE_BIAS_CAP"
     --delta_v3_selection_counterfactual_gain_min "$DELTA_V3_SELECTION_COUNTERFACTUAL_GAIN_MIN"
     --delta_v3_selection_lambda_saturation_max_pct "$DELTA_V3_SELECTION_LAMBDA_SATURATION_MAX_PCT"
@@ -603,23 +621,36 @@ run_forecast_dataset_main() {
   echo "[config] dataset=$DATASET_KEY stage=$STAGE task_base=$TASK_NAME_BASE"
   for news_path in "${NEWS_CHOICES[@]}"; do
     for base_backbone in "${BASE_BACKBONES[@]}"; do
+      # Plan P0.2: backbone-aware lambda_max. When the per-backbone override is non-empty,
+      # it supersedes DELTA_V3_LAMBDA_MAX for this backbone only; restored after the run.
+      local _lambda_max_saved="$DELTA_V3_LAMBDA_MAX"
+      case "$base_backbone" in
+        mlp)      [[ -n "${DELTA_V3_LAMBDA_MAX_MLP:-}"      ]] && DELTA_V3_LAMBDA_MAX="$DELTA_V3_LAMBDA_MAX_MLP" ;;
+        dlinear)  [[ -n "${DELTA_V3_LAMBDA_MAX_DLINEAR:-}"  ]] && DELTA_V3_LAMBDA_MAX="$DELTA_V3_LAMBDA_MAX_DLINEAR" ;;
+        nlinear)  [[ -n "${DELTA_V3_LAMBDA_MAX_NLINEAR:-}"  ]] && DELTA_V3_LAMBDA_MAX="$DELTA_V3_LAMBDA_MAX_NLINEAR" ;;
+        patchtst) [[ -n "${DELTA_V3_LAMBDA_MAX_PATCHTST:-}" ]] && DELTA_V3_LAMBDA_MAX="$DELTA_V3_LAMBDA_MAX_PATCHTST" ;;
+      esac
       for lr in "${LRS[@]}"; do
         for scheduler in "${SCHEDULERS[@]}"; do
           for grad_acc in "${GRAD_ACCS[@]}"; do
             for horizon in "${HORIZONS[@]}"; do
-              local task_name
-              task_name="${TASK_NAME_BASE}__lr${lr}__ga${grad_acc}__sch${scheduler}${TASK_NAME_SUFFIX}"
-              build_run_args "$task_name" "$base_backbone" "$horizon" "$lr" "$scheduler" "$grad_acc" "$news_path"
-              if [[ ${#EXTRA_RUN_ARGS[@]} -gt 0 ]]; then
-                RUN_ARGS+=( "${EXTRA_RUN_ARGS[@]}" )
-              fi
+              for active_mass_threshold in "${DELTA_V3_ACTIVE_MASS_THRESHOLDS[@]}"; do
+                local task_name
+                DELTA_V3_ACTIVE_MASS_THRESHOLD="$active_mass_threshold"
+                task_name="${TASK_NAME_BASE}__lr${lr}__ga${grad_acc}__sch${scheduler}${TASK_NAME_SUFFIX}"
+                build_run_args "$task_name" "$base_backbone" "$horizon" "$lr" "$scheduler" "$grad_acc" "$news_path"
+                if [[ ${#EXTRA_RUN_ARGS[@]} -gt 0 ]]; then
+                  RUN_ARGS+=( "${EXTRA_RUN_ARGS[@]}" )
+                fi
 
-              echo "==> Running dataset=$DATASET_KEY backbone=$base_backbone horizon=$horizon lr=$lr grad_acc=$grad_acc stage=$STAGE"
-              "$PYTHON_BIN" "$ENTRY" "${RUN_ARGS[@]}"
+                echo "==> Running dataset=$DATASET_KEY backbone=$base_backbone horizon=$horizon lr=$lr grad_acc=$grad_acc lambda_max=$DELTA_V3_LAMBDA_MAX active_mass_threshold=$DELTA_V3_ACTIVE_MASS_THRESHOLD stage=$STAGE"
+                "$PYTHON_BIN" "$ENTRY" "${RUN_ARGS[@]}"
+              done
             done
           done
         done
       done
+      DELTA_V3_LAMBDA_MAX="$_lambda_max_saved"
     done
   done
 }
