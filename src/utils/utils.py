@@ -112,6 +112,7 @@ def build_experiment_task_name(args) -> str:
             getattr(args, "delta_v3_text_encoder_model_id", "intfloat-e5-small-v2"),
             default="intfloat-e5-small-v2",
         ),
+        _sanitize_task_component(getattr(args, "delta_v3_pretrain_lr", "1e-3"), default="1e-3"),
     ]
     return "_".join(parts)
 

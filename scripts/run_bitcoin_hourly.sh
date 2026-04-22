@@ -19,7 +19,7 @@ DAY_FIRST="1"
 TRAIN_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_trainset.csv"
 VAL_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_valset.csv"
 TEST_FILE="dataset/bitcoin_hourly_24/bitcoin-hourly-open-2024_testset.csv"
-DEFAULT_NEWS_PATH="dataset/news_from_sources/coindesk_archive_2024_new.json"
+DEFAULT_NEWS_PATH="dataset/gdelt_bitcoin_2024.json"
 
 STAGE="all"
 BASE_EPOCHS="40"
@@ -30,15 +30,16 @@ LRS=("1e-4")
 HORIZONS=("48")
 SCHEDULERS=("1")
 BASE_BACKBONES=("dlinear")
-# NORMALIZATION_MODE="zscore"
+NORMALIZATION_MODE="zscore"
 EARLY_STOP_PATIENCE="5"
 NEWS_WINDOW_DAYS="1"
 
 TASK_NAME_BASE="delta_v3_bitcoin_hourly"
 PRE_RUN_HOOK=""
+DELTA_V3_PRETRAIN_LR="1e-4"
 
 DELTA_V3_REFINED_BANK_BUILD="1"
-DELTA_V3_ACTIVE_MASS_THRESHOLDS=("0.7")
+DELTA_V3_ACTIVE_MASS_THRESHOLDS=("60")
 
 NEWS_API_ENABLE="1"
 DELTA_V3_SCHEMA_VARIANT="bitcoin"
@@ -80,8 +81,8 @@ DELTA_V3_SELECTION_COUNTERFACTUAL_GAIN_MIN="0.01"
 DELTA_V3_SELECTION_LAMBDA_SATURATION_MAX_PCT="0.35"
 DELTA_V3_HARD_RESIDUAL_FRAC="0.6"
 DELTA_V3_HARD_RESIDUAL_PCT="0.10"
-DELTA_V3_PRETRAIN_EPOCHS="12"
-DELTA_V3_PRETRAIN_LR="1e-3"
+DELTA_V3_PRETRAIN_EPOCHS="20"
+
 DELTA_V3_PRICE_WINSOR_LOW="0.005"
 DELTA_V3_PRICE_WINSOR_HIGH="0.995"
 DELTA_V3_GRAD_CLIP="1.0"
@@ -102,25 +103,25 @@ fi
 
 set_horizon_specific_params() {
   local h="$1"
-  if [[ "$h" == "24" || "$h" == "48" ]]; then
-    DELTA_V3_LAMBDA_MAX="0.45"
-    DELTA_V3_LAMBDA_TS_CAP="0.30"
-    DELTA_V3_LAMBDA_NEWS_CAP="0.12"
-    DELTA_V3_SPIKE_BIAS_CAP="0.75"
-    DELTA_V3_SHAPE_GAIN_CAP="0.30"
-  elif [[ "$h" == "96" ]]; then
-    DELTA_V3_LAMBDA_MAX="0.20"
-    DELTA_V3_LAMBDA_TS_CAP="0.15"
-    DELTA_V3_LAMBDA_NEWS_CAP="0.05"
-    DELTA_V3_SPIKE_BIAS_CAP="0.40"
-    DELTA_V3_SHAPE_GAIN_CAP="0.20"
-  else
-    DELTA_V3_LAMBDA_MAX="0.12"
-    DELTA_V3_LAMBDA_TS_CAP="0.08"
-    DELTA_V3_LAMBDA_NEWS_CAP="0.02"
-    DELTA_V3_SPIKE_BIAS_CAP="0.30"
-    DELTA_V3_SHAPE_GAIN_CAP="0.15"
-  fi
+  # if [[ "$h" == "24" || "$h" == "48" ]]; then
+  #   DELTA_V3_LAMBDA_MAX="0.45"
+  #   DELTA_V3_LAMBDA_TS_CAP="0.30"
+  #   DELTA_V3_LAMBDA_NEWS_CAP="0.12"
+  #   DELTA_V3_SPIKE_BIAS_CAP="0.75"
+  #   DELTA_V3_SHAPE_GAIN_CAP="0.30"
+  # elif [[ "$h" == "96" ]]; then
+  #   DELTA_V3_LAMBDA_MAX="0.20"
+  #   DELTA_V3_LAMBDA_TS_CAP="0.15"
+  #   DELTA_V3_LAMBDA_NEWS_CAP="0.05"
+  #   DELTA_V3_SPIKE_BIAS_CAP="0.40"
+  #   DELTA_V3_SHAPE_GAIN_CAP="0.20"
+  # else
+  #   DELTA_V3_LAMBDA_MAX="0.12"
+  #   DELTA_V3_LAMBDA_TS_CAP="0.08"
+  #   DELTA_V3_LAMBDA_NEWS_CAP="0.02"
+  #   DELTA_V3_SPIKE_BIAS_CAP="0.30"
+  #   DELTA_V3_SHAPE_GAIN_CAP="0.15"
+  # fi
 }
 
 source "$SCRIPT_DIR/_run_forecast_common.sh"
