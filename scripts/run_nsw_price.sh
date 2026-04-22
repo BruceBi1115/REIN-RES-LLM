@@ -90,25 +90,25 @@ SPIKE_CLIP_THRESHOLD="0"
 
 set_horizon_specific_params() {
   local h="$1"
-  if [[ "$h" == "48" || "$h" == "96" ]]; then
-    DELTA_V3_LAMBDA_MAX="0.45"
-    DELTA_V3_LAMBDA_TS_CAP="0.30"
-    DELTA_V3_LAMBDA_NEWS_CAP="0.12"
-    DELTA_V3_SPIKE_BIAS_CAP="0.75"
-    DELTA_V3_SHAPE_GAIN_CAP="0.30"
-  elif [[ "$h" == "192" ]]; then
-    DELTA_V3_LAMBDA_MAX="0.20"
-    DELTA_V3_LAMBDA_TS_CAP="0.15"
-    DELTA_V3_LAMBDA_NEWS_CAP="0.05"
-    DELTA_V3_SPIKE_BIAS_CAP="0.40"
-    DELTA_V3_SHAPE_GAIN_CAP="0.20"
-  else
-    DELTA_V3_LAMBDA_MAX="0.12"
-    DELTA_V3_LAMBDA_TS_CAP="0.08"
-    DELTA_V3_LAMBDA_NEWS_CAP="0.02"
-    DELTA_V3_SPIKE_BIAS_CAP="0.30"
-    DELTA_V3_SHAPE_GAIN_CAP="0.15"
-  fi
+  # if [[ "$h" == "48" || "$h" == "96" ]]; then
+  #   DELTA_V3_LAMBDA_MAX="0.45"
+  #   DELTA_V3_LAMBDA_TS_CAP="0.30"
+  #   DELTA_V3_LAMBDA_NEWS_CAP="0.12"
+  #   DELTA_V3_SPIKE_BIAS_CAP="0.75"
+  #   DELTA_V3_SHAPE_GAIN_CAP="0.30"
+  # elif [[ "$h" == "192" ]]; then
+  #   DELTA_V3_LAMBDA_MAX="0.20"
+  #   DELTA_V3_LAMBDA_TS_CAP="0.15"
+  #   DELTA_V3_LAMBDA_NEWS_CAP="0.05"
+  #   DELTA_V3_SPIKE_BIAS_CAP="0.40"
+  #   DELTA_V3_SHAPE_GAIN_CAP="0.20"
+  # else
+  #   DELTA_V3_LAMBDA_MAX="0.12"
+  #   DELTA_V3_LAMBDA_TS_CAP="0.08"
+  #   DELTA_V3_LAMBDA_NEWS_CAP="0.02"
+  #   DELTA_V3_SPIKE_BIAS_CAP="0.30"
+  #   DELTA_V3_SHAPE_GAIN_CAP="0.15"
+  # fi
 }
 
 source "$SCRIPT_DIR/_run_forecast_common.sh"
