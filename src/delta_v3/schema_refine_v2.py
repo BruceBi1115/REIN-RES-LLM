@@ -12,7 +12,8 @@ from tqdm import tqdm
 from ..delta_news_hooks import OpenAINewsApiAdapter, build_news_api_adapter
 
 SCHEMA_VERSION = "v4_regime_v2"
-SCHEMA_VARIANTS = ("load", "price", "gas_demand", "traffic")
+BITCOIN_SCHEMA_VERSION = "v4_regime_v2_bitcoin_recall1"
+SCHEMA_VARIANTS = ("load", "price", "gas_demand", "traffic", "bitcoin")
 TOPIC_TAGS = (
     "supply_tight",
     "supply_surplus",
@@ -37,6 +38,11 @@ REGIME_KEYS = (
     "volatility_tone",
     "policy_in_effect",
 )
+
+
+def schema_version_for_variant(schema_variant: str) -> str:
+    variant = str(schema_variant or "").strip().lower()
+    return BITCOIN_SCHEMA_VERSION if variant == "bitcoin" else SCHEMA_VERSION
 
 
 def _compact_summary(text: str, max_words: int = 60) -> str:
@@ -95,6 +101,8 @@ def _load_existing_refined_rows(
 ) -> dict[str, dict[str, Any]]:
     existing_by_key: dict[str, dict[str, Any]] = {}
     seen_paths: set[str] = set()
+    expected_schema_variant = str(schema_variant or "").strip()
+    expected_schema_version = schema_version_for_variant(schema_variant)
 
     for raw_path in cache_paths:
         path = os.path.normpath(str(raw_path or "").strip())
@@ -117,7 +125,12 @@ def _load_existing_refined_rows(
                     continue
 
                 row_schema_variant = str(row.get("schema_variant", "") or "").strip()
-                if row_schema_variant and row_schema_variant != str(schema_variant or "").strip():
+                if row_schema_variant and row_schema_variant != expected_schema_variant:
+                    continue
+                row_schema_version = str(row.get("schema_version", "") or "").strip()
+                if row_schema_version and row_schema_version != expected_schema_version:
+                    continue
+                if expected_schema_variant == "bitcoin" and not row_schema_version:
                     continue
 
                 row_source_news_file = os.path.basename(str(row.get("source_news_file", "") or "").strip())
@@ -194,7 +207,7 @@ def _default_record(doc: dict[str, Any], schema_variant: str) -> dict[str, Any]:
         "doc_key": _doc_identity(doc),
         "published_at": str(doc.get("date", "")),
         "title": str(doc.get("title", "")),
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version_for_variant(schema_variant),
         "schema_variant": str(schema_variant),
         "is_actionable": False,
         "topic_tags": ["routine"],
@@ -221,50 +234,54 @@ def _build_prompts(doc: dict[str, Any], schema_variant: str, corpus_hint: str = 
     published_at = str(doc.get("date", "")).strip()
     content = str(doc.get("content", "") or doc.get("summary", "") or "").strip()
     body = _compact_summary(content, max_words=220)
-    if schema_variant == "price":
-        if _is_bitcoin_price_corpus(corpus_hint):
-            system_prompt = (
-                "You are refining generic news for Bitcoin hourly price forecasting into JSON. "
-                "Return JSON only, no markdown. "
-                "Favor recall over precision for is_actionable, and be slightly loose on borderline cases. "
-                "If an article has any plausible near-term pathway to move BTC spot level, flows, positioning, or volatility within the next 14 days, keep it actionable even if the pathway is indirect, sentiment-driven, or only moderate. "
-                "Treat the following as potentially actionable if they are current, imminent, recently announced and still relevant, or likely to shape trader expectations within the next 14 days: "
-                "ETF approvals or ETF flow updates, exchange or custody outages, regulatory or enforcement actions, stablecoin or crypto-liquidity stress, hacks or exploits, miner disruption or miner selling pressure, treasury or institutional accumulation, exchange reserve shifts, large liquidations, derivatives or funding stress, major macro rates or dollar shocks, and geopolitical or risk-asset shocks that plausibly spill into BTC. "
-                "Broader macro and geopolitical articles can still be actionable for BTC if they plausibly affect crypto risk appetite, liquidity, safe-haven demand, or volatility. "
-                "However, clearly unrelated human-interest, local civic, lifestyle, or sector-specific news with no plausible BTC or macro-risk transmission path should be non-actionable even if it is current. "
-                "Set is_actionable=false only if the article is clearly unrelated to BTC and broad risk conditions, purely retrospective, generic commentary with no fresh signal, or stale corporate or project news without a near-term trading path. "
-                "For borderline cases, prefer is_actionable=true with lower confidence rather than defaulting to false. "
-                "Use only the closed topic vocabulary: "
-                + ", ".join(TOPIC_TAGS)
-                + ". "
-                "If an article is clearly BTC-relevant but the legacy topic set is awkward, keep is_actionable=true and include other instead of routine. "
-                "Reserve routine for articles with no clear BTC or macro trading signal. "
-                "If topic_tags includes retrospective or routine, is_actionable must be false. "
-                "Map BTC drivers into the existing tags and regime fields as follows: "
-                "ETF inflows, treasury buying, exchange outflows, supply squeeze, or bullish positioning pressure -> supply_tight; "
-                "ETF outflows, miner selling, large holder distribution, or exchange inflows -> supply_surplus; "
-                "exchange outages, custody disruptions, settlement problems, or mining/network disruptions -> outage; "
-                "stablecoin stress, funding stress, liquidation cascades, sharp rates or dollar shocks, or macro liquidity tightening -> fuel_shock or other; "
-                "regulation, ETF approval, enforcement, or trading restrictions already in force -> policy_active or market_intervention and policy_in_effect=1; "
-                "broad risk-on or liquidity-relief conditions that support BTC absorption and calm stress -> renewable_surge or other; "
-                "risk-off, deleveraging, or liquidity drain that pressures BTC -> renewable_drought or other. "
-                "Interpret regime_vec for BTC as: "
-                "tightness = near-term BTC spot supply scarcity, squeeze pressure, or upward price pressure; "
-                "demand_outlook = near-term investor demand, ETF or treasury flow, or adoption pressure; "
-                "renewable_surplus = use this slot as broad liquidity and risk-relief tone that cushions BTC, negative when tightening or risk-off conditions pressure BTC; "
-                "volatility_tone = event, leverage, liquidation, regulatory, macro, or shock-driven BTC volatility risk; "
-                "policy_in_effect = 1 only when a policy, approval, restriction, or intervention is already active. "
-                "For indirect but still relevant signals, use smaller-magnitude regime values instead of zeroing them out. "
-                "Return fields exactly: "
-                "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
-                "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
-                "volatility_tone is in [0,1]. "
-                "policy_in_effect is 0 or 1. "
-                "horizon_days is an integer in [0,14]. "
-                "summary must stay under 60 words and be factual."
-            )
-        else:
-            system_prompt = (
+    variant = str(schema_variant or "").strip().lower()
+    if variant == "bitcoin":
+        system_prompt = (
+            "You are refining generic news for Bitcoin hourly price forecasting into JSON. "
+            "Return JSON only, no markdown. "
+            "Use a deliberately broad, recall-first filter for BTC. "
+            "The default for BTC, major crypto-market, ETF, stablecoin, exchange, miner, institutional-flow, derivatives, crypto-regulatory, or broad macro-risk headlines should be is_actionable=true unless the article is clearly filler or unrelated. "
+            "If an article has any plausible near-term pathway to move BTC spot level, ETF or treasury flows, trader positioning, sector risk appetite, crypto liquidity, or volatility within the next 14 days, keep it actionable even if the pathway is indirect, sentiment-driven, weak, or only moderate. "
+            "Do not require the article to name BTC: major ETH, SOL, DeFi, stablecoin, exchange, custody, cyber-security, or crypto policy news can be actionable when it plausibly spills into BTC through sector sentiment, leverage, liquidity, or regulatory expectations. "
+            "Treat the following as potentially actionable if they are current, imminent, recently announced and still relevant, or likely to shape trader expectations within the next 14 days: "
+            "BTC or crypto price breakouts and breakdowns, support/resistance or target-level analysis, ETF approvals or ETF flow updates, options expiries, funding rates, open interest, liquidations, whale or exchange-reserve movement, exchange or custody outages, regulatory or enforcement actions, stablecoin or crypto-liquidity stress, hacks or exploits, miner disruption or miner selling pressure, treasury or institutional accumulation, major macro rates or dollar shocks, and geopolitical or risk-asset shocks that plausibly spill into BTC. "
+            "Broader macro and geopolitical articles can still be actionable for BTC if they plausibly affect crypto risk appetite, liquidity, safe-haven demand, dollar conditions, leverage appetite, or volatility. "
+            "Recent market recaps, outlook pieces, analyst calls, and price-analysis headlines can be actionable when they contain a current setup, positioning cue, flow cue, or forward-looking risk; mark them true with modest confidence instead of treating them as purely retrospective. "
+            "However, clearly unrelated human-interest, local civic, lifestyle, author-page, education-only, sponsorship, entertainment, or sector-specific news with no plausible BTC, crypto-market, or macro-risk transmission path should be non-actionable even if it is current. "
+            "Set is_actionable=false only if the article is clearly unrelated to BTC, crypto markets, and broad risk conditions, purely historical with no current setup, generic commentary with no fresh signal, or stale corporate or project news without a near-term trading path. "
+            "For borderline cases, prefer is_actionable=true with lower confidence, typically 0.20-0.45, rather than defaulting to false. "
+            "Use only the closed topic vocabulary: "
+            + ", ".join(TOPIC_TAGS)
+            + ". "
+            "If an article is clearly BTC-relevant but the legacy topic set is awkward, keep is_actionable=true and include other instead of routine. "
+            "Use retrospective only for purely backward-looking articles with no current market setup or forward implication. "
+            "Reserve routine for articles with no clear BTC, crypto-market, or macro trading signal. "
+            "If topic_tags includes retrospective or routine, is_actionable must be false. "
+            "Map BTC drivers into the existing tags and regime fields as follows: "
+            "ETF inflows, treasury buying, exchange outflows, supply squeeze, breakout momentum, or bullish positioning pressure -> supply_tight; "
+            "ETF outflows, miner selling, large holder distribution, exchange inflows, breakdown momentum, or forced deleveraging -> supply_surplus; "
+            "exchange outages, custody disruptions, settlement problems, hacks with market contagion risk, or mining/network disruptions -> outage; "
+            "stablecoin stress, funding stress, liquidation cascades, sharp rates or dollar shocks, or macro liquidity tightening -> fuel_shock or other; "
+            "regulation, ETF approval, enforcement, tax/reporting rule, or trading restriction already in force -> policy_active or market_intervention and policy_in_effect=1; "
+            "broad risk-on or liquidity-relief conditions that support BTC absorption and calm stress -> renewable_surge or other; "
+            "risk-off, deleveraging, or liquidity drain that pressures BTC -> renewable_drought or other. "
+            "Interpret regime_vec for BTC as: "
+            "tightness = near-term BTC spot supply scarcity, squeeze pressure, or upward price pressure; "
+            "demand_outlook = near-term investor demand, ETF or treasury flow, adoption pressure, or crypto-sector risk appetite; "
+            "renewable_surplus = use this slot as broad liquidity and risk-relief tone that cushions BTC, negative when tightening or risk-off conditions pressure BTC; "
+            "volatility_tone = event, leverage, liquidation, regulatory, macro, technical-breakout, or shock-driven BTC volatility risk; "
+            "policy_in_effect = 1 only when a policy, approval, restriction, tax rule, or intervention is already active. "
+            "For indirect but still relevant signals, use smaller-magnitude regime values instead of zeroing them out. "
+            "Return fields exactly: "
+            "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
+            "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
+            "volatility_tone is in [0,1]. "
+            "policy_in_effect is 0 or 1. "
+            "horizon_days is an integer in [0,14]. "
+            "summary must stay under 60 words and be factual."
+        )
+    elif variant == "price":
+        system_prompt = (
                 "You are refining generic energy news for NSW electricity price forecasting into JSON. "
                 "Return JSON only, no markdown. "
                 "Favor recall over precision for is_actionable. "
@@ -306,7 +323,7 @@ def _build_prompts(doc: dict[str, Any], schema_variant: str, corpus_hint: str = 
                 "horizon_days is an integer in [0,14]. "
                 "summary must stay under 60 words and be factual."
             )
-    elif schema_variant == "gas_demand":
+    elif variant == "gas_demand":
         system_prompt = (
             "You are refining generic energy news for Netherlands gas demand forecasting into strict JSON. "
             "Return JSON only, no markdown. "
@@ -348,7 +365,7 @@ def _build_prompts(doc: dict[str, Any], schema_variant: str, corpus_hint: str = 
             "horizon_days is an integer in [0,14]. "
             "summary must stay under 60 words and be factual."
         )
-    elif schema_variant == "traffic":
+    elif variant == "traffic":
         system_prompt = (
             "You are refining generic news for hourly road traffic count forecasting into strict JSON. "
             "Return JSON only, no markdown. "
@@ -388,7 +405,7 @@ def _build_prompts(doc: dict[str, Any], schema_variant: str, corpus_hint: str = 
             "horizon_days is an integer in [0,14]. "
             "summary must stay under 60 words and be factual."
         )
-    else:
+    elif variant == "load":
         system_prompt = (
             "You are refining generic energy news for NSW electricity load forecasting into strict JSON. "
             "Return JSON only, no markdown. "

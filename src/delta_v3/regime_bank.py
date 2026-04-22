@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from .schema_refine_v2 import REGIME_KEYS, TOPIC_TAGS, compute_news_corpus_signature
+from .schema_refine_v2 import REGIME_KEYS, TOPIC_TAGS, compute_news_corpus_signature, schema_version_for_variant
 
 
 def _mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -212,6 +212,8 @@ def build_regime_bank(
         "ema_alpha": float(ema_alpha),
         "ema_window": int(ema_window),
     }
+    if str(schema_variant or "").strip() == "bitcoin":
+        metadata["schema_version"] = schema_version_for_variant(schema_variant)
     if str(source_news_path or "").strip():
         try:
             news_signature = compute_news_corpus_signature(source_news_path)

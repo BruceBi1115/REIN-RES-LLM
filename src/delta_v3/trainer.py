@@ -37,7 +37,7 @@ from .model import build_delta_v3_model
 from .modulation_heads import RegimePretrainHeads
 from .pretrain_v2 import run_regime_self_supervised_pretrain
 from .regime_bank import build_regime_bank, load_regime_bank, read_regime_bank_metadata
-from .schema_refine_v2 import compute_news_corpus_signature, refine_dataset_news_corpus
+from .schema_refine_v2 import compute_news_corpus_signature, refine_dataset_news_corpus, schema_version_for_variant
 from .targets import ResidualTargetDecomposer, compute_residual_calendar_baseline
 
 
@@ -82,7 +82,7 @@ def _expected_regime_bank_metadata(
     news_signature: dict[str, object],
 ) -> dict[str, str | float | int]:
     date_start, date_end = _series_day_bounds(bundle, args)
-    return {
+    expected = {
         "source_news_file": os.path.basename(str(cfg.news_path or "").strip()),
         "source_news_stem": os.path.splitext(os.path.basename(str(cfg.news_path or "").strip()))[0],
         "source_news_doc_count": int(news_signature.get("doc_count", 0) or 0),
@@ -97,6 +97,9 @@ def _expected_regime_bank_metadata(
         "ema_alpha": float(cfg.regime_ema_alpha),
         "ema_window": int(cfg.regime_ema_window),
     }
+    if str(cfg.schema_variant or "").strip() == "bitcoin":
+        expected["schema_version"] = schema_version_for_variant(cfg.schema_variant)
+    return expected
 
 
 def _regime_bank_metadata_matches(
@@ -152,6 +155,7 @@ def _summarize_refined_corpus(refined_path: str) -> dict[str, float | int]:
 
 def _inspect_refined_corpus(refined_path: str) -> dict[str, object]:
     total_docs = 0
+    schema_versions: set[str] = set()
     schema_variants: set[str] = set()
     source_news_files: set[str] = set()
     source_news_stems: set[str] = set()
@@ -167,6 +171,9 @@ def _inspect_refined_corpus(refined_path: str) -> dict[str, object]:
             except Exception:
                 continue
             total_docs += 1
+            schema_version = str(row.get("schema_version", "") or "").strip()
+            if schema_version:
+                schema_versions.add(schema_version)
             schema_variant = str(row.get("schema_variant", "") or "").strip()
             if schema_variant:
                 schema_variants.add(schema_variant)
@@ -187,6 +194,7 @@ def _inspect_refined_corpus(refined_path: str) -> dict[str, object]:
                 source_news_digests.add(source_news_digest)
     return {
         "total_docs": int(total_docs),
+        "schema_versions": sorted(schema_versions),
         "schema_variants": sorted(schema_variants),
         "source_news_files": sorted(source_news_files),
         "source_news_stems": sorted(source_news_stems),
@@ -209,6 +217,11 @@ def _refined_corpus_matches(
     schema_variants = list(metadata.get("schema_variants", []) or [])
     if len(schema_variants) != 1 or schema_variants[0] != expected_schema_variant:
         return False, metadata
+    if expected_schema_variant == "bitcoin":
+        expected_schema_version = schema_version_for_variant(expected_schema_variant)
+        schema_versions = list(metadata.get("schema_versions", []) or [])
+        if len(schema_versions) != 1 or schema_versions[0] != expected_schema_version:
+            return False, metadata
 
     expected_news_file = os.path.basename(str(cfg.news_path or "").strip())
     expected_news_stem = os.path.splitext(expected_news_file)[0]
