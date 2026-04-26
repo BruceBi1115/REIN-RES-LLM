@@ -36,7 +36,14 @@ from .importance import HardResidualSampler
 from .model import build_delta_v3_model
 from .modulation_heads import RegimePretrainHeads
 from .pretrain_v2 import run_regime_self_supervised_pretrain
-from .regime_bank import build_regime_bank, load_regime_bank, read_regime_bank_metadata
+from .regime_bank import (
+    _align_bank_time_bounds,
+    _effective_freq_minutes,
+    _format_axis_timestamp,
+    build_regime_bank,
+    load_regime_bank,
+    read_regime_bank_metadata,
+)
 from .schema_refine_v2 import compute_news_corpus_signature, refine_dataset_news_corpus, schema_version_for_variant
 from .targets import ResidualTargetDecomposer, compute_residual_calendar_baseline
 
@@ -81,7 +88,8 @@ def _expected_regime_bank_metadata(
     *,
     news_signature: dict[str, object],
 ) -> dict[str, str | float | int]:
-    date_start, date_end = _series_day_bounds(bundle, args)
+    freq_minutes = _resolve_bank_freq_minutes(bundle, args)
+    date_start, date_end = _series_time_bounds(bundle, args)
     expected = {
         "source_news_file": os.path.basename(str(cfg.news_path or "").strip()),
         "source_news_stem": os.path.splitext(os.path.basename(str(cfg.news_path or "").strip()))[0],
@@ -91,11 +99,15 @@ def _expected_regime_bank_metadata(
         "dataset_key": str(cfg.dataset_key or "").strip(),
         "encoder_model_id": str(cfg.text_encoder_model_id or "").strip(),
         "max_length": int(cfg.text_encoder_max_length),
-        "date_start": str(pd.Timestamp(date_start).date()),
-        "date_end": str(pd.Timestamp(date_end).date()),
+        "date_start": _format_axis_timestamp(date_start, freq_minutes),
+        "date_end": _format_axis_timestamp(date_end, freq_minutes),
         "tau_days": float(cfg.regime_tau_days),
         "ema_alpha": float(cfg.regime_ema_alpha),
         "ema_window": int(cfg.regime_ema_window),
+        "freq_min": int(freq_minutes),
+        "time_granularity": "subdaily" if 0 < int(freq_minutes) < 1440 else "daily",
+        "causal_cutoff": "published_at_lte_target_time",
+        "date_only_news_policy": "available_next_day_for_subdaily",
     }
     if str(cfg.schema_variant or "").strip() == "bitcoin":
         expected["schema_version"] = schema_version_for_variant(cfg.schema_variant)
@@ -305,8 +317,8 @@ def _fail_fast_on_empty_bank(bank, *, bank_path: str, refined_path: str):
     )
 
 
-def _series_day_bounds(bundle, args) -> tuple[pd.Timestamp, pd.Timestamp]:
-    all_times = pd.concat(
+def _series_all_times(bundle, args) -> pd.Series:
+    return pd.concat(
         [
             pd.to_datetime(bundle["train_df"][args.time_col], errors="coerce"),
             pd.to_datetime(bundle["val_df"][args.time_col], errors="coerce"),
@@ -314,9 +326,31 @@ def _series_day_bounds(bundle, args) -> tuple[pd.Timestamp, pd.Timestamp]:
         ],
         axis=0,
     ).dropna()
+
+
+def _resolve_bank_freq_minutes(bundle, args) -> int:
+    configured = _effective_freq_minutes(getattr(args, "freq_min", ""))
+    if configured > 0:
+        return configured
+    all_times = _series_all_times(bundle, args).drop_duplicates().sort_values()
+    if len(all_times) <= 0:
+        return 0
+    diffs = all_times.diff().dropna().dt.total_seconds().to_numpy(dtype=np.float64) / 60.0
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size <= 0:
+        return 0
+    median_minutes = float(np.median(diffs))
+    if 0 < median_minutes < 1440:
+        return max(1, int(round(median_minutes)))
+    return 0
+
+
+def _series_time_bounds(bundle, args) -> tuple[pd.Timestamp, pd.Timestamp]:
+    all_times = _series_all_times(bundle, args)
     if len(all_times) <= 0:
         raise ValueError("Cannot build regime bank without any valid series timestamps.")
-    return pd.Timestamp(all_times.min()).normalize(), pd.Timestamp(all_times.max()).normalize()
+    freq_minutes = _resolve_bank_freq_minutes(bundle, args)
+    return _align_bank_time_bounds(pd.Timestamp(all_times.min()), pd.Timestamp(all_times.max()), freq_minutes)
 
 
 def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
@@ -414,7 +448,8 @@ def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
             f"refined_path={actual_refined_path}."
         )
 
-    date_start, date_end = _series_day_bounds(bundle, args)
+    freq_minutes = _resolve_bank_freq_minutes(bundle, args)
+    date_start, date_end = _series_time_bounds(bundle, args)
     live_logger.info(f"[DELTA_V3] building regime bank at {bank_path}")
     build_regime_bank(
         refined_jsonl=actual_refined_path,
@@ -429,6 +464,7 @@ def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
         tau_days=cfg.regime_tau_days,
         ema_alpha=cfg.regime_ema_alpha,
         ema_window=cfg.regime_ema_window,
+        freq_min=freq_minutes,
     )
     bank = load_regime_bank(bank_path)
     _fail_fast_on_empty_bank(bank, bank_path=bank_path, refined_path=actual_refined_path)
@@ -781,9 +817,12 @@ def evaluate_delta_v3(
     se_sum, ae_sum, n_elems = 0.0, 0.0, 0
     base_se_sum, base_ae_sum = 0.0, 0.0
     sample_final_abs = []
+    sample_final_sq = []
     sample_base_abs = []
     sample_blank_abs = []
+    sample_blank_sq = []
     sample_perm_abs = []
+    sample_perm_sq = []
     sample_final_abs_z = []
     sample_blank_abs_z = []
     sample_perm_abs_z = []
@@ -921,9 +960,14 @@ def evaluate_delta_v3(
                 n_elems += int(args.horizon)
 
                 sample_final_abs.append(float(np.abs(pred - true).mean()))
+                sample_final_sq.append(float(((pred - true) ** 2).mean()))
                 sample_base_abs.append(float(np.abs(base_only - true).mean()))
                 sample_blank_abs.append(float(np.abs(blank_pred - true).mean()))
+                sample_blank_sq.append(float(((blank_pred - true) ** 2).mean()))
                 sample_perm_abs.append(float(np.abs(np.asarray(perm_denorm, dtype=np.float32) - true).mean()) if perm_denorm is not None else float("nan"))
+                sample_perm_sq.append(
+                    float(((np.asarray(perm_denorm, dtype=np.float32) - true) ** 2).mean()) if perm_denorm is not None else float("nan")
+                )
                 sample_final_abs_z.append(float(np.abs(pred_z_cpu[i] - targets_z_cpu[i]).mean()))
                 sample_blank_abs_z.append(float(np.abs(blank_pred_z_cpu[i] - targets_z_cpu[i]).mean()))
                 sample_perm_abs_z.append(
@@ -1008,10 +1052,13 @@ def evaluate_delta_v3(
             "top10pct_residual_mae": float(sample_final_abs_arr[top_mask].mean()) if top_mask.size > 0 and top_mask.any() else float("nan"),
             "spike_gate_hit_rate": float(np.mean(sample_spike_hit)) if sample_spike_hit else 0.0,
             "spike_target_hit_rate": float(np.mean(sample_spike_target_hit)) if sample_spike_target_hit else 0.0,
+            "active_subset_mse": _subset_mean(sample_final_sq, active_mask),
             "active_subset_mae": _subset_mean(sample_final_abs, active_mask),
+            "blank_active_subset_mse": _subset_mean(sample_blank_sq, active_mask),
             "blank_active_subset_mae": _subset_mean(sample_blank_abs, active_mask),
             "inactive_subset_mae": inactive_normal,
             "blank_inactive_subset_mae": inactive_blank,
+            "permuted_active_subset_mse": _subset_mean(sample_perm_sq, active_mask),
             "permuted_active_subset_mae": _subset_mean(sample_perm_abs, active_mask),
             "inactive_blank_gap_pct": inactive_blank_gap_pct,
             "active_blank_gain_z": active_blank_gain_z,
@@ -1623,10 +1670,13 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
     )
     live_logger.info(
         "[TEST][COUNTERFACTUAL] "
+        f"active_subset_mse={float(diag.get('active_subset_mse', float('nan'))):.6f} "
         f"active_mae={float(diag.get('active_subset_mae', float('nan'))):.6f} "
+        f"blank_active_subset_mse={float(diag.get('blank_active_subset_mse', float('nan'))):.6f} "
         f"blank_active={float(diag.get('blank_active_subset_mae', float('nan'))):.6f} "
         f"inactive_mae={float(diag.get('inactive_subset_mae', float('nan'))):.6f} "
         f"blank_inactive={float(diag.get('blank_inactive_subset_mae', float('nan'))):.6f} "
+        f"permuted_active_subset_mse={float(diag.get('permuted_active_subset_mse', float('nan'))):.6f} "
         f"perm_active={float(diag.get('permuted_active_subset_mae', float('nan'))):.6f}"
     )
     live_logger.info(
