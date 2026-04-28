@@ -5,3 +5,7 @@ dataset/
 __pycache__/
 */__pycache__/
 *.py[cod]
+.claude
+.vscode
+paper
+.codex

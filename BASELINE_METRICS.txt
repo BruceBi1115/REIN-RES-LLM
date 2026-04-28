@@ -1,9 +1,0 @@
-Baseline metrics placeholder for the purge-and-replant refactor.
-
-Status:
-- Pending a full base-only regression run on NSW LOAD and NSW PRICE.
-- This file exists so the Phase A artifact path is in place, but the numeric baseline has not been regenerated in this refactor turn.
-
-Expected entries after regression:
-- NSW LOAD: base test MSE / MAE / sMAPE
-- NSW PRICE: base test MSE / MAE / sMAPE
