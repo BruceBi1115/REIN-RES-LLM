@@ -12,6 +12,8 @@ import pandas as pd
 import torch
 from transformers import AutoModel, AutoTokenizer
 
+from ..time_mmd_prompts import TIME_MMD_VARIANTS, refinement_horizon_days
+
 from .schema_refine_v2 import REGIME_KEYS, TOPIC_TAGS, compute_news_corpus_signature, schema_version_for_variant
 
 
@@ -162,6 +164,7 @@ def build_regime_bank(
     ema_window: int = 5,
     freq_min: int | str | None = None,
     batch_size: int = 32,
+    confidence_weighting: bool = True,
 ) -> None:
     _ = ema_window
     freq_minutes = _effective_freq_minutes(freq_min)
@@ -182,7 +185,7 @@ def build_regime_bank(
             published_at = published_at.normalize() + pd.Timedelta(days=1)
         elif not is_subdaily:
             published_at = published_at.normalize()
-        horizon_days = int(max(0, min(14, int(row.get("horizon_days", 0) or 0))))
+        horizon_days = int(max(0, min(refinement_horizon_days(schema_variant), int(row.get("horizon_days", 0) or 0))))
         confidence = float(max(0.0, min(1.0, float(row.get("confidence", 0.0) or 0.0))))
         if horizon_days <= 0 or confidence <= 0.0:
             continue
@@ -232,7 +235,8 @@ def build_regime_bank(
             horizon_end = published_at + pd.Timedelta(days=int(row["horizon_days"]))
             if published_at <= timestamp <= horizon_end:
                 age_days = max(0.0, float((timestamp - published_at) / pd.Timedelta(days=1)))
-                weight = float(row["confidence"]) * math.exp(-float(age_days) / tau_days)
+                confidence_factor = float(row["confidence"]) if bool(confidence_weighting) else 1.0
+                weight = confidence_factor * math.exp(-float(age_days) / tau_days)
                 if weight > 0:
                     in_force.append((row, weight))
 
@@ -269,8 +273,9 @@ def build_regime_bank(
         "time_granularity": "subdaily" if is_subdaily else "daily",
         "causal_cutoff": "published_at_lte_target_time",
         "date_only_news_policy": "available_next_day_for_subdaily",
+        "confidence_weighting": bool(confidence_weighting),
     }
-    if str(schema_variant or "").strip() == "bitcoin":
+    if str(schema_variant or "").strip() in ("bitcoin", *TIME_MMD_VARIANTS):
         metadata["schema_version"] = schema_version_for_variant(schema_variant)
     if str(source_news_path or "").strip():
         try:

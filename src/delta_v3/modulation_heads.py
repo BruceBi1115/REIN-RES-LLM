@@ -49,8 +49,8 @@ class RegimeModulationHeads(nn.Module):
     ):
         super().__init__()
         self.active_mass_threshold = float(active_mass_threshold)
-        # Soft-gate sharpness for lambda_base shrinkage when relevance is below threshold.
-        # Plan Priority-1: inactive samples should see lambda_base → lambda_min, so their
+        # Soft-gate sharpness for lambda_delta_final shrinkage when relevance is below threshold.
+        # Plan Priority-1: inactive samples should see lambda_delta_final -> lambda_min, so their
         # delta contribution vanishes without relying on a hard 0/1 mask during training.
         self.active_soft_tau = 0.05
         self.lambda_min = float(lambda_min)
@@ -80,11 +80,11 @@ class RegimeModulationHeads(nn.Module):
         lambda_ts = self.lambda_min + self.lambda_ts_cap * torch.sigmoid(lambda_ts_logit)
         trust_delta_raw = self.trust_delta_mlp(regime_repr) * active
         lambda_news_delta = self.lambda_news_cap * torch.tanh(trust_delta_raw)
-        lambda_base_raw = (lambda_ts + lambda_news_delta).clamp(min=self.lambda_min, max=self.lambda_max)
-        # Soft gate: shrink lambda_base toward lambda_min when relevance is below threshold,
+        lambda_delta_raw = (lambda_ts + lambda_news_delta).clamp(min=self.lambda_min, max=self.lambda_max)
+        # Soft gate: shrink lambda_delta_final toward lambda_min when relevance is below threshold,
         # so inactive samples see a ~5% delta contribution instead of 5-45% TS-only noise.
         soft_gate = torch.sigmoid((relevance - self.active_mass_threshold) / self.active_soft_tau)
-        lambda_base = self.lambda_min + (lambda_base_raw - self.lambda_min) * soft_gate
+        lambda_delta_final = self.lambda_min + (lambda_delta_raw - self.lambda_min) * soft_gate
         shape_gain_raw = self.shape_gain_mlp(regime_repr) * active
         spike_bias = self.spike_bias_cap * torch.tanh(self.spike_prior_mlp(regime_repr) * active)
         shape_gain = 1.0 + self.shape_gain_cap * torch.tanh(shape_gain_raw)
@@ -97,7 +97,7 @@ class RegimeModulationHeads(nn.Module):
             "shape_gain_raw": shape_gain_raw,
             "shape_gain": shape_gain,
             "spike_bias": spike_bias,
-            "lambda_base": lambda_base,
+            "lambda_delta_final": lambda_delta_final,
         }
 
     def initialize_from_pretrain(self, pretrain_heads: "RegimePretrainHeads") -> None:

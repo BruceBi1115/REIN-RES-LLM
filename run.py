@@ -1,5 +1,7 @@
 import argparse
 
+from src.time_mmd_prompts import TIME_MMD_VARIANTS
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Forecasting With Delta V3")
@@ -85,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--delta_v3_schema_variant",
         type=str,
         default="load",
-        choices=["load", "price", "gas_demand", "traffic", "bitcoin"],
+        choices=["load", "price", "gas_demand", "traffic", "bitcoin", "ozone", *TIME_MMD_VARIANTS],
     )
     parser.add_argument("--delta_v3_text_encoder_model_id", type=str, default="intfloat/e5-small-v2")
     parser.add_argument("--delta_v3_text_encoder_max_length", type=int, default=256)

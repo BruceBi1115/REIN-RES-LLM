@@ -24,6 +24,7 @@ from ..base.common import (
 from ..base_backbone import load_base_backbone_checkpoint
 from ..delta.core import _build_delta_optimizer, _build_delta_scheduler, skill_score
 from ..delta_news_hooks import build_news_api_adapter
+from ..time_mmd_prompts import TIME_MMD_VARIANTS, refinement_horizon_days
 from ..utils.batch_utils import _batch_time_seq_for_sample
 from ..utils.utils import draw_pred_true, record_test_results_csv
 from .config import (
@@ -109,7 +110,7 @@ def _expected_regime_bank_metadata(
         "causal_cutoff": "published_at_lte_target_time",
         "date_only_news_policy": "available_next_day_for_subdaily",
     }
-    if str(cfg.schema_variant or "").strip() == "bitcoin":
+    if str(cfg.schema_variant or "").strip() in ("bitcoin", *TIME_MMD_VARIANTS):
         expected["schema_version"] = schema_version_for_variant(cfg.schema_variant)
     return expected
 
@@ -120,6 +121,8 @@ def _regime_bank_metadata_matches(
 ) -> tuple[bool | None, dict[str, str | float | int]]:
     actual = read_regime_bank_metadata(path)
     if not actual:
+        if expected.get("schema_variant") in TIME_MMD_VARIANTS:
+            return False, {}
         return None, {}
     for key, expected_value in expected.items():
         if key not in actual:
@@ -167,6 +170,7 @@ def _summarize_refined_corpus(refined_path: str) -> dict[str, float | int]:
 
 def _inspect_refined_corpus(refined_path: str) -> dict[str, object]:
     total_docs = 0
+    missing_schema_rows = 0
     schema_versions: set[str] = set()
     schema_variants: set[str] = set()
     source_news_files: set[str] = set()
@@ -187,6 +191,8 @@ def _inspect_refined_corpus(refined_path: str) -> dict[str, object]:
             if schema_version:
                 schema_versions.add(schema_version)
             schema_variant = str(row.get("schema_variant", "") or "").strip()
+            if not schema_version or not schema_variant:
+                missing_schema_rows += 1
             if schema_variant:
                 schema_variants.add(schema_variant)
             source_news_file = os.path.basename(str(row.get("source_news_file", "") or "").strip())
@@ -206,6 +212,7 @@ def _inspect_refined_corpus(refined_path: str) -> dict[str, object]:
                 source_news_digests.add(source_news_digest)
     return {
         "total_docs": int(total_docs),
+        "missing_schema_rows": missing_schema_rows,
         "schema_versions": sorted(schema_versions),
         "schema_variants": sorted(schema_variants),
         "source_news_files": sorted(source_news_files),
@@ -229,7 +236,9 @@ def _refined_corpus_matches(
     schema_variants = list(metadata.get("schema_variants", []) or [])
     if len(schema_variants) != 1 or schema_variants[0] != expected_schema_variant:
         return False, metadata
-    if expected_schema_variant == "bitcoin":
+    if expected_schema_variant in TIME_MMD_VARIANTS and metadata["missing_schema_rows"]:
+        return False, metadata
+    if expected_schema_variant in ("bitcoin", *TIME_MMD_VARIANTS):
         expected_schema_version = schema_version_for_variant(expected_schema_variant)
         schema_versions = list(metadata.get("schema_versions", []) or [])
         if len(schema_versions) != 1 or schema_versions[0] != expected_schema_version:
@@ -310,6 +319,9 @@ def _fail_fast_on_empty_bank(bank, *, bank_path: str, refined_path: str):
     num_active_days = int(np.asarray(getattr(bank, "relevance_mass", np.zeros((0,), dtype=np.float32)) > 0).sum())
     if num_dates > 0 and num_active_days > 0:
         return
+    ablation_mode = str((getattr(bank, "metadata", {}) or {}).get("ablation_mode", "") or "").strip()
+    if num_dates > 0 and ablation_mode in {"no_relevance_mass", "blank_news_features"}:
+        return
     raise RuntimeError(
         "delta_v3 regime bank is empty. "
         f"bank_path={bank_path} refined_path={refined_path} dates={num_dates} active_days={num_active_days}. "
@@ -355,6 +367,11 @@ def _series_time_bounds(bundle, args) -> tuple[pd.Timestamp, pd.Timestamp]:
 
 def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
     live_logger = bundle["live_logger"]
+    live_logger.info(
+        f"[DELTA_V3][REFINE_CONFIG] schema_variant={cfg.schema_variant} "
+        f"schema_version={schema_version_for_variant(cfg.schema_variant)} "
+        f"max_horizon_days={refinement_horizon_days(cfg.schema_variant)}"
+    )
     news_signature = compute_news_corpus_signature(cfg.news_path)
     refined_path, legacy_refined_paths, bank_path, legacy_bank_paths = _resolve_v3_paths(args, cfg)
     refined_candidate_paths = _dedupe_paths([refined_path] + legacy_refined_paths)
@@ -367,6 +384,17 @@ def _prepare_regime_bank(args, bundle, cfg: DeltaV3Config):
     refined_debug_path = reusable_refined_path or refined_path
     existing_refined_seed_paths = [path for path in refined_candidate_paths if os.path.exists(path)]
     expected_bank_meta = _expected_regime_bank_metadata(args, bundle, cfg, news_signature=news_signature)
+    if os.path.exists(bank_path) and not cfg.refined_bank_build:
+        actual_meta = read_regime_bank_metadata(bank_path)
+        if str(actual_meta.get("ablation_mode", "") or "").strip() and cfg.schema_variant not in TIME_MMD_VARIANTS:
+            live_logger.info(
+                "[DELTA_V3] using explicit ablation regime bank without cache rebuild "
+                f"path={bank_path} ablation_mode={actual_meta.get('ablation_mode')}"
+            )
+            bank = load_regime_bank(bank_path)
+            _fail_fast_on_empty_bank(bank, bank_path=bank_path, refined_path=refined_debug_path)
+            return bank, refined_debug_path, bank_path
+
     if os.path.exists(bank_path) and not cfg.refined_bank_build:
         meta_matches, actual_meta = _regime_bank_metadata_matches(bank_path, expected_bank_meta)
         if meta_matches is not False:
@@ -709,9 +737,20 @@ def _write_debug_rows(
                 "residual_hat_z": json.dumps([float(x) for x in residual_hat_cpu[i].tolist()], ensure_ascii=False),
                 "slow_ts": float(out["slow_ts"][i].detach().cpu()),
                 "shape_ts": json.dumps([float(x) for x in out["shape_ts"][i].detach().cpu().tolist()], ensure_ascii=False),
+                "shape_z": json.dumps([float(x) for x in out["shape_z"][i].detach().cpu().tolist()], ensure_ascii=False),
                 "spike_ts": json.dumps([float(x) for x in out["spike_ts"][i].detach().cpu().tolist()], ensure_ascii=False),
+                "spike_gate": json.dumps([float(x) for x in out["spike_gate"][i].detach().cpu().tolist()], ensure_ascii=False),
+                "spike_component_z": json.dumps(
+                    [
+                        float(x)
+                        for x in (out["spike_gate"][i] * out["spike_ts"][i]).detach().cpu().tolist()
+                    ],
+                    ensure_ascii=False,
+                ),
+                "residual_ts_z": json.dumps([float(x) for x in out["residual_ts_z"][i].detach().cpu().tolist()], ensure_ascii=False),
+                "hard_gate": float(out["hard_gate"][i].detach().cpu().view(-1)[0]),
                 "spike_gate_mean": float(out["spike_gate"][i].detach().cpu().mean()),
-                "lambda_base": float(out["lambda_base"][i].detach().cpu()),
+                "lambda_delta_final": float(out["lambda_delta_final"][i].detach().cpu()),
                 "shape_gain": float(out["shape_gain"][i].detach().cpu()),
                 "spike_bias": float(out["spike_bias"][i].detach().cpu()),
                 "relevance_mass": float(out["relevance_mass"][i].detach().cpu()),
@@ -974,7 +1013,7 @@ def evaluate_delta_v3(
                     float(np.abs(perm_pred_z_cpu[i] - targets_z_cpu[i]).mean()) if perm_pred_z_cpu is not None else float("nan")
                 )
                 sample_active.append(bool(active_flags_batch[i]))
-                sample_lambda.append(float(out["lambda_base"][i].detach().cpu()))
+                sample_lambda.append(float(out["lambda_delta_final"][i].detach().cpu()))
                 sample_lambda_ts.append(float(out["lambda_ts"][i].detach().cpu()))
                 sample_lambda_news_delta.append(float(out["lambda_news_delta"][i].detach().cpu()))
                 sample_shape_gain.append(float(out["shape_gain"][i].detach().cpu()))
@@ -1063,9 +1102,9 @@ def evaluate_delta_v3(
             "inactive_blank_gap_pct": inactive_blank_gap_pct,
             "active_blank_gain_z": active_blank_gain_z,
             "active_permuted_gain_z": active_permuted_gain_z,
-            "lambda_base_mean": float(np.mean(sample_lambda)) if sample_lambda else 0.0,
-            "lambda_base_active_mean": _subset_mean(sample_lambda, active_mask),
-            "lambda_base_inactive_mean": _subset_mean(sample_lambda, inactive_mask),
+            "lambda_delta_final_mean": float(np.mean(sample_lambda)) if sample_lambda else 0.0,
+            "lambda_delta_final_active_mean": _subset_mean(sample_lambda, active_mask),
+            "lambda_delta_final_inactive_mean": _subset_mean(sample_lambda, inactive_mask),
             "lambda_ts_mean": float(np.mean(sample_lambda_ts)) if sample_lambda_ts else 0.0,
             "lambda_news_delta_mean": float(np.mean(sample_lambda_news_delta)) if sample_lambda_news_delta else 0.0,
             "lambda_saturation_pct": lambda_saturation_pct,
@@ -1489,7 +1528,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
             train_steps += 1
             pbar.set_postfix(
                 loss=f"{train_loss_sum / max(1, train_steps):.5f}",
-                lambda_base=f"{float(out['lambda_base'].detach().cpu().mean()):.3f}",
+                lambda_delta_final=f"{float(out['lambda_delta_final'].detach().cpu().mean()):.3f}",
                 active=f"{float((regime_pack['relevance_mass'] > cfg.active_mass_threshold).detach().cpu().float().mean()):.3f}",
                 spike=f"{float(out['spike_gate_hard'].detach().cpu().mean()):.3f}",
             )
@@ -1559,7 +1598,7 @@ def train_delta_v3_stage(args, bundle, best_base_path: str, best_base_metric):
             f"perm_active={float(diag.get('permuted_active_subset_mae', float('nan'))):.6f} "
             f"gate={gate_reason} "
             f"lr={optimizer.param_groups[0]['lr']:.2e} "
-            f"lambda={float(diag.get('lambda_base_mean', 0.0)):.4f} "
+            f"lambda={float(diag.get('lambda_delta_final_mean', 0.0)):.4f} "
             f"lambda_sat={float(diag.get('lambda_saturation_pct', 0.0)):.3f} "
             f"shape_gain={float(diag.get('shape_gain_mean', 1.0)):.4f} "
             f"spike_bias={float(diag.get('spike_bias_mean', 0.0)):.4f} "

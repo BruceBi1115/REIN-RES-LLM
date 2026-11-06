@@ -146,7 +146,7 @@ def record_test_results_csv(args, live_logger, mse, mae, base_mse=None, base_mae
             "Counterfactual_Permuted_Active_MSE": float(residual_diag.get("permuted_active_subset_mse", np.nan)),
             "Counterfactual_Permuted_Active_MAE": float(residual_diag.get("permuted_active_subset_mae", np.nan)),
             "Inactive_Blank_Gap_Pct": float(residual_diag.get("inactive_blank_gap_pct", np.nan)),
-            "Lambda_Base_Mean": float(residual_diag.get("lambda_base_mean", np.nan)),
+            "Lambda_Delta_Final_Mean": float(residual_diag.get("lambda_delta_final_mean", np.nan)),
             "Shape_Gain_Mean": float(residual_diag.get("shape_gain_mean", np.nan)),
             "Spike_Bias_Mean": float(residual_diag.get("spike_bias_mean", np.nan)),
             "Relevance_Mass_Mean": float(residual_diag.get("relevance_mass_mean", np.nan)),

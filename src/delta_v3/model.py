@@ -89,17 +89,17 @@ class DeltaV3Regressor(nn.Module):
         residual_z = slow_ts.unsqueeze(-1) + shape_z + spike_gate * spike_ts
 
         # Hard gate: zero out delta on samples with relevance_mass < threshold.
-        # Differs from the soft gate in RegimeModulationHeads (which shrinks lambda_base toward lambda_min
+        # Differs from the soft gate in RegimeModulationHeads (which shrinks lambda_delta_final toward lambda_min
         # via a sigmoid). Hard gate is a stricter data-level guard for datasets with sparse/noisy news
         # coverage, so delta cannot inject noise on genuinely-silent days at inference or training time.
         hard_gate_threshold = float(self.cfg.hard_gate_mass_threshold)
         if hard_gate_threshold > 0.0:
             relevance = regime_pack["relevance_mass"].to(base_pred_z.dtype).view(-1)
             gate = (relevance >= hard_gate_threshold).to(base_pred_z.dtype).unsqueeze(-1)
-            pred_z = base_pred_z + gate * modulation["lambda_base"].unsqueeze(-1) * residual_z
+            pred_z = base_pred_z + gate * modulation["lambda_delta_final"].unsqueeze(-1) * residual_z
         else:
             gate = torch.ones((base_pred_z.size(0), 1), dtype=base_pred_z.dtype, device=base_pred_z.device)
-            pred_z = base_pred_z + modulation["lambda_base"].unsqueeze(-1) * residual_z
+            pred_z = base_pred_z + modulation["lambda_delta_final"].unsqueeze(-1) * residual_z
 
         return {
             "pred_z": pred_z,
@@ -114,7 +114,7 @@ class DeltaV3Regressor(nn.Module):
             "spike_gate_logits": spike_gate_logits,
             "spike_gate": spike_gate,
             "spike_gate_hard": spike_gate_hard,
-            "lambda_base": modulation["lambda_base"],
+            "lambda_delta_final": modulation["lambda_delta_final"],
             "lambda_ts": modulation["lambda_ts"],
             "lambda_news_delta": modulation["lambda_news_delta"],
             "shape_gain": modulation["shape_gain"],

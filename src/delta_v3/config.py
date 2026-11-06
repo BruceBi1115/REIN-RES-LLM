@@ -4,6 +4,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from ..time_mmd_prompts import TIME_MMD_SCHEMA_VERSION, TIME_MMD_VARIANTS
+
 DEFAULT_SHARED_REFINE_CACHE_DIR = os.path.join("_shared_refine_cache", "v4")
 LEGACY_SHARED_REFINE_CACHE_DIR = os.path.join("checkpoints", "_shared_refine_cache", "v4")
 LEGACY_BACKUP_DIR = os.path.join("_shared_refine_cache", "LEGACY_BACKUP")
@@ -131,8 +133,17 @@ class DeltaV3Config:
         dataset_key = str(getattr(args, "dataset_key", "dataset") or "dataset").strip()
         news_path = str(getattr(args, "news_path", "") or "").strip()
         news_cache_tag = news_dataset_cache_tag(news_path)
+        schema_variant = str(getattr(args, "delta_v3_schema_variant", "load") or "load").strip()
+        if dataset_key in TIME_MMD_VARIANTS and schema_variant != dataset_key:
+            raise ValueError(
+                f"Dataset {dataset_key!r} requires --delta_v3_schema_variant {dataset_key}; "
+                f"got {schema_variant!r}."
+            )
+        cache_dir = DEFAULT_SHARED_REFINE_CACHE_DIR
+        if schema_variant in TIME_MMD_VARIANTS:
+            cache_dir = os.path.join(cache_dir, schema_variant, TIME_MMD_SCHEMA_VERSION)
         override_bank_path = str(getattr(args, "delta_v3_regime_bank_path", "") or "").strip()
-        regime_bank_path = override_bank_path or build_regime_bank_path(DEFAULT_SHARED_REFINE_CACHE_DIR, news_path)
+        regime_bank_path = override_bank_path or build_regime_bank_path(cache_dir, news_path)
         legacy_bank_path = override_bank_path or build_legacy_regime_bank_path(
             DEFAULT_SHARED_REFINE_CACHE_DIR,
             dataset_key,
@@ -143,11 +154,11 @@ class DeltaV3Config:
             dataset_key=dataset_key,
             news_path=news_path,
             news_cache_tag=news_cache_tag,
-            cache_dir=DEFAULT_SHARED_REFINE_CACHE_DIR,
+            cache_dir=cache_dir,
             legacy_cache_dir=LEGACY_SHARED_REFINE_CACHE_DIR,
             history_len=int(getattr(args, "history_len", 48) or 48),
             horizon=int(getattr(args, "horizon", 48) or 48),
-            schema_variant=str(getattr(args, "delta_v3_schema_variant", "load") or "load").strip(),
+            schema_variant=schema_variant,
             regime_bank_path=regime_bank_path,
             regime_bank_legacy_path=legacy_bank_path,
             refined_bank_build=bool(int(refined_bank_build or 0)),
@@ -166,13 +177,13 @@ class DeltaV3Config:
             patch_stride=int(getattr(args, "delta_v3_patch_stride", 4) or 4),
             dropout=float(getattr(args, "delta_v3_dropout", 0.1) or 0.1),
             use_base_hidden=bool(int(getattr(args, "delta_v3_use_base_hidden", 1) or 0)),
-            slow_weight=float(getattr(args, "delta_v3_slow_weight", 1.0) or 1.0),
-            shape_weight=float(getattr(args, "delta_v3_shape_weight", 1.0) or 1.0),
-            spike_weight=float(getattr(args, "delta_v3_spike_weight", 1.0) or 1.0),
+            slow_weight=float(getattr(args, "delta_v3_slow_weight", 1.0)),
+            shape_weight=float(getattr(args, "delta_v3_shape_weight", 1.0)),
+            spike_weight=float(getattr(args, "delta_v3_spike_weight", 1.0)),
             spike_gate_threshold=float(getattr(args, "delta_v3_spike_gate_threshold", 0.8) or 0.8),
             spike_k=float(getattr(args, "delta_v3_spike_k", 3.0) or 3.0),
             spike_target_pct=float(getattr(args, "delta_v3_spike_target_pct", 0.10) or 0.10),
-            spike_gate_loss_weight=float(getattr(args, "delta_v3_spike_gate_loss_weight", 0.25) or 0.25),
+            spike_gate_loss_weight=float(getattr(args, "delta_v3_spike_gate_loss_weight", 0.25)),
             news_blank_prob=float(getattr(args, "delta_v3_news_blank_prob", 0.3) or 0.3),
             consistency_weight=float(getattr(args, "delta_v3_consistency_weight", 0.05) or 0.05),
             counterfactual_weight=float(getattr(args, "delta_v3_counterfactual_weight", 0.1) or 0.1),
@@ -181,7 +192,7 @@ class DeltaV3Config:
                 getattr(args, "delta_v3_inactive_residual_weight", 0.1) or 0.1
             ),
             spike_bias_l2=float(getattr(args, "delta_v3_spike_bias_l2", 1e-3) or 1e-3),
-            active_mass_threshold=float(getattr(args, "delta_v3_active_mass_threshold", 0.7) or 0.7),
+            active_mass_threshold=float(getattr(args, "delta_v3_active_mass_threshold", 0.7)),
             lambda_min=float(getattr(args, "delta_v3_lambda_min", 0.05) or 0.05),
             lambda_ts_cap=float(getattr(args, "delta_v3_lambda_ts_cap", 0.45) or 0.45),
             lambda_news_cap=float(getattr(args, "delta_v3_lambda_news_cap", 0.20) or 0.20),

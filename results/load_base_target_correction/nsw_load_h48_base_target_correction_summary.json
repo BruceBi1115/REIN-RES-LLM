@@ -1,0 +1,11 @@
+{
+  "debug_csv": "checkpoints/delta_v3_nsw_load_dlinear_[load]freeNews_reneweconomy_pvmag_watt_1_48_1e-4_0.7_intfloat-e5-small-v2_0.001/test_delta_residual_debug_delta_v3_nsw_load_dlinear_[load]freeNews_reneweconomy_pvmag_watt_1_48_1e-4_0.7_intfloat-e5-small-v2_0.001.csv",
+  "selected_sample_idx": 2850,
+  "horizon": 48,
+  "base_mae_mw": 1641.54296875,
+  "rein_mae_mw": 939.2373046875,
+  "mae_gain_mw": 702.3056640625,
+  "relevance_mass": 4.945498466491699,
+  "lambda_delta_final": 0.449999988079071,
+  "shape_gain": 1.1999995708465576
+}
