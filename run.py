@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--delta_v3_schema_variant",
         type=str,
         default="load",
-        choices=["load", "price", "gas_demand", "traffic", "bitcoin", "ozone", *TIME_MMD_VARIANTS],
+        choices=["load", "price", "gas_demand", "traffic", "bitcoin", *TIME_MMD_VARIANTS],
     )
     parser.add_argument("--delta_v3_text_encoder_model_id", type=str, default="intfloat/e5-small-v2")
     parser.add_argument("--delta_v3_text_encoder_max_length", type=int, default=256)
@@ -159,6 +159,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--delta_v3_grad_clip", type=float, default=1.0)
     parser.add_argument("--delta_v3_eval_permutation_seed", type=int, default=2024)
+    parser.add_argument("--delta_v3_shape_gain_fixed", type=float, default=-1.0,
+                        help="If >=0, pin shape_gain to this constant (e.g. 0 removes the shape branch). <0 disables.")
     parser.add_argument("--delta_v3_select_metric", type=str, default="mae", choices=["mae", "top10pct_mae"])
 
     return parser

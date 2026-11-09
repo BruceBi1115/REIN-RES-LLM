@@ -389,6 +389,7 @@ init_common_defaults() {
   set_default DELTA_V3_LAMBDA_MAX_PATCHTST ""
   set_default DELTA_V3_SHAPE_GAIN_CAP "0.50"
   set_default DELTA_V3_SHAPE_GAIN_L2_WEIGHT "0.01"
+  set_default DELTA_V3_SHAPE_GAIN_FIXED "-1"
   set_default DELTA_V3_HARD_GATE_MASS_THRESHOLD "0.0"
   # M5: direction-aware aux loss (cosine agreement between delta contribution and true residual).
   set_default DELTA_V3_DIRECTION_WEIGHT "0.05"
@@ -553,6 +554,7 @@ build_run_args() {
     --delta_v3_lambda_max "$DELTA_V3_LAMBDA_MAX"
     --delta_v3_shape_gain_cap "$DELTA_V3_SHAPE_GAIN_CAP"
     --delta_v3_shape_gain_l2_weight "$DELTA_V3_SHAPE_GAIN_L2_WEIGHT"
+    --delta_v3_shape_gain_fixed "$DELTA_V3_SHAPE_GAIN_FIXED"
     --delta_v3_hard_gate_mass_threshold "$DELTA_V3_HARD_GATE_MASS_THRESHOLD"
     --delta_v3_direction_weight "$DELTA_V3_DIRECTION_WEIGHT"
     --delta_v3_residual_history_channel "$DELTA_V3_RESIDUAL_HISTORY_CHANNEL"

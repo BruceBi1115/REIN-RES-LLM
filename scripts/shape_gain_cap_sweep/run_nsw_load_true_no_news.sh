@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+RUN_SCRIPT_NAME="scripts/shape_gain_cap_sweep/run_nsw_load_true_no_news.sh"
+RUN_SCRIPT_PATH="$SCRIPT_DIR/run_nsw_load.sh"
+
+DATASET_KEY="nsw_load"
+TIME_COL="date"
+VALUE_COL="TOTALDEMAND"
+ID_COL=""
+UNIT="MW"
+DESCRIPTION="This dataset records the electricity load demand data in Australia NSW from 2024, collected from the National Electricity Market."
+REGION="Australia, NSW"
+FREQ_MIN=""
+DAY_FIRST="1"
+
+TRAIN_FILE="dataset/2024NSWelecLOAD/2024NSWelecLOAD_trainset.csv"
+VAL_FILE="dataset/2024NSWelecLOAD/2024NSWelecLOAD_valset.csv"
+TEST_FILE="dataset/2024NSWelecLOAD/2024NSWelecLOAD_testset.csv"
+DEFAULT_NEWS_PATH="dataset/[load]freeNews_reneweconomy_pvmag_watt.json"
+
+BASE_EPOCHS="40"
+DELTA_EPOCHS="30"
+BATCH_SIZE="16"
+GRAD_ACCS=("4")
+LRS=("1e-4")
+
+NORMALIZATION_MODE="zscore"
+HORIZONS=("48" "96" "192" "336" "720")
+SCHEDULERS=("1")
+BASE_BACKBONES=("dlinear")
+
+# Sweep: shape_gain_cap comes from env SGCAP (required); seed fixed.
+SGCAP="${SGCAP:?set SGCAP, e.g. SGCAP=0.4}"
+SEED="2024"
+TASK_NAME_BASE="delta_v3_nsw_load_true_no_news_sgcap${SGCAP}"
+PRE_RUN_HOOK=""
+DELTA_V3_REFINED_BANK_BUILD="0"
+# TRUE NO-NEWS: theta=-1 -> gate always open (lambda_ts trains normally), news knobs always on
+DELTA_V3_ACTIVE_MASS_THRESHOLDS=("-1")
+
+NEWS_WINDOW_DAYS="1"
+NEWS_API_ENABLE="1"
+DELTA_V3_SCHEMA_VARIANT="load"
+# TRUE NO-NEWS: all regime content + relevance mass are 0 (built from the HEAD bank via
+# scripts/make_regime_bank_ablation.py --mode blank_news_features)
+DELTA_V3_REGIME_BANK_PATH="_shared_refine_cache/v4/ablations/true_nonews/nsw_load_blank_news_features.npz"
+# TRUE NO-NEWS 1: all three news knobs pinned to neutral (lambda_news=0, shape_gain=1, spike_bias=0).
+#   lambda_news = cap*tanh(.), shape_gain = 1 + cap*tanh(.), spike_bias = cap*tanh(.)  -> cap ~0 = neutral.
+#   1e-12 instead of 0 because src/delta_v3/config.py uses `value or <default>`, which turns 0 back into the default.
+DELTA_V3_LAMBDA_NEWS_CAP="1e-12"
+DELTA_V3_SHAPE_GAIN_CAP="$SGCAP"  # swept; lambda_news / spike_bias stay pinned at ~0
+DELTA_V3_SPIKE_BIAS_CAP="1e-12"
+
+DELTA_V3_TEXT_ENCODER_MODEL_ID="intfloat/e5-small-v2"
+DELTA_V3_TEXT_ENCODER_MAX_LENGTH="256"
+DELTA_V3_REGIME_TAU_DAYS="5.0"
+DELTA_V3_REGIME_EMA_ALPHA="0.5"
+DELTA_V3_REGIME_EMA_WINDOW="5"
+DELTA_V3_ARCH="patchtst_regime_modulation"
+DELTA_V3_HIDDEN_SIZE="128"
+DELTA_V3_NUM_LAYERS="2"
+DELTA_V3_NUM_HEADS="4"
+DELTA_V3_PATCH_LEN="8"
+DELTA_V3_PATCH_STRIDE="4"
+DELTA_V3_DROPOUT="0.1"
+DELTA_V3_USE_BASE_HIDDEN="1"
+DELTA_V3_SLOW_WEIGHT="1.0"
+DELTA_V3_SHAPE_WEIGHT="1.0"
+DELTA_V3_SPIKE_WEIGHT="1.0"
+DELTA_V3_SPIKE_GATE_THRESHOLD="0.8"
+DELTA_V3_SPIKE_K="3.0"
+DELTA_V3_SPIKE_TARGET_PCT="0.10"
+DELTA_V3_SPIKE_GATE_LOSS_WEIGHT="0.25"
+DELTA_V3_NEWS_BLANK_PROB="0.3"
+DELTA_V3_CONSISTENCY_WEIGHT="0.05"
+DELTA_V3_COUNTERFACTUAL_WEIGHT="0.1"
+DELTA_V3_COUNTERFACTUAL_MARGIN="0.02"
+DELTA_V3_SPIKE_BIAS_L2="1e-3"
+
+DELTA_V3_LAMBDA_MIN="0.05"
+DELTA_V3_LAMBDA_TS_CAP="0.30"
+DELTA_V3_LAMBDA_MAX="0.45"
+DELTA_V3_SELECTION_COUNTERFACTUAL_GAIN_MIN="0.01"
+DELTA_V3_SELECTION_LAMBDA_SATURATION_MAX_PCT="0.35"
+DELTA_V3_HARD_RESIDUAL_FRAC="0.6"
+DELTA_V3_HARD_RESIDUAL_PCT="0.10"
+DELTA_V3_PRETRAIN_EPOCHS="12"
+DELTA_V3_PRETRAIN_LR="1e-3"
+DELTA_V3_PRICE_WINSOR_LOW="0.005"
+DELTA_V3_PRICE_WINSOR_HIGH="0.995"
+DELTA_V3_GRAD_CLIP="1.0"
+DELTA_V3_EVAL_PERMUTATION_SEED="2024"
+DELTA_V3_SELECT_METRIC="mae"
+
+cd "$REPO_ROOT"
+source "$COMMON_DIR/_run_forecast_common.sh"
+run_forecast_dataset_main "$@"

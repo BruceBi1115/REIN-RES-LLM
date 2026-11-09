@@ -221,6 +221,7 @@ def _sync_args_from_delta_cfg(args, cfg: DeltaV3Config) -> None:
         "price_winsor_high",
         "grad_clip",
         "eval_permutation_seed",
+        "shape_gain_fixed",
         "select_metric",
     }
 

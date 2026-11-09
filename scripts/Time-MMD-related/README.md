@@ -39,7 +39,7 @@ New caches are isolated under:
 _shared_refine_cache/v4/<time_mmd_domain>/v4_regime_v2_time_mmd_v1/
 ```
 
-Old top-level caches generated with load/price/ozone/traffic prompts are preserved.
+Old top-level caches generated with load/price/traffic prompts are preserved.
 The next domain run refines into the new directory and records the domain and
 prompt version. Wrong-version, wrong-domain, and unversioned caches are rejected.
 Increment `TIME_MMD_SCHEMA_VERSION` when changing prompt semantics so subsequent

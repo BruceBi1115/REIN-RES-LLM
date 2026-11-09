@@ -120,14 +120,13 @@ source "$1"
                 self.assertIn(profile.target, system)
                 self.assertIn(DOC["content"], user)
                 self.assertNotIn("NSW", system)
-                self.assertNotIn("Sacramento", system)
                 self.assertEqual(record["horizon_days"], profile.horizon_days)
                 self.assertEqual(record["schema_version"], TIME_MMD_SCHEMA_VERSION)
         self.assertEqual(seen, set(TIME_MMD_VARIANTS))
 
     def test_mismatched_dataset_prompt_is_rejected(self):
         args = make_args("time_mmd_climate")
-        for wrong in ("ozone", "time_mmd_environment"):
+        for wrong in ("bitcoin", "time_mmd_environment"):
             with self.subTest(wrong=wrong):
                 args.delta_v3_schema_variant = wrong
                 with self.assertRaisesRegex(ValueError, "requires --delta_v3_schema_variant"):
@@ -139,7 +138,7 @@ source "$1"
         expected = {
             "load": "NSW electricity load", "price": "NSW electricity price",
             "gas_demand": "Netherlands gas demand", "traffic": "hourly road traffic count",
-            "bitcoin": "Bitcoin hourly price", "ozone": "Sacramento hourly ozone",
+            "bitcoin": "Bitcoin hourly price",
         }
         for variant, target in expected.items():
             with self.subTest(variant=variant):
@@ -182,7 +181,7 @@ source "$1"
         variant = "time_mmd_climate"
         base = refine._default_record(DOC, variant)
         invalid = [
-            dict(base, schema_variant="ozone"),
+            dict(base, schema_variant="bitcoin"),
             dict(base, schema_version="old_version"),
             {k: v for k, v in base.items() if k != "schema_version"},
             {k: v for k, v in base.items() if k != "schema_variant"},
@@ -213,7 +212,7 @@ source "$1"
             signature = refine.compute_news_corpus_signature(str(news))
             self.assertTrue(trainer._refined_corpus_matches(str(refined), cfg, news_signature=signature)[0])
             row = json.loads(refined.read_text())
-            for invalid in (dict(row, schema_version="old"), dict(row, schema_variant="ozone")):
+            for invalid in (dict(row, schema_version="old"), dict(row, schema_variant="bitcoin")):
                 write_jsonl(refined, [invalid])
                 self.assertFalse(trainer._refined_corpus_matches(str(refined), cfg, news_signature=signature)[0])
             unversioned = {k: v for k, v in row.items() if k != "schema_version"}
@@ -232,7 +231,7 @@ source "$1"
                 cfg = config.DeltaV3Config.from_args(args)
             # This was the pre-Time-MMD cache location; preserve its bytes during migration.
             old_refined = Path(config.build_refined_cache_path(str(cache_root), str(news)))
-            write_jsonl(old_refined, [refine._default_record(DOC, "ozone")])
+            write_jsonl(old_refined, [refine._default_record(DOC, "bitcoin")])
             old_bytes = old_refined.read_bytes()
             bundle = {
                 "live_logger": Mock(),
@@ -267,7 +266,7 @@ source "$1"
 
     def test_bank_cache_rejects_legacy_and_missing_metadata(self):
         expected = {"schema_variant": "time_mmd_climate", "schema_version": TIME_MMD_SCHEMA_VERSION}
-        for actual in ({}, {"schema_variant": "ozone"}, dict(expected, schema_version="old")):
+        for actual in ({}, {"schema_variant": "bitcoin"}, dict(expected, schema_version="old")):
             with self.subTest(actual=actual), patch.object(trainer, "read_regime_bank_metadata", return_value=actual):
                 self.assertFalse(trainer._regime_bank_metadata_matches("unused.npz", expected)[0])
 

@@ -36,6 +36,7 @@ class DeltaV3Regressor(nn.Module):
             lambda_max=cfg.lambda_max,
             shape_gain_cap=cfg.shape_gain_cap,
             spike_bias_cap=cfg.spike_bias_cap,
+            shape_gain_fixed=cfg.shape_gain_fixed,
         )
 
     def encode_regime(self, regime_pack: dict[str, torch.Tensor]) -> torch.Tensor:

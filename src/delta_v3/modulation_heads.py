@@ -46,6 +46,7 @@ class RegimeModulationHeads(nn.Module):
         lambda_max: float = 0.45,
         shape_gain_cap: float = 0.20,
         spike_bias_cap: float = 0.75,
+        shape_gain_fixed: float = -1.0,
     ):
         super().__init__()
         self.active_mass_threshold = float(active_mass_threshold)
@@ -59,6 +60,7 @@ class RegimeModulationHeads(nn.Module):
         self.lambda_max = float(lambda_max)
         self.shape_gain_cap = float(shape_gain_cap)
         self.spike_bias_cap = float(spike_bias_cap)
+        self.shape_gain_fixed = float(shape_gain_fixed)
         self.ts_trust_mlp = _ScalarMLP(hidden_size, final_bias=-1.0)
         self.trust_delta_mlp = _ScalarMLP(hidden_size)
         self.shape_gain_mlp = _ScalarMLP(hidden_size)
@@ -88,6 +90,8 @@ class RegimeModulationHeads(nn.Module):
         shape_gain_raw = self.shape_gain_mlp(regime_repr) * active
         spike_bias = self.spike_bias_cap * torch.tanh(self.spike_prior_mlp(regime_repr) * active)
         shape_gain = 1.0 + self.shape_gain_cap * torch.tanh(shape_gain_raw)
+        if self.shape_gain_fixed >= 0.0:
+            shape_gain = torch.full_like(shape_gain, self.shape_gain_fixed)
         return {
             "active": active,
             "lambda_ts_logit": lambda_ts_logit,

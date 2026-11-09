@@ -127,6 +127,8 @@ class DeltaV3Config:
     grad_clip: float
     select_metric: str
     eval_permutation_seed: int
+    # <0 disables; >=0 pins shape_gain to this constant (e.g. 0 removes the shape branch).
+    shape_gain_fixed: float = -1.0
 
     @classmethod
     def from_args(cls, args) -> "DeltaV3Config":
@@ -230,4 +232,5 @@ class DeltaV3Config:
             grad_clip=float(getattr(args, "delta_v3_grad_clip", 1.0) or 1.0),
             select_metric=str(getattr(args, "delta_v3_select_metric", "mae") or "mae").strip(),
             eval_permutation_seed=int(getattr(args, "delta_v3_eval_permutation_seed", 2024) or 2024),
+            shape_gain_fixed=float(getattr(args, "delta_v3_shape_gain_fixed", -1.0)),
         )

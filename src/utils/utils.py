@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import os
 import random
 import re
@@ -153,22 +154,19 @@ def record_test_results_csv(args, live_logger, mse, mae, base_mse=None, base_mae
             "Spike_Gate_Hit_Rate": float(residual_diag.get("spike_gate_hit_rate", np.nan)),
             "Spike_Target_Hit_Rate": float(residual_diag.get("spike_target_hit_rate", np.nan)),
         }
-        new_row = pd.DataFrame([row])
+        # Append-only: never read back and rewrite the file, so concurrent runs cannot
+        # overwrite each other's rows. Re-running a task appends a new row (latest = last).
         ordered_cols = list(row.keys())
-        if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
-            for col in ordered_cols:
-                if col not in df.columns:
-                    df[col] = np.nan
-            df = df[ordered_cols]
-            df = df[df["Task"] != task]
-            out_df = pd.concat([df, new_row], ignore_index=True)
-        else:
-            out_df = new_row
-        out_df = out_df[ordered_cols]
-        out_df.to_csv(csv_path, index=False)
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=ordered_cols, lineterminator="\n")
+        with open(csv_path, "a", encoding="utf-8", newline="") as handle:
+            if handle.tell() == 0:
+                writer.writeheader()
+            writer.writerow(row)
+            handle.write(buf.getvalue())  # one write call per row
+            handle.flush()
         live_logger.info(f"[RESULT_TASK] {task}")
-        live_logger.info(f"Saved test results to {csv_path} (upsert by Task)")
+        live_logger.info(f"Saved test results to {csv_path} (appended)")
     except Exception as exc:
         live_logger.error(f"Failed to save test results to CSV: {exc}")
 

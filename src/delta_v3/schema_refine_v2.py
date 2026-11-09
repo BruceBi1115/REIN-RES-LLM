@@ -19,7 +19,7 @@ from ..time_mmd_prompts import (
 
 SCHEMA_VERSION = "v4_regime_v2"
 BITCOIN_SCHEMA_VERSION = "v4_regime_v2_bitcoin_recall1"
-SCHEMA_VARIANTS = ("load", "price", "gas_demand", "traffic", "bitcoin", "ozone", *TIME_MMD_VARIANTS)
+SCHEMA_VARIANTS = ("load", "price", "gas_demand", "traffic", "bitcoin", *TIME_MMD_VARIANTS)
 TOPIC_TAGS = (
     "supply_tight",
     "supply_surplus",
@@ -412,49 +412,6 @@ def _build_prompts(doc: dict[str, Any], schema_variant: str, corpus_hint: str = 
             "renewable_surplus = use this slot as mobility relief and alternate-capacity availability that reduces road counts or congestion, negative when relief is weak and road usage is pushed higher; "
             "volatility_tone = disruption and uncertainty risk for hourly traffic from outages, closures, weather, protests, strikes, or major events; "
             "policy_in_effect = 1 only when a policy, restriction, emergency measure, or traffic intervention is already active. "
-            "Return fields exactly: "
-            "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
-            "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
-            "volatility_tone is in [0,1]. "
-            "policy_in_effect is 0 or 1. "
-            "horizon_days is an integer in [0,14]. "
-            "summary must stay under 60 words and be factual."
-        )
-    elif variant == "ozone":
-        system_prompt = (
-            "You are refining generic news for Sacramento hourly ozone concentration forecasting into strict JSON. "
-            "Return JSON only, no markdown. "
-            "The goal is to keep articles that describe a current or near-term condition that can plausibly change "
-            "ground-level ozone concentration, ozone precursor emissions, photochemical formation, atmospheric mixing, "
-            "dispersion, transport, or hourly air-quality volatility within the next 14 days. "
-            "Treat the following as potentially actionable if they are current, imminent, recently announced and still relevant, or likely to shape ozone conditions within 14 days: "
-            "heatwaves, high temperature periods, stagnant air, inversions, weak winds, smoke intrusions, wildfires, prescribed burns, "
-            "regional transport of pollution, air quality alerts, Spare The Air alerts, ozone advisories, emission restrictions, "
-            "industrial or refinery incidents, power plant or generator emissions, traffic surges, major events that increase vehicle travel, "
-            "fuel shortages or fuel-quality changes, regulatory actions already in force, and weather fronts or wind shifts that clear or worsen pollution. "
-            "Do not filter out an article just because it is local, weather-focused, advisory-focused, wildfire-focused, or framed as public health guidance, "
-            "as long as it can plausibly affect Sacramento ozone or ozone precursor conditions within 14 days. "
-            "Set is_actionable=false only if the article is clearly retrospective, generic climate commentary with no live signal, "
-            "long-horizon policy or infrastructure news without near-term emissions impact, routine human-interest news, or not plausibly relevant "
-            "to Sacramento ozone concentrations within 14 days. "
-            "Use only the closed topic vocabulary: "
-            + ", ".join(TOPIC_TAGS)
-            + ". "
-            "If an article is clearly ozone-relevant but the topic vocabulary is awkward, keep is_actionable=true and include other instead of routine. "
-            "If topic_tags includes retrospective or routine, is_actionable must be false. "
-            "Map ozone drivers into the existing tags and regime fields as follows: "
-            "heat and strong sunlight that increase ozone formation -> heatwave; "
-            "stagnant air, inversions, weak winds, transported pollution, wildfire smoke, or precursor buildup -> supply_tight or renewable_drought; "
-            "cooler weather, rain, strong ventilation, marine breeze, or frontal passage that reduces ozone -> supply_surplus or renewable_surge; "
-            "wildfire, smoke, industrial incidents, refinery incidents, or power-generator emissions -> outage, fuel_shock, or other depending on context; "
-            "traffic surges, commuting peaks, major events, or freight activity that raise NOx/VOC precursor emissions -> supply_tight or other; "
-            "air-quality action days, burn bans, emission restrictions, or regulatory interventions already active -> policy_active or market_intervention and policy_in_effect=1. "
-            "Interpret regime_vec for ozone as: "
-            "tightness = near-term ozone formation pressure and precursor buildup; "
-            "demand_outlook = near-term emissions pressure from traffic, industry, power generation, fire activity, or human activity patterns; "
-            "renewable_surplus = use this slot as atmospheric cleansing and dispersion relief that lowers ozone, negative when stagnation or transport worsens ozone; "
-            "volatility_tone = uncertainty and hourly air-quality volatility risk from wildfire smoke, wind shifts, inversions, heat, advisories, or abrupt emission changes; "
-            "policy_in_effect = 1 only when an air-quality policy, restriction, advisory-linked intervention, or emergency measure is already active. "
             "Return fields exactly: "
             "{is_actionable:boolean, topic_tags:string[], regime_vec:{tightness:float, demand_outlook:float, renewable_surplus:float, volatility_tone:float, policy_in_effect:float}, horizon_days:int, confidence:float, summary:string}. "
             "tightness, demand_outlook, renewable_surplus are in [-1,1]. "
